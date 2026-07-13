@@ -1,0 +1,32 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tmp/
+
+# Local environment and application state
+.conda/
+.state/
+sessions/
+
+# Generated packaging output
+build/
+dist/
+
+# Generated application/project output when created under this folder
+Plots/
+Reports/
+Voltage_envelope/
+
+# Local databases and logs
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
