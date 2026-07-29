@@ -267,7 +267,7 @@ def _load_embedded_plotter_session(
     try:
         _log(log, "plotter: Indexing runs...")
         run_index = run_service.build_index(context)
-        _log(log, "plotter: Loading MM/CB results...")
+        _log(log, "plotter: Loading MM results...")
         catalog = results_service.build_base_catalog(context, run_index, cache)
         limits = limit_service.load_effective_limits(context)
         renderer = MatplotlibRenderer(run_index)
@@ -291,11 +291,10 @@ def _render_plot_batches_direct(
 
     from pscad_plotter_app_v3.models import PlotMode
     from pscad_plotter_app_v3.services.batch_excel import BatchExcelService
-    from pscad_plotter_app_v3.services.batching import BatchBuilderService
+    from pscad_plotter_app_v3.services.batching import build_mm_jobs
     from pscad_plotter_app_v3.services.limits import LimitService
 
     batch_service = BatchExcelService()
-    batch_builder = BatchBuilderService()
     limit_service = LimitService()
     batch_dir = project_root / "Plots" / "Plot_batch"
 
@@ -334,8 +333,7 @@ def _render_plot_batches_direct(
                         f"No MM limits found; plotting without limits: "
                         f"{request.case_name} | {request.elements[0] if request.elements else ''}",
                     )
-                batch = batch_builder.build_batch(request, limit)
-                jobs.extend(batch.jobs)
+                jobs.extend(build_mm_jobs(request, limit))
 
             _log(log, f"Rendering {len(jobs)} plot(s): {scope.folder} | {event_name}")
             for job in jobs:

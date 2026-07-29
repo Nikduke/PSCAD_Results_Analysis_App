@@ -8,8 +8,22 @@ from typing import Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from results_analysis_app import actions, project_scan_runner, reporting, resonance_checks, scanner, storage
+from results_analysis_app import (
+    actions,
+    project_scan_cache,
+    project_scan_runner,
+    reporting,
+    resonance_checks,
+    scanner,
+    storage,
+)
 from results_analysis_app.background import BackgroundTask, CancelToken
+from results_analysis_app.exclusions import (
+    ExclusionRule,
+    normalize_case_run_exclusions,
+    normalize_exclusion_rules,
+    normalize_high_voltage_exclusions,
+)
 from results_analysis_app.models import (
     DEFAULT_EVENTS,
     DEFAULT_RESONANCE_CHECKS,
@@ -18,14 +32,9 @@ from results_analysis_app.models import (
     DashboardFigure,
     ProjectEntry,
     ScopeEntry,
-    normalize_bus_exclusions,
-    normalize_chart_y_limits,
-    normalize_case_run_exclusions,
-    normalize_high_voltage_exclusions,
 )
-from results_analysis_app.project_config import load_project_frequency, load_voltage_configs
+from results_analysis_app.project_config import load_voltage_configs
 from results_analysis_app.styles import (
-    PANEL_STYLE,
     apply_choice_button_style,
     apply_run_button_style,
     apply_secondary_button_style,
@@ -62,9 +71,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._busy = False
         self._worker: BackgroundTask | None = None
         self._cancel_token: CancelToken | None = None
+        self._close_when_idle = False
         self._frequency_fallback_prompted = False
         self._open_settings_after_task = False
-        self._table_copy_shortcuts: list[QtGui.QShortcut] = []
+        self._table_shortcuts: list[QtGui.QShortcut] = []
         self._autosave_timer = QtCore.QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(750)
@@ -73,7 +83,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frequency_fallback_prompt_requested.connect(self._show_frequency_fallback_prompt)
         self._build_ui()
         self._load_session_to_ui()
-        self.rescan_projects()
+        self.refresh_project_scans()
 
     def _build_ui(self) -> None:
         root = QtWidgets.QWidget(self)
@@ -125,7 +135,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _panel(self, parent: QtWidgets.QWidget) -> QtWidgets.QFrame:
         panel = QtWidgets.QFrame(parent)
         panel.setObjectName("panel")
-        panel.setStyleSheet(PANEL_STYLE)
         return panel
 
     def _build_top_bar(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
@@ -244,13 +253,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.delete_project_button = QtWidgets.QPushButton("Delete", panel)
         self.select_all_projects_button = QtWidgets.QPushButton("All", panel)
         self.select_no_projects_button = QtWidgets.QPushButton("None", panel)
-        self.rescan_button = QtWidgets.QPushButton("Rescan", panel)
         for button in (
             self.add_project_button,
             self.delete_project_button,
             self.select_all_projects_button,
             self.select_no_projects_button,
-            self.rescan_button,
         ):
             apply_secondary_button_style(button)
             controls.addWidget(button)
@@ -289,14 +296,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.delete_project_button.clicked.connect(self.delete_selected_projects)
         self.select_all_projects_button.clicked.connect(lambda: self._set_all_projects(True))
         self.select_no_projects_button.clicked.connect(lambda: self._set_all_projects(False))
-        self.rescan_button.clicked.connect(self.rescan_projects)
         self.save_session_button.clicked.connect(self.save_session_as)
         self.load_session_button.clicked.connect(self.load_session_from_file)
         self.clear_session_button.clicked.connect(self.clear_session)
         return panel
 
     def _build_project_exclusions_panel(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
-        box = QtWidgets.QGroupBox("Selected Project Exclusions", parent)
+        box = QtWidgets.QGroupBox("Project Exclusions", parent)
         layout = QtWidgets.QVBoxLayout(box)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -305,72 +311,84 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.exclusion_tabs = QtWidgets.QTabWidget(box)
         tabs = self.exclusion_tabs
-        self.bus_exclusion_tab = QtWidgets.QWidget(tabs)
-        bus_layout = QtWidgets.QFormLayout(self.bus_exclusion_tab)
-        bus_layout.setContentsMargins(6, 6, 6, 6)
-        self.bus_exclusion_layout = bus_layout
-        self.bus_exclusion_fields: dict[str, QtWidgets.QLineEdit] = {}
-        tabs.addTab(self.bus_exclusion_tab, "Buses")
 
-        self.case_run_table = QtWidgets.QTableWidget(0, 2, tabs)
-        self.case_run_table.setHorizontalHeaderLabels(["Case", "Run"])
-        self.case_run_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.case_run_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.case_run_table.itemChanged.connect(self._on_case_run_table_changed)
-        self._enable_table_copy(self.case_run_table)
-        case_tab = QtWidgets.QWidget(tabs)
-        case_layout = QtWidgets.QVBoxLayout(case_tab)
-        case_layout.setContentsMargins(6, 6, 6, 6)
-        case_layout.addWidget(self.case_run_table)
-        case_buttons = QtWidgets.QHBoxLayout()
-        self.add_case_run_button = QtWidgets.QPushButton("Add", case_tab)
-        self.delete_case_run_button = QtWidgets.QPushButton("Delete", case_tab)
-        apply_secondary_button_style(self.add_case_run_button)
-        apply_secondary_button_style(self.delete_case_run_button)
-        self.add_case_run_button.clicked.connect(self._add_case_run_row)
-        self.delete_case_run_button.clicked.connect(self._delete_case_run_rows)
-        case_buttons.addWidget(self.add_case_run_button)
-        case_buttons.addWidget(self.delete_case_run_button)
-        case_layout.addLayout(case_buttons)
-        tabs.addTab(case_tab, "Case/Run")
+        manual_tab = QtWidgets.QWidget(tabs)
+        manual_layout = QtWidgets.QVBoxLayout(manual_tab)
+        manual_layout.setContentsMargins(6, 6, 6, 6)
+        self.manual_exclusion_table = QtWidgets.QTableWidget(0, 4, manual_tab)
+        self._configure_exclusion_table(
+            self.manual_exclusion_table,
+            ["Apply", "Case", "Run", "Bus"],
+            editable=True,
+        )
+        manual_header = self.manual_exclusion_table.horizontalHeader()
+        manual_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        manual_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        manual_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.manual_exclusion_table.setColumnWidth(2, 64)
+        self.manual_exclusion_table.itemChanged.connect(self._on_manual_exclusion_table_changed)
+        self._enable_table_clipboard(self.manual_exclusion_table, paste=True)
+        manual_layout.addWidget(self.manual_exclusion_table)
+        manual_buttons = QtWidgets.QHBoxLayout()
+        self.add_manual_exclusion_button = QtWidgets.QPushButton("Add", manual_tab)
+        self.delete_manual_exclusion_button = QtWidgets.QPushButton("Delete", manual_tab)
+        apply_secondary_button_style(self.add_manual_exclusion_button)
+        apply_secondary_button_style(self.delete_manual_exclusion_button)
+        self.add_manual_exclusion_button.clicked.connect(self._add_manual_exclusion_row)
+        self.delete_manual_exclusion_button.clicked.connect(self._delete_manual_exclusion_rows)
+        manual_buttons.addWidget(self.add_manual_exclusion_button)
+        manual_buttons.addWidget(self.delete_manual_exclusion_button)
+        manual_buttons.addStretch(1)
+        self._add_apply_buttons(
+            manual_buttons,
+            manual_tab,
+            self.manual_exclusion_table,
+            "manual exclusion",
+        )
+        manual_layout.addLayout(manual_buttons)
+        tabs.addTab(manual_tab, "Manual")
 
         nonconv_tab = QtWidgets.QWidget(tabs)
         nonconv_layout = QtWidgets.QVBoxLayout(nonconv_tab)
         nonconv_layout.setContentsMargins(6, 6, 6, 6)
         self.nonconv_proposal_table = QtWidgets.QTableWidget(0, 6, nonconv_tab)
-        self.nonconv_proposal_table.setHorizontalHeaderLabels(
-            ["Apply", "Case", "Run", "Fault", "Signal", "Reason"]
+        self._configure_exclusion_table(
+            self.nonconv_proposal_table,
+            ["Apply", "Case", "Run", "Fault", "Signal", "Reason"],
         )
-        self.nonconv_proposal_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.nonconv_proposal_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         nonconv_header = self.nonconv_proposal_table.horizontalHeader()
-        nonconv_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
         nonconv_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
         nonconv_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
         nonconv_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
         nonconv_header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
         nonconv_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.nonconv_proposal_table.setColumnWidth(0, 56)
         self.nonconv_proposal_table.setColumnWidth(1, 150)
         self.nonconv_proposal_table.setColumnWidth(2, 54)
         self.nonconv_proposal_table.setColumnWidth(3, 70)
         self.nonconv_proposal_table.setColumnWidth(4, 110)
         self.nonconv_proposal_table.itemChanged.connect(self._on_nonconv_table_changed)
-        self._enable_table_copy(self.nonconv_proposal_table)
+        self._enable_table_clipboard(self.nonconv_proposal_table)
         nonconv_layout.addWidget(self.nonconv_proposal_table)
+        nonconv_buttons = QtWidgets.QHBoxLayout()
+        nonconv_buttons.addStretch(1)
+        self._add_apply_buttons(
+            nonconv_buttons,
+            nonconv_tab,
+            self.nonconv_proposal_table,
+            "non-convergent exclusion",
+        )
+        nonconv_layout.addLayout(nonconv_buttons)
         tabs.addTab(nonconv_tab, "NonConv")
 
         self.high_voltage_tab = QtWidgets.QWidget(tabs)
         high_layout = QtWidgets.QVBoxLayout(self.high_voltage_tab)
         high_layout.setContentsMargins(6, 6, 6, 6)
         self.high_voltage_proposal_table = QtWidgets.QTableWidget(0, 8, self.high_voltage_tab)
-        self.high_voltage_proposal_table.setHorizontalHeaderLabels(
-            ["Apply", "kV", "Case", "Run", "Bus", "Max", "Limit", "Signal"]
+        self._configure_exclusion_table(
+            self.high_voltage_proposal_table,
+            ["Apply", "kV", "Case", "Run", "Bus", "Max", "Limit", "Signal"],
         )
-        self.high_voltage_proposal_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.high_voltage_proposal_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         high_header = self.high_voltage_proposal_table.horizontalHeader()
-        high_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
         high_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
         high_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
         high_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
@@ -378,7 +396,6 @@ class MainWindow(QtWidgets.QMainWindow):
         high_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
         high_header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Fixed)
         high_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.Interactive)
-        self.high_voltage_proposal_table.setColumnWidth(0, 56)
         self.high_voltage_proposal_table.setColumnWidth(1, 52)
         self.high_voltage_proposal_table.setColumnWidth(2, 150)
         self.high_voltage_proposal_table.setColumnWidth(3, 54)
@@ -386,25 +403,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.high_voltage_proposal_table.setColumnWidth(6, 82)
         self.high_voltage_proposal_table.setColumnWidth(7, 112)
         self.high_voltage_proposal_table.itemChanged.connect(self._on_high_voltage_table_changed)
-        self._enable_table_copy(self.high_voltage_proposal_table)
+        self._enable_table_clipboard(self.high_voltage_proposal_table)
         high_layout.addWidget(self.high_voltage_proposal_table)
         high_buttons = QtWidgets.QHBoxLayout()
-        self.apply_all_high_voltage_button = QtWidgets.QPushButton("Apply all", self.high_voltage_tab)
-        self.apply_all_high_voltage_button.setToolTip("Check every high-voltage exclusion row.")
-        self.clear_all_high_voltage_button = QtWidgets.QPushButton("Clear all", self.high_voltage_tab)
-        self.clear_all_high_voltage_button.setToolTip("Uncheck every high-voltage exclusion row.")
-        apply_secondary_button_style(self.apply_all_high_voltage_button)
-        apply_secondary_button_style(self.clear_all_high_voltage_button)
-        self.apply_all_high_voltage_button.clicked.connect(self._apply_all_high_voltage_rows)
-        self.clear_all_high_voltage_button.clicked.connect(self._clear_all_high_voltage_rows)
         high_buttons.addStretch(1)
-        high_buttons.addWidget(self.apply_all_high_voltage_button)
-        high_buttons.addWidget(self.clear_all_high_voltage_button)
+        self._add_apply_buttons(
+            high_buttons,
+            self.high_voltage_tab,
+            self.high_voltage_proposal_table,
+            "high-voltage exclusion",
+        )
         high_layout.addLayout(high_buttons)
         tabs.addTab(self.high_voltage_tab, "High Voltage")
 
         layout.addWidget(tabs)
         return box
+
+    def _configure_exclusion_table(
+        self,
+        table: QtWidgets.QTableWidget,
+        headers: list[str],
+        *,
+        editable: bool = False,
+    ) -> None:
+        table.setHorizontalHeaderLabels(headers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.AllEditTriggers
+            if editable
+            else QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(0, 56)
+
+    def _add_apply_buttons(
+        self,
+        layout: QtWidgets.QHBoxLayout,
+        parent: QtWidgets.QWidget,
+        table: QtWidgets.QTableWidget,
+        row_name: str,
+    ) -> None:
+        apply_all = QtWidgets.QPushButton("Apply all", parent)
+        apply_none = QtWidgets.QPushButton("Apply none", parent)
+        apply_all.setToolTip(f"Check every {row_name} row.")
+        apply_none.setToolTip(f"Uncheck every {row_name} row.")
+        apply_secondary_button_style(apply_all)
+        apply_secondary_button_style(apply_none)
+        apply_all.clicked.connect(
+            lambda _checked=False, target=table: self._set_all_exclusion_rows_checked(
+                target,
+                True,
+            )
+        )
+        apply_none.clicked.connect(
+            lambda _checked=False, target=table: self._set_all_exclusion_rows_checked(
+                target,
+                False,
+            )
+        )
+        layout.addWidget(apply_all)
+        layout.addWidget(apply_none)
 
     def _build_scopes_panel(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
         panel = self._panel(parent)
@@ -520,7 +578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
-        self._enable_table_copy(self.preview_table)
+        self._enable_table_clipboard(self.preview_table)
         layout.addWidget(self.preview_table, 2)
 
         layout.addWidget(make_section_label("Dashboard Figures Shared Across Projects", panel))
@@ -558,412 +616,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._loading = was_loading
 
     def open_settings_dialog(self, initial_tab: str | None = None) -> None:
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Analysis Settings")
-        dialog.resize(1120, 760)
-        layout = QtWidgets.QVBoxLayout(dialog)
+        from results_analysis_app.settings_dialog import edit_settings
 
-        project_path = self._current_project_path()
-        project_frequency = load_project_frequency(project_path) if project_path else None
+        edit_settings(self, initial_tab)
 
-        tabs = QtWidgets.QTabWidget(dialog)
-        build_tab = QtWidgets.QWidget(tabs)
-        build_form = QtWidgets.QFormLayout(build_tab)
-        workers_spin = QtWidgets.QSpinBox(build_tab)
-        workers_spin.setRange(1, 64)
-        workers_spin.setValue(int(self.session.envelope_workers))
-        workers_spin.setToolTip("Parallel workers used while reading envelope waveform files.")
-        build_form.addRow("Envelope workers", workers_spin)
-
-        time_step_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        time_step_spin.setDecimals(4)
-        time_step_spin.setRange(0.0001, 1.0)
-        time_step_spin.setSingleStep(0.001)
-        time_step_spin.setSuffix(" s")
-        time_step_spin.setValue(float(self.session.envelope_time_step))
-        build_form.addRow("Envelope time step", time_step_spin)
-
-        time_end_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        time_end_spin.setDecimals(3)
-        time_end_spin.setRange(0.001, 10.0)
-        time_end_spin.setSingleStep(0.1)
-        time_end_spin.setSuffix(" s")
-        time_end_spin.setValue(float(self.session.envelope_time_end))
-        build_form.addRow("Envelope time end", time_end_spin)
-
-        fallback_frequency_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        fallback_frequency_spin.setDecimals(2)
-        fallback_frequency_spin.setRange(1.0, 1000.0)
-        fallback_frequency_spin.setSingleStep(1.0)
-        fallback_frequency_spin.setSuffix(" Hz")
-        fallback_frequency_spin.setValue(float(project_frequency or self.session.envelope_fallback_frequency))
-        fallback_frequency_spin.setEnabled(project_frequency is None)
-        build_form.addRow("Fallback frequency", fallback_frequency_spin)
-        frequency_source = (
-            f"Input_Data!B16 for selected project. Settings fallback remains {self.session.envelope_fallback_frequency:g} Hz."
-            if project_frequency is not None
-            else "Settings fallback; used when Input_Data!B16 is unavailable."
-        )
-        build_form.addRow("Frequency source", make_muted_label(frequency_source, build_tab))
-
-        high_voltage_factor_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        high_voltage_factor_spin.setDecimals(2)
-        high_voltage_factor_spin.setRange(0.01, 100.0)
-        high_voltage_factor_spin.setSingleStep(0.5)
-        high_voltage_factor_spin.setValue(float(self.session.high_voltage_limit_factor))
-        build_form.addRow("High voltage factor", high_voltage_factor_spin)
-
-        nonconv_iip_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        nonconv_iip_spin.setDecimals(1)
-        nonconv_iip_spin.setRange(0.1, 100000.0)
-        nonconv_iip_spin.setSingleStep(10.0)
-        nonconv_iip_spin.setValue(float(self.session.nonconv_cb_iip_limit))
-        build_form.addRow("NonConv CB_IIp limit", nonconv_iip_spin)
-
-        nonconv_iir_spin = QtWidgets.QDoubleSpinBox(build_tab)
-        nonconv_iir_spin.setDecimals(1)
-        nonconv_iir_spin.setRange(0.1, 100000.0)
-        nonconv_iir_spin.setSingleStep(10.0)
-        nonconv_iir_spin.setValue(float(self.session.nonconv_cb_iir_limit))
-        build_form.addRow("NonConv CB_IIr limit", nonconv_iir_spin)
-        tabs.addTab(build_tab, "Envelope Build")
-
-        chart_tab = QtWidgets.QWidget(tabs)
-        chart_layout = QtWidgets.QVBoxLayout(chart_tab)
-        chart_form = QtWidgets.QFormLayout()
-        chart_x_max_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-        chart_x_max_spin.setDecimals(3)
-        chart_x_max_spin.setRange(0.001, 10.0)
-        chart_x_max_spin.setSingleStep(0.1)
-        chart_x_max_spin.setSuffix(" s")
-        chart_x_max_spin.setValue(float(self.session.envelope_chart_x_max))
-        chart_form.addRow("Chart x max", chart_x_max_spin)
-
-        chart_x_major_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-        chart_x_major_spin.setDecimals(3)
-        chart_x_major_spin.setRange(0.001, 10.0)
-        chart_x_major_spin.setSingleStep(0.01)
-        chart_x_major_spin.setSuffix(" s")
-        chart_x_major_spin.setValue(float(self.session.envelope_chart_x_major))
-        chart_form.addRow("Chart x major", chart_x_major_spin)
-
-        chart_top_left_edit = QtWidgets.QLineEdit(chart_tab)
-        chart_top_left_edit.setText(self.session.envelope_chart_top_left_cell)
-        chart_form.addRow("Chart top-left cell", chart_top_left_edit)
-
-        chart_width_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-        chart_width_spin.setDecimals(2)
-        chart_width_spin.setRange(10.0, 5000.0)
-        chart_width_spin.setValue(float(self.session.envelope_chart_width))
-        chart_form.addRow("Chart width", chart_width_spin)
-
-        chart_height_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-        chart_height_spin.setDecimals(2)
-        chart_height_spin.setRange(10.0, 5000.0)
-        chart_height_spin.setValue(float(self.session.envelope_chart_height))
-        chart_form.addRow("Chart height", chart_height_spin)
-
-        show_sa_label_check = QtWidgets.QCheckBox("Show SA label", chart_tab)
-        show_sa_label_check.setChecked(bool(self.session.envelope_chart_show_sa_label))
-        chart_form.addRow("Annotations", show_sa_label_check)
-        chart_layout.addLayout(chart_form)
-
-        y_limit_table = QtWidgets.QTableWidget(0, 4, chart_tab)
-        y_limit_table.setHorizontalHeaderLabels(["kV", "Y min", "Y max", "Y major"])
-        y_limit_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        y_limit_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        y_limit_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        y_limit_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        chart_limits = normalize_chart_y_limits(self.session.envelope_chart_y_limits_by_voltage)
-        voltage_options = set(chart_limits)
-        voltage_options.update(self.session.voltages)
-        for scan in self.project_scans.values():
-            voltage_options.update(scan.available_voltages)
-        for voltage in self._sorted_voltages(voltage_options):
-            row = y_limit_table.rowCount()
-            y_limit_table.insertRow(row)
-            limits = chart_limits.get(voltage, {})
-            for column, value in enumerate(
-                (
-                    voltage,
-                    "" if limits.get("y_min") is None else str(limits.get("y_min")),
-                    "" if limits.get("y_max") is None else str(limits.get("y_max")),
-                    "" if limits.get("y_major") is None else str(limits.get("y_major")),
-                )
-            ):
-                y_limit_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
-        chart_layout.addWidget(make_section_label("Chart Y Limits By Voltage", chart_tab))
-        chart_layout.addWidget(y_limit_table)
-        tabs.addTab(chart_tab, "Envelope Chart")
-
-        um_tab = QtWidgets.QWidget(tabs)
-        um_layout = QtWidgets.QVBoxLayout(um_tab)
-        um_layout.addWidget(
-            make_muted_label(
-                f"Project: {Path(project_path).name}" if project_path else "Select a project to edit Um values.",
-                um_tab,
-            )
-        )
-        um_table = QtWidgets.QTableWidget(0, 3, um_tab)
-        um_table.setHorizontalHeaderLabels(["kV", "Um", "Source"])
-        um_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        um_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        um_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        xlsx_configs = {}
-        um_overrides = {}
-        if project_path:
-            xlsx_configs = load_voltage_configs(project_path, um_overrides={})
-            um_overrides = self.session.voltage_um_overrides_by_project.get(project_path, {})
-            scan = self.project_scans.get(project_path)
-            voltages = set(self.session.voltages)
-            voltages.update(xlsx_configs)
-            voltages.update(um_overrides)
-            if scan is not None:
-                voltages.update(scan.available_voltages)
-            for voltage in self._sorted_voltages(voltages):
-                row = um_table.rowCount()
-                um_table.insertRow(row)
-                voltage_item = QtWidgets.QTableWidgetItem(voltage)
-                voltage_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-                um_table.setItem(row, 0, voltage_item)
-                if voltage in um_overrides:
-                    um_value = um_overrides[voltage]
-                    source = "Manual"
-                elif voltage in xlsx_configs:
-                    um_value = xlsx_configs[voltage].um
-                    source = "Input xlsx"
-                else:
-                    um_value = ""
-                    source = "Missing"
-                um_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(um_value)))
-                source_item = QtWidgets.QTableWidgetItem(source)
-                source_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-                um_table.setItem(row, 2, source_item)
-        um_layout.addWidget(um_table)
-        tabs.addTab(um_tab, "Voltage Um")
-
-        events_tab = QtWidgets.QWidget(tabs)
-        events_form = QtWidgets.QFormLayout(events_tab)
-        event_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
-        for event in DEFAULT_EVENTS:
-            spin = QtWidgets.QDoubleSpinBox(events_tab)
-            spin.setDecimals(4)
-            spin.setRange(0.0, 10.0)
-            spin.setSingleStep(0.001)
-            spin.setSuffix(" s")
-            spin.setValue(float(self.session.event_times.get(event, 0.0)))
-            event_spins[event] = spin
-            events_form.addRow(event, spin)
-        tabs.addTab(events_tab, "Events")
-
-        resonance_tab = QtWidgets.QWidget(tabs)
-        resonance_layout = QtWidgets.QVBoxLayout(resonance_tab)
-        resonance_form = QtWidgets.QFormLayout()
-        resonance_layout.addWidget(
-            make_muted_label("Enable checks from the top Analysis row. This page controls their thresholds.", resonance_tab)
-        )
-
-        resonance_top_n_spin = QtWidgets.QSpinBox(resonance_tab)
-        resonance_top_n_spin.setRange(1, 20)
-        resonance_top_n_spin.setValue(int(self.session.resonance_top_n))
-        resonance_form.addRow("Top N per voltage/type/check", resonance_top_n_spin)
-
-        resonance_limit_spin = QtWidgets.QDoubleSpinBox(resonance_tab)
-        resonance_limit_spin.setDecimals(4)
-        resonance_limit_spin.setRange(0.001, 100.0)
-        resonance_limit_spin.setSingleStep(0.1)
-        resonance_limit_spin.setValue(float(self.session.resonance_limit_multiplier))
-        resonance_form.addRow("Voltage limit multiplier", resonance_limit_spin)
-
-        resonance_auto_release_check = QtWidgets.QCheckBox("Auto-detect release/recovery time", resonance_tab)
-        resonance_auto_release_check.setChecked(bool(self.session.resonance_auto_release))
-        resonance_form.addRow("Release mode", resonance_auto_release_check)
-
-        resonance_manual_start_spin = QtWidgets.QDoubleSpinBox(resonance_tab)
-        resonance_manual_start_spin.setDecimals(4)
-        resonance_manual_start_spin.setRange(0.0, 10.0)
-        resonance_manual_start_spin.setSingleStep(0.001)
-        resonance_manual_start_spin.setSuffix(" s")
-        resonance_manual_start_spin.setValue(float(self.session.resonance_manual_analysis_start))
-        resonance_manual_start_spin.setEnabled(not resonance_auto_release_check.isChecked())
-        resonance_auto_release_check.toggled.connect(lambda checked: resonance_manual_start_spin.setEnabled(not checked))
-        resonance_form.addRow("Manual analysis start time", resonance_manual_start_spin)
-        resonance_layout.addLayout(resonance_form)
-
-        advanced_group = QtWidgets.QGroupBox("Algorithm constants", resonance_tab)
-        advanced_form = QtWidgets.QFormLayout(advanced_group)
-
-        def fraction_spin(value: float) -> QtWidgets.QDoubleSpinBox:
-            spin = QtWidgets.QDoubleSpinBox(advanced_group)
-            spin.setDecimals(4)
-            spin.setRange(0.0001, 1.0)
-            spin.setSingleStep(0.01)
-            spin.setValue(float(value))
-            return spin
-
-        def seconds_spin(value: float) -> QtWidgets.QDoubleSpinBox:
-            spin = QtWidgets.QDoubleSpinBox(advanced_group)
-            spin.setDecimals(4)
-            spin.setRange(0.0001, 10.0)
-            spin.setSingleStep(0.001)
-            spin.setSuffix(" s")
-            spin.setValue(float(value))
-            return spin
-
-        peak_fraction_spin = fraction_spin(self.session.resonance_peak_search_fraction)
-        release_decay_spin = fraction_spin(self.session.resonance_release_decay_ratio)
-        release_rebound_spin = fraction_spin(self.session.resonance_release_rebound_ratio)
-        release_hold_spin = seconds_spin(self.session.resonance_release_hold_time)
-        rolling_window_spin = seconds_spin(self.session.resonance_rolling_p95_window)
-        rolling_min_spin = QtWidgets.QSpinBox(advanced_group)
-        rolling_min_spin.setRange(1, 10000)
-        rolling_min_spin.setValue(int(self.session.resonance_rolling_min_samples))
-        log_floor_factor_spin = QtWidgets.QDoubleSpinBox(advanced_group)
-        log_floor_factor_spin.setDecimals(8)
-        log_floor_factor_spin.setRange(0.00000001, 1.0)
-        log_floor_factor_spin.setValue(float(self.session.resonance_log_floor_vlim_factor))
-        log_floor_absolute_spin = QtWidgets.QDoubleSpinBox(advanced_group)
-        log_floor_absolute_spin.setDecimals(8)
-        log_floor_absolute_spin.setRange(0.00000001, 1000.0)
-        log_floor_absolute_spin.setValue(float(self.session.resonance_log_floor_absolute))
-        growth_window_fraction_spin = fraction_spin(self.session.resonance_growth_window_fraction)
-        min_positive_fraction_spin = fraction_spin(self.session.resonance_min_positive_fraction)
-        min_growth_ratio_spin = QtWidgets.QDoubleSpinBox(advanced_group)
-        min_growth_ratio_spin.setDecimals(4)
-        min_growth_ratio_spin.setRange(1.0, 100.0)
-        min_growth_ratio_spin.setSingleStep(0.01)
-        min_growth_ratio_spin.setValue(float(self.session.resonance_min_growth_ratio))
-        min_level_spin = QtWidgets.QDoubleSpinBox(advanced_group)
-        min_level_spin.setDecimals(4)
-        min_level_spin.setRange(0.0001, 100.0)
-        min_level_spin.setSingleStep(0.05)
-        min_level_spin.setValue(float(self.session.resonance_min_level_over_vlim))
-        min_delta_factor_spin = QtWidgets.QDoubleSpinBox(advanced_group)
-        min_delta_factor_spin.setDecimals(4)
-        min_delta_factor_spin.setRange(0.0001, 100.0)
-        min_delta_factor_spin.setSingleStep(0.01)
-        min_delta_factor_spin.setValue(float(self.session.resonance_min_growth_delta_factor))
-
-        advanced_form.addRow("Peak search fraction", peak_fraction_spin)
-        advanced_form.addRow("Release decay ratio", release_decay_spin)
-        advanced_form.addRow("Release rebound ratio", release_rebound_spin)
-        advanced_form.addRow("Release hold time", release_hold_spin)
-        advanced_form.addRow("Trailing rolling p95 window", rolling_window_spin)
-        advanced_form.addRow("Rolling minimum samples", rolling_min_spin)
-        advanced_form.addRow("Log floor Vlim factor", log_floor_factor_spin)
-        advanced_form.addRow("Log floor absolute", log_floor_absolute_spin)
-        advanced_form.addRow("Growth window fraction", growth_window_fraction_spin)
-        advanced_form.addRow("Minimum positive fraction", min_positive_fraction_spin)
-        advanced_form.addRow("Minimum growth ratio", min_growth_ratio_spin)
-        advanced_form.addRow("Minimum level over Vlim", min_level_spin)
-        advanced_form.addRow("Minimum growth delta factor", min_delta_factor_spin)
-        resonance_layout.addWidget(advanced_group)
-        resonance_layout.addStretch(1)
-        tabs.addTab(resonance_tab, "Resonance Checks")
-
-        if initial_tab:
-            for index in range(tabs.count()):
-                if tabs.tabText(index) == initial_tab:
-                    tabs.setCurrentIndex(index)
-                    break
-        layout.addWidget(tabs)
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
-            dialog,
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-
-        def optional_number(item: QtWidgets.QTableWidgetItem | None) -> float | None:
-            if item is None or not item.text().strip():
-                return None
-            try:
-                return float(item.text())
-            except ValueError:
-                return None
-
-        old_nonconv_limits = (
-            float(self.session.nonconv_cb_iip_limit),
-            float(self.session.nonconv_cb_iir_limit),
-        )
-        self.session.envelope_workers = int(workers_spin.value())
-        self.session.envelope_time_step = float(time_step_spin.value())
-        self.session.envelope_time_end = float(time_end_spin.value())
-        if project_frequency is None:
-            self.session.envelope_fallback_frequency = float(fallback_frequency_spin.value())
-        self.session.envelope_chart_x_max = float(chart_x_max_spin.value())
-        self.session.envelope_chart_x_major = float(chart_x_major_spin.value())
-        self.session.envelope_chart_top_left_cell = chart_top_left_edit.text().strip() or "H1"
-        self.session.envelope_chart_width = float(chart_width_spin.value())
-        self.session.envelope_chart_height = float(chart_height_spin.value())
-        self.session.envelope_chart_show_sa_label = show_sa_label_check.isChecked()
-        raw_y_limits = {}
-        for row in range(y_limit_table.rowCount()):
-            voltage_item = y_limit_table.item(row, 0)
-            if voltage_item is None or not voltage_item.text().strip():
-                continue
-            raw_y_limits[voltage_item.text()] = {
-                "y_min": optional_number(y_limit_table.item(row, 1)),
-                "y_max": optional_number(y_limit_table.item(row, 2)),
-                "y_major": optional_number(y_limit_table.item(row, 3)),
-            }
-        self.session.envelope_chart_y_limits_by_voltage = normalize_chart_y_limits(raw_y_limits)
-        if project_path:
-            overrides = {}
-            for row in range(um_table.rowCount()):
-                voltage_item = um_table.item(row, 0)
-                um_item = um_table.item(row, 1)
-                if voltage_item is None or um_item is None:
-                    continue
-                voltage = voltage_item.text().strip()
-                if not voltage:
-                    continue
-                try:
-                    um = float(um_item.text())
-                except ValueError:
-                    continue
-                default = xlsx_configs.get(voltage)
-                if default is None or abs(default.um - um) > 1e-9:
-                    overrides[voltage] = um
-            if overrides:
-                self.session.voltage_um_overrides_by_project[project_path] = overrides
-            else:
-                self.session.voltage_um_overrides_by_project.pop(project_path, None)
-        self.session.high_voltage_limit_factor = float(high_voltage_factor_spin.value())
-        self.session.nonconv_cb_iip_limit = float(nonconv_iip_spin.value())
-        self.session.nonconv_cb_iir_limit = float(nonconv_iir_spin.value())
-        self.session.resonance_top_n = int(resonance_top_n_spin.value())
-        self.session.resonance_limit_multiplier = float(resonance_limit_spin.value())
-        self.session.resonance_auto_release = resonance_auto_release_check.isChecked()
-        self.session.resonance_manual_analysis_start = float(resonance_manual_start_spin.value())
-        self.session.resonance_peak_search_fraction = float(peak_fraction_spin.value())
-        self.session.resonance_release_decay_ratio = float(release_decay_spin.value())
-        self.session.resonance_release_rebound_ratio = float(release_rebound_spin.value())
-        self.session.resonance_release_hold_time = float(release_hold_spin.value())
-        self.session.resonance_rolling_p95_window = float(rolling_window_spin.value())
-        self.session.resonance_rolling_min_samples = int(rolling_min_spin.value())
-        self.session.resonance_log_floor_vlim_factor = float(log_floor_factor_spin.value())
-        self.session.resonance_log_floor_absolute = float(log_floor_absolute_spin.value())
-        self.session.resonance_growth_window_fraction = float(growth_window_fraction_spin.value())
-        self.session.resonance_min_positive_fraction = float(min_positive_fraction_spin.value())
-        self.session.resonance_min_growth_ratio = float(min_growth_ratio_spin.value())
-        self.session.resonance_min_level_over_vlim = float(min_level_spin.value())
-        self.session.resonance_min_growth_delta_factor = float(min_delta_factor_spin.value())
-        event_times = {event: float(spin.value()) for event, spin in event_spins.items()}
-        self.session.event_times = event_times
-        self.autosave()
-        new_nonconv_limits = (
-            float(self.session.nonconv_cb_iip_limit),
-            float(self.session.nonconv_cb_iir_limit),
-        )
-        if new_nonconv_limits != old_nonconv_limits:
-            self.rescan_projects()
 
     def _set_voltage_options(
         self,
@@ -994,7 +650,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.voltage_layout.addWidget(check)
         finally:
             self._loading = was_loading
-        self._reload_bus_exclusion_fields()
         if not self._loading:
             self._sync_global_selections_from_ui()
 
@@ -1077,30 +732,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.project_exclusion_label.setText("Select a project.")
             else:
                 self.project_exclusion_label.setText(Path(project_path).name)
-            self._reload_bus_exclusion_fields()
-            self._set_case_run_rows(
-                self.session.manual_case_run_exclusions_by_project.get(project_path or "", [])
+            self._set_manual_exclusion_rows(
+                self.session.manual_exclusions_by_project.get(project_path or "", [])
             )
             self._set_nonconv_proposal_rows(scan.nonconv_cases if scan else [])
             self._set_high_voltage_proposal_rows(scan.high_voltage_exclusions if scan else [])
         finally:
             self._loading = was_loading
-
-    def _reload_bus_exclusion_fields(self) -> None:
-        while self.bus_exclusion_layout.rowCount():
-            self.bus_exclusion_layout.removeRow(0)
-        self.bus_exclusion_fields = {}
-        project_path = self._current_project_path()
-        scan = self._selected_scan()
-        voltages = self.session.voltages or (scan.available_voltages if scan else [])
-        exclusions = self.session.bus_exclusions_by_project.get(project_path or "", {})
-        for voltage in self._sorted_voltages(voltages):
-            edit = QtWidgets.QLineEdit(self.bus_exclusion_tab)
-            edit.setPlaceholderText(f"MM_{voltage}_...")
-            edit.setText(", ".join(exclusions.get(voltage, [])))
-            edit.textChanged.connect(self._on_project_exclusions_changed)
-            self.bus_exclusion_fields[voltage] = edit
-            self.bus_exclusion_layout.addRow(f"{voltage} kV", edit)
 
     @contextmanager
     def _table_bulk_update(self, table: QtWidgets.QTableWidget):
@@ -1112,13 +750,28 @@ class MainWindow(QtWidgets.QMainWindow):
             table.setUpdatesEnabled(True)
             del blocker
 
-    def _set_case_run_rows(self, rows: list[tuple[str, int]]) -> None:
-        normalized = normalize_case_run_exclusions(rows)
-        with self._table_bulk_update(self.case_run_table):
-            self.case_run_table.setRowCount(len(normalized))
-            for row, (case, run) in enumerate(normalized):
-                self.case_run_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(case)))
-                self.case_run_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(run)))
+    def _set_manual_exclusion_rows(self, rows: list[ExclusionRule]) -> None:
+        normalized = normalize_exclusion_rules(rows)
+        with self._table_bulk_update(self.manual_exclusion_table):
+            self.manual_exclusion_table.setRowCount(len(normalized))
+            for row, rule in enumerate(normalized):
+                self.manual_exclusion_table.setItem(
+                    row,
+                    0,
+                    self._checkbox_item(
+                        rule.apply,
+                        "Checked rows are excluded from envelope builds.",
+                    ),
+                )
+                for column, value in enumerate(
+                    (rule.case, "" if rule.run is None else rule.run, rule.bus),
+                    start=1,
+                ):
+                    self.manual_exclusion_table.setItem(
+                        row,
+                        column,
+                        self._editable_table_item(value),
+                    )
 
     def _checkbox_item(self, checked: bool, tooltip: str) -> QtWidgets.QTableWidgetItem:
         item = QtWidgets.QTableWidgetItem("")
@@ -1138,6 +791,12 @@ class MainWindow(QtWidgets.QMainWindow):
         item = QtWidgets.QTableWidgetItem(text)
         item.setToolTip(text)
         item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+        return item
+
+    def _editable_table_item(self, value: object = "") -> QtWidgets.QTableWidgetItem:
+        text = str(value)
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setToolTip(text)
         return item
 
     def _set_nonconv_proposal_rows(self, rows: list[scanner.NonConvergentCase]) -> None:
@@ -1220,17 +879,44 @@ class MainWindow(QtWidgets.QMainWindow):
         elif not visible and index >= 0:
             self.exclusion_tabs.removeTab(index)
 
-    def _append_case_run_row(self, case: str = "", run: int | str = "") -> None:
-        row = self.case_run_table.rowCount()
-        self.case_run_table.insertRow(row)
-        self.case_run_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(case)))
-        self.case_run_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(run)))
+    def _append_manual_exclusion_row(self, rule: ExclusionRule | None = None) -> int:
+        rule = rule or ExclusionRule()
+        row = self.manual_exclusion_table.rowCount()
+        self.manual_exclusion_table.insertRow(row)
+        self.manual_exclusion_table.setItem(
+            row,
+            0,
+            self._checkbox_item(
+                rule.apply,
+                "Checked rows are excluded from envelope builds.",
+            ),
+        )
+        for column, value in enumerate(
+            (rule.case, "" if rule.run is None else rule.run, rule.bus),
+            start=1,
+        ):
+            self.manual_exclusion_table.setItem(
+                row,
+                column,
+                self._editable_table_item(value),
+            )
+        return row
 
-    def _enable_table_copy(self, table: QtWidgets.QTableWidget) -> None:
+    def _enable_table_clipboard(
+        self,
+        table: QtWidgets.QTableWidget,
+        *,
+        paste: bool = False,
+    ) -> None:
         shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Copy, table)
         shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         shortcut.activated.connect(lambda checked=False, target=table: self._copy_table_selection(target))
-        self._table_copy_shortcuts.append(shortcut)
+        self._table_shortcuts.append(shortcut)
+        if paste:
+            paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Paste, table)
+            paste_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            paste_shortcut.activated.connect(self._paste_manual_exclusions)
+            self._table_shortcuts.append(paste_shortcut)
 
     def _table_clipboard_value(self, table: QtWidgets.QTableWidget, row: int, column: int) -> str:
         item = table.item(row, column)
@@ -1265,14 +951,99 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_rows(self, table: QtWidgets.QTableWidget) -> list[int]:
         return sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
 
-    def _case_run_rows(self) -> list[tuple[str, int]]:
-        rows: list[tuple[str, int]] = []
-        for row in range(self.case_run_table.rowCount()):
-            case_item = self.case_run_table.item(row, 0)
-            run_item = self.case_run_table.item(row, 1)
-            if case_item is not None and run_item is not None:
-                rows.append((case_item.text(), run_item.text()))
-        return normalize_case_run_exclusions(rows)
+    def _manual_exclusion_rows(self) -> list[ExclusionRule]:
+        rows: list[dict[str, object]] = []
+        for row in range(self.manual_exclusion_table.rowCount()):
+            apply_item = self.manual_exclusion_table.item(row, 0)
+            values = [
+                self.manual_exclusion_table.item(row, column).text()
+                if self.manual_exclusion_table.item(row, column) is not None
+                else ""
+                for column in range(1, 4)
+            ]
+            rows.append(
+                {
+                    "apply": (
+                        apply_item is not None
+                        and apply_item.checkState() == QtCore.Qt.CheckState.Checked
+                    ),
+                    "case": values[0],
+                    "run": values[1],
+                    "bus": values[2],
+                }
+            )
+        return normalize_exclusion_rules(rows)
+
+    def _paste_manual_exclusions(self) -> None:
+        lines = [
+            line.split("\t")
+            for line in QtWidgets.QApplication.clipboard().text().splitlines()
+            if line.strip()
+        ]
+        if not lines:
+            return
+
+        header_names = {"apply", "case", "run", "bus"}
+        first = [value.strip().casefold() for value in lines[0]]
+        has_header = (
+            all(value in header_names for value in first)
+            and (len(first) > 1 or first == ["apply"])
+        )
+        if has_header:
+            column_map = {
+                source: ("apply", "case", "run", "bus").index(name)
+                for source, name in enumerate(first)
+            }
+            data_rows = lines[1:]
+        else:
+            current_column = self.manual_exclusion_table.currentColumn()
+            if current_column < 0:
+                current_column = 0 if len(first) >= 4 else 1
+            column_map = {
+                source: current_column + source
+                for source in range(len(first))
+                if current_column + source < self.manual_exclusion_table.columnCount()
+            }
+            data_rows = lines
+        if not data_rows:
+            return
+
+        start_row = self.manual_exclusion_table.currentRow()
+        if start_row < 0:
+            start_row = self.manual_exclusion_table.rowCount()
+        with self._table_bulk_update(self.manual_exclusion_table):
+            for offset, values in enumerate(data_rows):
+                target_row = start_row + offset
+                while target_row >= self.manual_exclusion_table.rowCount():
+                    self._append_manual_exclusion_row()
+                for source_column, value in enumerate(values):
+                    target_column = column_map.get(source_column)
+                    if target_column is None:
+                        continue
+                    if target_column == 0:
+                        checked = value.strip().casefold() not in {
+                            "0",
+                            "false",
+                            "no",
+                            "off",
+                            "unchecked",
+                            "none",
+                        }
+                        item = self.manual_exclusion_table.item(target_row, 0)
+                        if item is not None:
+                            item.setCheckState(
+                                QtCore.Qt.CheckState.Checked
+                                if checked
+                                else QtCore.Qt.CheckState.Unchecked
+                            )
+                    else:
+                        item = self.manual_exclusion_table.item(target_row, target_column)
+                        if item is None:
+                            item = self._editable_table_item()
+                            self.manual_exclusion_table.setItem(target_row, target_column, item)
+                        item.setText(value.strip())
+                        item.setToolTip(value.strip())
+        self._on_project_exclusions_changed()
 
     def _disabled_nonconv_rows(self) -> list[tuple[str, int]]:
         rows: list[tuple[str, int]] = []
@@ -1305,19 +1076,11 @@ class MainWindow(QtWidgets.QMainWindow):
         project_path = self._current_project_path()
         if project_path is None:
             return
-        bus_exclusions = normalize_bus_exclusions(
-            {voltage: edit.text() for voltage, edit in self.bus_exclusion_fields.items()}
-        )
-        if bus_exclusions:
-            self.session.bus_exclusions_by_project[project_path] = bus_exclusions
+        manual_exclusions = self._manual_exclusion_rows()
+        if manual_exclusions:
+            self.session.manual_exclusions_by_project[project_path] = manual_exclusions
         else:
-            self.session.bus_exclusions_by_project.pop(project_path, None)
-
-        case_run = self._case_run_rows()
-        if case_run:
-            self.session.manual_case_run_exclusions_by_project[project_path] = case_run
-        else:
-            self.session.manual_case_run_exclusions_by_project.pop(project_path, None)
+            self.session.manual_exclusions_by_project.pop(project_path, None)
 
         disabled_nonconv = self._disabled_nonconv_rows()
         if disabled_nonconv:
@@ -1337,7 +1100,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_current_project_exclusions()
         self.autosave()
 
-    def _on_case_run_table_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
+    def _on_manual_exclusion_table_changed(
+        self,
+        _item: QtWidgets.QTableWidgetItem,
+    ) -> None:
         self._on_project_exclusions_changed()
 
     def _on_nonconv_table_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
@@ -1348,32 +1114,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if item.column() == 0:
             self._on_project_exclusions_changed()
 
-    def _apply_all_high_voltage_rows(self) -> None:
-        self._set_all_high_voltage_rows_checked(True)
-
-    def _clear_all_high_voltage_rows(self) -> None:
-        self._set_all_high_voltage_rows_checked(False)
-
-    def _set_all_high_voltage_rows_checked(self, checked: bool) -> None:
+    def _set_all_exclusion_rows_checked(
+        self,
+        table: QtWidgets.QTableWidget,
+        checked: bool,
+    ) -> None:
         was_loading = self._loading
         self._loading = True
         try:
-            with self._table_bulk_update(self.high_voltage_proposal_table):
-                for row in range(self.high_voltage_proposal_table.rowCount()):
-                    item = self.high_voltage_proposal_table.item(row, 0)
+            with self._table_bulk_update(table):
+                for row in range(table.rowCount()):
+                    item = table.item(row, 0)
                     if item is not None:
-                        item.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                        item.setCheckState(
+                            QtCore.Qt.CheckState.Checked
+                            if checked
+                            else QtCore.Qt.CheckState.Unchecked
+                        )
         finally:
             self._loading = was_loading
         self._on_project_exclusions_changed()
 
-    def _add_case_run_row(self) -> None:
-        self._append_case_run_row()
+    def _add_manual_exclusion_row(self) -> None:
+        with self._table_bulk_update(self.manual_exclusion_table):
+            row = self._append_manual_exclusion_row()
+        self.manual_exclusion_table.setCurrentCell(row, 1)
+        self.manual_exclusion_table.editItem(self.manual_exclusion_table.item(row, 1))
         self._on_project_exclusions_changed()
 
-    def _delete_case_run_rows(self) -> None:
-        for row in self._selected_rows(self.case_run_table):
-            self.case_run_table.removeRow(row)
+    def _delete_manual_exclusion_rows(self) -> None:
+        for row in self._selected_rows(self.manual_exclusion_table):
+            self.manual_exclusion_table.removeRow(row)
         self._on_project_exclusions_changed()
 
     def _on_global_selection_changed(self) -> None:
@@ -1498,9 +1269,9 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._loading = False
         self.autosave()
-        self.rescan_projects()
         self._select_project_path(project_path)
         self._reload_project_exclusions()
+        self.refresh_project_scans(project_paths=[project_path])
 
     def delete_selected_projects(self) -> None:
         selected_items = self.project_tree.selectedItems()
@@ -1511,6 +1282,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for path in paths:
             self.project_scans.pop(path, None)
             self.dashboard_figures.pop(path, None)
+        try:
+            project_scan_cache.remove_projects(paths)
+        except OSError as exc:
+            self.log(f"Project scan cache cleanup failed: {exc}")
         self._loading = True
         try:
             self._reload_project_tree()
@@ -1620,7 +1395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.ensure_full_scope()
         self._load_session_to_ui()
         self.autosave()
-        self.rescan_projects()
+        self.refresh_project_scans()
         self.log(f"Loaded session: {path_text}")
 
     def clear_session(self) -> None:
@@ -1636,6 +1411,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dashboard_figures.clear()
         self._autosave_timer.stop()
         storage.clear_autosave()
+        try:
+            project_scan_cache.clear()
+        except OSError as exc:
+            self.log(f"Project scan cache cleanup failed: {exc}")
         self._load_session_to_ui()
         self._load_dashboard_figure_list(None)
         self.update_preview()
@@ -1695,56 +1474,91 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
         return True
 
-    def _effective_case_run_exclusions_by_project(self) -> dict[str, list[tuple[str, int]]]:
+    def _effective_exclusions_by_project(self) -> dict[str, list[ExclusionRule]]:
         result = {
-            project: list(exclusions)
-            for project, exclusions in self.session.manual_case_run_exclusions_by_project.items()
+            project: [rule for rule in normalize_exclusion_rules(exclusions) if rule.apply]
+            for project, exclusions in self.session.manual_exclusions_by_project.items()
         }
         for project_path, scan in self.project_scans.items():
             disabled = set(self.session.disabled_nonconv_by_project.get(project_path, []))
             detected = [
-                (row.case, row.run)
+                ExclusionRule(case=row.case, run=row.run)
                 for row in scan.nonconv_cases
                 if (row.case, row.run) not in disabled
             ]
-            combined = normalize_case_run_exclusions([*result.get(project_path, []), *detected])
-            if combined:
-                result[project_path] = combined
+            result.setdefault(project_path, []).extend(detected)
+        for project_path, exclusions in self.session.high_voltage_exclusions_by_project.items():
+            result.setdefault(project_path, []).extend(
+                ExclusionRule(voltage=voltage, case=case, run=run, bus=bus)
+                for voltage, case, run, bus in normalize_high_voltage_exclusions(exclusions)
+            )
+        for project_path in list(result):
+            normalized = normalize_exclusion_rules(result[project_path])
+            if normalized:
+                result[project_path] = normalized
             else:
-                result.pop(project_path, None)
+                result.pop(project_path)
         return result
 
-    def rescan_projects(self) -> None:
+    def refresh_project_scans(
+        self,
+        project_paths: Iterable[str] | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
         if self._busy:
             return
         current_path = self._current_project_path()
-        project_paths = [project.path for project in self.session.projects]
-        if not project_paths:
+        paths = list(
+            dict.fromkeys(
+                str(Path(path).resolve())
+                for path in (
+                    project_paths
+                    if project_paths is not None
+                    else [project.path for project in self.session.projects]
+                )
+            )
+        )
+        if not paths:
             self.project_scans.clear()
             self.session.status_cache.clear()
+            try:
+                project_scan_cache.clear()
+            except OSError as exc:
+                self.log(f"Project scan cache cleanup failed: {exc}")
             self.update_preview()
             return
         iip_limit = float(self.session.nonconv_cb_iip_limit)
         iir_limit = float(self.session.nonconv_cb_iir_limit)
 
-        def work(_log, cancel):
-            return project_scan_runner.scan_projects(
-                project_paths,
+        def work(log, cancel):
+            return project_scan_runner.scan_projects_cached(
+                paths,
                 current_path,
                 iip_limit,
                 iir_limit,
+                force=force,
                 check_cancel=cancel.throw_if_cancelled,
+                log=log,
             )
 
-        self._start_background_task("Scanning projects", work, self._rescan_projects_finished)
+        title = "Rebuilding project cache" if force else "Checking project cache"
+        self._start_background_task(title, work, self._project_scans_finished)
 
-    def _rescan_projects_finished(self, result: project_scan_runner.ProjectScanBatch) -> None:
+    def _project_scans_finished(self, result: project_scan_runner.ProjectScanBatch) -> None:
         current_path = result.current_path
         scans = result.scans
         known_paths = {project.path for project in self.session.projects}
+        self.project_scans.update(
+            {
+                project_path: scan
+                for project_path, scan in scans.items()
+                if project_path in known_paths
+            }
+        )
         self.project_scans = {
             project_path: scan
-            for project_path, scan in scans.items()
+            for project_path, scan in self.project_scans.items()
             if project_path in known_paths
         }
         self.session.status_cache = {
@@ -1783,6 +1597,57 @@ class MainWindow(QtWidgets.QMainWindow):
             selected = discovered
         self._set_voltage_options(discovered, selected)
 
+    def _refresh_project_status_after_action(
+        self,
+        project_paths: Iterable[str],
+        *,
+        refresh_dashboards: bool = False,
+        refresh_envelopes: bool = False,
+        refresh_plots: bool = False,
+        refresh_reports: bool = False,
+        refresh_high_voltage_exclusions: bool = False,
+    ) -> None:
+        paths = list(dict.fromkeys(str(Path(path).resolve()) for path in project_paths))
+        for project_path in paths:
+            scan = self.project_scans.get(project_path)
+            if scan is None:
+                continue
+            scanner.refresh_project_scan_outputs(
+                scan,
+                refresh_dashboards=refresh_dashboards,
+                refresh_envelopes=refresh_envelopes,
+                refresh_plots=refresh_plots,
+                refresh_reports=refresh_reports,
+                refresh_high_voltage_exclusions=refresh_high_voltage_exclusions,
+            )
+            self.session.status_cache[project_path] = scan.chips
+
+        if not paths:
+            return
+        try:
+            project_scan_cache.update_project_scans(
+                self.project_scans,
+                paths,
+                (
+                    float(self.session.nonconv_cb_iip_limit),
+                    float(self.session.nonconv_cb_iir_limit),
+                ),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self.log(f"Project scan cache could not be saved: {exc}")
+
+        current_path = self._current_project_path()
+        self._loading = True
+        try:
+            self._reload_project_tree()
+            if current_path is not None:
+                self._select_project_path(current_path)
+        finally:
+            self._loading = False
+        self._reload_project_exclusions()
+        self.autosave()
+        self.update_preview()
+
     def _select_project_path(self, project_path: str) -> None:
         for row in range(self.project_tree.topLevelItemCount()):
             item = self.project_tree.topLevelItem(row)
@@ -1812,7 +1677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_background_task(
             "Scanning dashboard figures",
             work,
-            self._dashboard_refresh_finished,
+            self._dashboard_figures_scan_finished,
         )
 
     def refresh_dashboards(self) -> None:
@@ -1851,13 +1716,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         result: dict[str, tuple[list[DashboardFigure], list[str]]],
     ) -> None:
+        self._update_dashboard_figures(result)
+        self._refresh_project_status_after_action(
+            result,
+            refresh_dashboards=True,
+        )
+        self.autosave()
+        self._load_dashboard_figure_list(self._current_project_path())
+
+    def _update_dashboard_figures(
+        self,
+        result: dict[str, tuple[list[DashboardFigure], list[str]]],
+    ) -> None:
         for project_path, (figures, _warnings) in result.items():
             self.dashboard_figures[project_path] = figures
             if not self.session.dashboard_figure_selection_initialized and figures:
                 self.session.dashboard_figure_selection = [figure.id for figure in figures]
                 self.session.dashboard_figure_selection_initialized = True
+
+    def _dashboard_figures_scan_finished(
+        self,
+        result: dict[str, tuple[list[DashboardFigure], list[str]]],
+    ) -> None:
+        self._update_dashboard_figures(result)
         self.autosave()
-        self.rescan_projects()
         self._load_dashboard_figure_list(self._current_project_path())
 
     def scan_high_voltage_log(self) -> None:
@@ -1878,6 +1760,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     root,
                     limit_factor,
                     voltage_overrides.get(project_path, {}),
+                    check_cancel=cancel.throw_if_cancelled,
                 )
                 result[project_path] = (rows, warnings)
                 log(f"PSCAD log high-voltage scan complete: {root.name} | {len(rows)} proposals")
@@ -1938,7 +1821,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._ensure_voltage_um(projects, voltages):
             return
         dashboard_figure_ids = list(self.session.dashboard_figure_selection)
-        envelope_kwargs = self._envelope_build_kwargs(self._effective_case_run_exclusions_by_project())
+        envelope_kwargs = self._envelope_build_kwargs()
 
         def work(log, cancel):
             log("Analysis started.")
@@ -1957,7 +1840,17 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Analysis finished. Reports written: {len(written)}")
             return written
 
-        self._start_background_task("Running analysis", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Running analysis",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_envelopes=True,
+                refresh_plots=True,
+                refresh_reports=True,
+                refresh_high_voltage_exclusions=True,
+            ),
+        )
 
     def build_envelopes_only(self) -> None:
         selected = self._selected_work("Build envelopes")
@@ -1967,7 +1860,7 @@ class MainWindow(QtWidgets.QMainWindow):
         voltages = list(self.session.voltages)
         if not self._ensure_voltage_um(projects, voltages):
             return
-        envelope_kwargs = self._envelope_build_kwargs(self._effective_case_run_exclusions_by_project())
+        envelope_kwargs = self._envelope_build_kwargs()
 
         def work(log, cancel):
             log("Envelope build started.")
@@ -1985,7 +1878,14 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Envelope data/check build complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task("Building envelope data/checks", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Building envelope data/checks",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_envelopes=True,
+            ),
+        )
 
     def rebuild_envelope_charts_only(self) -> None:
         selected = self._selected_work("Rebuild envelope charts")
@@ -2009,7 +1909,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_background_task(
             "Rebuilding envelope charts",
             work,
-            lambda _result: self.rescan_projects(),
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_envelopes=True,
+                refresh_high_voltage_exclusions=True,
+            ),
         )
 
     def create_event_batches_only(self) -> None:
@@ -2032,7 +1936,7 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Event plot batch creation complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task("Creating event plot batches", work, lambda _result: self.rescan_projects())
+        self._start_background_task("Creating event plot batches", work)
 
     def render_event_plots_only(self) -> None:
         selected = self._selected_work("Render event plots")
@@ -2051,7 +1955,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             log("Event plot rendering complete.")
 
-        self._start_background_task("Rendering event plots", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Rendering event plots",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_plots=True,
+            ),
+        )
 
     def rebuild_analysis_charts_only(self) -> None:
         selected = self._selected_work("Rebuild analysis charts")
@@ -2064,13 +1975,21 @@ class MainWindow(QtWidgets.QMainWindow):
             written = actions.rebuild_analysis_charts(
                 projects,
                 scopes,
+                envelope_chart_x_max=self.session.envelope_chart_x_max,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
             log(f"Analysis chart rebuild complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task("Rebuilding analysis charts", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Rebuilding analysis charts",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_envelopes=True,
+            ),
+        )
 
     def create_analysis_batches_only(self) -> None:
         selected = self._selected_work("Create analysis batches")
@@ -2094,7 +2013,7 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Analysis plot batch creation complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task("Creating analysis plot batches", work, lambda _result: self.rescan_projects())
+        self._start_background_task("Creating analysis plot batches", work)
 
     def render_analysis_plots_only(self) -> None:
         selected = self._selected_work("Render analysis plots")
@@ -2115,7 +2034,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             log("Analysis plot rendering complete.")
 
-        self._start_background_task("Rendering analysis plots", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Rendering analysis plots",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_plots=True,
+            ),
+        )
 
     def build_reports_only(self) -> None:
         selected = self._selected_work("Build reports")
@@ -2145,7 +2071,14 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Report rebuild complete: {len(written)} files.")
             return written
 
-        self._start_background_task("Building reports", work, lambda _result: self.rescan_projects())
+        self._start_background_task(
+            "Building reports",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_reports=True,
+            ),
+        )
 
     def update_preview(self) -> None:
         projects = [project for project in self.session.projects if project.selected]
@@ -2205,10 +2138,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "envelope_chart_height": float(self.session.envelope_chart_height),
         }
 
-    def _envelope_build_kwargs(
-        self,
-        case_run_exclusions: dict[str, list[tuple[str, int]]] | None = None,
-    ) -> dict[str, object]:
+    def _envelope_build_kwargs(self) -> dict[str, object]:
         return {
             "envelope_workers": int(self.session.envelope_workers),
             "envelope_time_step": float(self.session.envelope_time_step),
@@ -2219,13 +2149,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "nonconv_cb_iip_limit": float(self.session.nonconv_cb_iip_limit),
             "nonconv_cb_iir_limit": float(self.session.nonconv_cb_iir_limit),
             "voltage_um_overrides_by_project": dict(self.session.voltage_um_overrides_by_project),
-            "bus_exclusions_by_project": dict(self.session.bus_exclusions_by_project),
-            "manual_case_run_exclusions_by_project": (
-                case_run_exclusions
-                if case_run_exclusions is not None
-                else self._effective_case_run_exclusions_by_project()
-            ),
-            "high_voltage_exclusions_by_project": dict(self.session.high_voltage_exclusions_by_project),
+            "exclusions_by_project": self._effective_exclusions_by_project(),
             "resonance_settings": self._resonance_settings(),
         }
 
@@ -2243,7 +2167,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = worker
         worker.message.connect(self._on_worker_message)
         worker.succeeded.connect(lambda result: self._task_succeeded(title, result, on_success))
-        worker.failed.connect(lambda message: self._task_failed(title, message))
+        worker.failed.connect(lambda message, details: self._task_failed(title, message, details))
+        worker.finished.connect(self._worker_finished)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
@@ -2343,16 +2268,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status("Ready")
             self._open_settings_if_requested()
 
-    def _task_failed(self, title: str, message: str) -> None:
+    def _task_failed(self, title: str, message: str, details: str) -> None:
         if message == "Operation stopped by user.":
             self.log(f"{title} stopped by user.")
             self._set_busy(False, "Stopped")
         else:
             self.log(f"{title} failed: {message}")
+            self.log(f"{title} traceback:\n{details.rstrip()}")
             self._set_busy(False, f"{title} failed")
         self._worker = None
         self._cancel_token = None
         self._open_settings_if_requested()
+
+    def _worker_finished(self) -> None:
+        if self._close_when_idle:
+            QtCore.QTimer.singleShot(0, self.close)
 
     def _open_settings_if_requested(self) -> None:
         if not self._open_settings_after_task:
@@ -2400,6 +2330,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        if self._worker is not None and self._worker.isRunning():
+            self._close_when_idle = True
+            self.stop_current_task()
+            event.ignore()
+            return
         if self._autosave_timer.isActive():
             self._autosave_timer.stop()
             self._save_autosave_now()

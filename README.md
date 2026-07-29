@@ -1,6 +1,6 @@
 # PSCAD Results Analysis
 
-Current working snapshot: 2026-07-13.
+Current working snapshot: 2026-07-29.
 
 This is the active app root inside the copied project folder. It contains only the current PSCAD Results Analysis app code, tests, setup files, build outputs, session state, and current documentation.
 
@@ -10,18 +10,24 @@ This is the active app root inside the copied project folder. It contains only t
 - Scans PSCAD project folders, dashboard workbooks, result files, scopes, voltage levels, and exclusions.
 - Builds voltage envelopes and combined envelope charts for selected scopes and voltages.
 - Creates TOV/SFO/SA plot batches, renders waveform plots with the embedded plotting engine, and builds DOCX reports.
-- Runs optional analysis checks: Stress, Late, and No-settle. These use chronological envelope data from envelope building and do not reread raw waveforms.
+- Runs optional analysis checks: Stress, Late, and No-settle. These use chronological envelope data from envelope building and do not reread raw waveforms. Their `Resonance_Checks.xlsx` workbooks omit empty result tabs and retain only `Settings` when no findings exist.
 - Supports high-voltage proposal import from envelope output and from `PSCAD_log.txt` plus fast raw waveform maxima for matching case/MM buses.
 - Uses `Input_Data_PSCAD*.xlsx` and `.inf` files as the project-opening voltage sources; treated result CSVs and generated plot filenames are not used to define available voltages.
 
 ## Folder layout
 
 - `src/results_analysis_app/` - main PySide6 app, scanning, envelope build, reporting, settings, UI actions.
-- `src/results_analysis_app/project_scan_runner.py` - project-opening scan wrapper.
-- `src/pscad_plotter_app_v3/` - embedded plotting engine used for waveform plot rendering.
+- `src/results_analysis_app/settings_dialog.py` - Settings dialog construction and settings-to-session updates.
+- `src/results_analysis_app/project_scan_runner.py` - project-opening scan and cache wrapper.
+- `src/results_analysis_app/project_scan_cache.py` - persistent metadata-validated project scan cache.
+- `src/results_analysis_app/exclusions.py` - shared exclusion rules, matching, normalization, and legacy-session migration.
+- `src/results_analysis_app/styles.py` - centralized light/dark palette and semantic widget styling.
+- `src/pscad_plotter_app_v3/` - compact MM waveform plotting and Excel-export engine used by report batches.
 - `src/results_analysis_app/assets/` - app icon and packaged assets.
 - `tests/` - focused contract tests for current behavior.
 - `docs/CURRENT_CONTEXT.md` - current state handover for future Codex work.
+- `AGENTS.md` - project-specific development, validation, and documentation rules.
+- `STARTER_PROMPT.md` - onboarding prompt for a new machine or clean Codex task.
 - `environment.yml` - conda environment definition.
 - `PSCADResultsAnalysis.spec` - PyInstaller spec for optional one-file executable build.
 - `start_app.bat` - starts the app with the project-local conda environment.
@@ -91,6 +97,8 @@ Dependency smoke test:
 ..\.conda\pscad-results-analysis\python.exe -c "import PySide6.QtCore, pandas, openpyxl, docx, win32com.client, matplotlib, numpy, pyexpat; import results_analysis_app; print('ok')"
 ```
 
+The current contract-test baseline is 62 passing tests. Use the current command output, rather than this number alone, to determine whether validation succeeded.
+
 ## Build executable
 
 Executable build is optional. Prefer running from conda during development.
@@ -113,37 +121,70 @@ The packaged executable stores autosave and manually saved sessions beside `PSCA
 
 The build spec explicitly bundles conda runtime DLLs used by Python startup modules, including `ffi-8.dll` for `_ctypes`. Missing these DLLs can make PyInstaller fail on another machine before the app window opens.
 
+## Source control
+
+Git is configured in this app root on branch `main`, with `origin` pointing to the project GitHub repository. Generated state, environments, caches, build output, and project output folders are excluded by `.gitignore`.
+
+Inspect `git status` before editing or committing. Preserve unrelated worktree changes and do not use destructive reset or checkout commands to discard them.
+
 ## Main workflow
 
-1. Add PSCAD project folders.
-2. Rescan projects.
-3. Select projects, scopes, voltages, TOV/SFO/SA events, and optional analysis checks.
+1. Add PSCAD project folders. Existing saved projects are validated against `.inf`, NonConv, voltage-input, dashboard, envelope, plot, and report file metadata; unchanged scans are restored from `.state/project_scan_cache.json`.
+2. Select projects, scopes, voltages, TOV/SFO/SA events, and optional analysis checks.
+3. Review exclusions for the current project. The `Manual` table accepts `Case`, `Run`, and `Bus`; blank cells are wildcards, while a completely blank row is ignored. `NonConv` and `High Voltage` provide detected proposals through the same `Apply` checkbox workflow.
 4. Use `Scan HV log` if `PSCAD_log.txt` exists and high-voltage proposals are needed before first envelope build. The scan reads the warning case/MM bus pairs from the log, then checks raw waveform maxima for every run of those cases.
 5. Use `Scan figures` or `Dashboards update`.
 6. Use `Build envelope data/checks` to build envelope workbooks, checks, and envelope charts.
 7. Use the TOV/SFO/SA or Analysis step buttons to rebuild charts, create batches, or render plots without rerunning all steps.
 8. Use `Rebuild reports` to regenerate reports from existing outputs.
 
-Reports include a short selected SFO/TOV/SA value list before each exported envelope figure. SFO and TOV use the matching `LLp` envelope rows, SA uses the matching `LGp` row when SA is selected, and TOV/SA show calculated RMS values with Word-subscripted peak/RMS units. Generated plot figures in reports include copyable Case, Run, Element, Fault, and Trace headings; envelope and dashboard figures keep their existing headings.
+Heading numbering and envelope bullets use separate Word numbering definitions and list IDs, emitted in Word's required definition-before-instance order so both lists render correctly.
+
+Use `Rebuild project cache` in Settings when project metadata needs a forced fresh scan. Normal startup and adding a project scan only missing or changed projects. Analysis actions update affected status flags and cache entries directly; they do not trigger a full project scan.
+
+Reports use numbered Word headings and add field-based figure captions plus clickable cross-references for dashboard, envelope, time-domain, and analysis figures. Cached field values are written into the document and automatic field updating is disabled, so opening a report does not show Word's external-field update prompt; fields can still be refreshed manually with `Ctrl+A`, `F9` after editing. Dashboard figures are written before envelope and waveform figures so their figure numbers follow the report order. A short selected SFO/TOV/SA list with the reference report's green hollow-circle bullets is placed before each exported envelope figure. SFO and TOV use the matching `LLp` envelope rows, SA uses the matching `LGp` row when SA is selected, and TOV/SA show calculated RMS values with Word-subscripted peak/RMS units. SA time-domain reports use the line-ground TOV RMS value and the fixed 300 ms duration text for surge arrester selection. Dashboard figures titled `Initial voltages`, `Initial Active Power`, and `Initial Reactive Power` keep the dashboard's saved slicer state; other dashboard figures are filtered per report voltage. RMS overvoltage dashboard titles are reported as `voltage rise`; RMS `dip` and `drop` titles remain unchanged. Generated time-domain and analysis figures in reports place their green Case, Run, Element, Fault, and Trace plot headings before the cross-reference text; these headings are unnumbered third-level navigation entries. Known fault labels are separated from the element, while faultless element labels such as `MM_161_TPC1` remain intact. Reports embed the reference report's typography in code: A4 layout, green numbered chapter headings, green third-level plot headings, justified body text, green italic captions, report header, and page-number footer. A real report template is not required.
 
 Outputs are written inside each selected PSCAD project, normally under:
 
 - `Voltage_envelope/<scope>/`
 - `Plots/Plot_batch/`
-- `Plots/Generated/<scope>/`
+- `Plots/Generated/<scope>/` only for event/check folders that contain rendered plots
 - `Reports/<scope>/`
 
 ## Notes
 
 - Session autosave data is saved under `.state/` when running from conda. The packaged executable stores `.state/` and `sessions/` beside the executable.
+- The UI follows the Windows light/dark colour scheme at startup and while the app is open. Panels, tables, headers, tabs, inputs, labels, buttons, selections, disabled controls, status controls, checkboxes, and scrollbars share one semantic application theme. Widget and item-view checkboxes use the same high-contrast indicator states throughout the app.
+- Manual exclusions use one `Apply / Case / Run / Bus` table. Any blank field matches all values for that field: a run-only rule applies that run number across all cases and buses, a bus-only rule applies that bus across all cases and runs, and a fully blank row is never applied. New rows are checked by default. The table supports TSV copy/paste; all exclusion tabs use `Apply all` and `Apply none`.
+- Applied manual, NonConv, and High Voltage rows are normalized into one matcher before envelope reads. Whole-run rules are removed before worker submission; bus-specific rules filter matching `.inf` descriptors. Sessions containing the former per-voltage Bus and Case/Run fields are migrated when loaded; former Bus entries become bus-only wildcard rules because the universal Manual table has no voltage column.
 - Test commands use `.tmp/` so pytest does not depend on the user temp folder.
-- Project opening keeps NonConv proposal detection eager. Reads inside one project scan use a bounded worker pool; multiple project opening stays sequential to avoid nested worker contention.
+- Project opening validates a persistent metadata cache first. Only missing, changed, or forced project scans read project contents; unchanged hot-start entries are not rewritten. Mixed hot/cold startup scans only the stale projects, and adding one project does not rescan the existing list. NonConv proposal detection remains eager for actual scans. Reads inside one project scan use a bounded worker pool; multiple cold project scans stay sequential to avoid nested worker contention.
+- The project scan cache stores serialized UI scan data plus relative project-file metadata and the NonConv limits used to calculate it. Cache validation reads metadata only; it does not parse `.inf`, `.out`, Excel, plot, or report contents.
 - Project scans keep only the status flags needed by the UI instead of retaining full output-file lists.
-- Envelope builds parse each selected `.inf` file once per build and reuse the descriptors across voltage workers. Raw `.out` waveform reads remain voltage-specific.
-- Embedded plotter catalog caches BLAKE2b `.inf` content hashes with path metadata and parses identical `.inf` contents once when rebuilding a catalog. Unchanged per-file catalog entries still use the existing SQLite cache.
+- `Scan HV log` reads matching raw runs through a bounded worker pool; the configured high-voltage factor and raw-waveform logic are unchanged.
+- Envelope builds enumerate `.inf` files once per build and hash each selected layout with BLAKE2b. Files with identical content share one parsed descriptor template across scopes and voltages. A shared bounded run-read pool is reused for one voltage at a time. The default envelope worker count is 4, based on representative storage benchmarks; raw `.out` waveform reads remain voltage-specific.
+- `Envelope time end` is an upper limit. Each project reads `Final duration` from `Input_Data_PSCAD*.xlsx`, and each run is capped again by the final timestamp already loaded with its raw waveform columns. No separate `.out` scan is performed and no zero-valued samples are generated after a run ends.
+- `Chart x max` is also an upper limit. Envelope and resonance charts use the smaller of that setting and the available generated data duration.
+- Envelope waveform absolute values are reused between high-voltage checks and envelope rolling. Envelope workbooks are formatted during their initial write instead of being serialized twice.
+- Envelope phase candidates are reduced directly with NumPy while preserving the existing source-order tie rule and Case/Run attribution; intermediate dataframe merge chains are no longer built.
+- Report plot batches support only the MM waveform mode used by this app. Legacy CB, arbitrary-channel, FFT, combined-mode, and unused catalog branches were removed; MM Excel waveform exports remain supported. The embedded SQLite cache now loads only the MM element rows needed to validate these batches.
+- Background failures write their traceback to the app log. Closing the window during active work requests cancellation and waits for the worker to finish; the raw high-voltage scanner checks cancellation inside its descriptor/channel loops.
+- Invalid `.inf` layouts, unreadable CB summaries, and unreadable high-voltage proposal workbooks are reported in scan/build warnings instead of being silently discarded.
 - A malformed autosave is ignored and the app starts with a default session.
+- Dashboard figure-only scans update the figure list without triggering a project scan. Dashboard refresh updates only dashboard status and cache metadata.
+- Report image directories are indexed once per project/scope report pass and reused across selected voltages.
+- Plot generation creates `Plots/Generated` subfolders only when a batch produces rendered plot files; empty event/check folders are not pre-created.
 - Report-only export images are removed after each scope's DOCX reports are written.
 - PSCAD `.inf` case/run parsing and `.out` column mapping are shared with the embedded plotter waveform I/O helpers.
-- Full `Run analysis` reuses the same envelope, batch, render, and report action functions as the step buttons.
+- Full `Run analysis` reuses the same envelope, batch, render, and report action functions as the step buttons. Completed actions update only affected project output status and cache entries.
 - Documentation uses relative paths only. Update docs after meaningful behavior or workflow changes.
-- This project does not use Git.
+- Git is used for source control; generated outputs and local state remain excluded from commits.
+
+## Current validation gaps and risks
+
+- Existing files under `dist/` do not represent the latest source until the executable is rebuilt and tested.
+- Excel COM workflows require Microsoft Excel and remain machine-sensitive.
+- Full envelope and report workflows should be validated on representative PSCAD projects after material analysis or reporting changes.
+- The latest source-level cleanup was validated with synthetic MM rendering and Excel export, but not with a full representative PSCAD envelope/plot/report pass.
+- Project-cache validation uses file size and modification time. An external edit preserving both values may require `Rebuild project cache`.
+- Envelope waveform reads are parallel within one voltage level, while voltage levels are processed sequentially through one shared bounded pool. Large projects remain storage-bound.

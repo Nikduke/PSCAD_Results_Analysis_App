@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-import re
 from dataclasses import dataclass, field
+from hashlib import blake2b
 from pathlib import Path
+import re
 
 import numpy as np
+
+
+def hash_inf_file(inf_path: Path) -> str:
+    digest = blake2b(digest_size=16)
+    with inf_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(slots=True)
@@ -126,57 +135,6 @@ def _missing_out_file_error(out_file: Path) -> FileNotFoundError:
             f"stem-based naming. Sample files: {sample_names}"
         )
     return FileNotFoundError(detail)
-
-
-def _first_time_value(line: str) -> float | None:
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        return float(stripped.split()[0])
-    except (IndexError, ValueError):
-        return None
-
-
-def _reverse_text_lines(path: Path, block_size: int = 64 * 1024):
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        position = handle.tell()
-        pending = b""
-        while position > 0:
-            read_size = min(block_size, position)
-            position -= read_size
-            handle.seek(position)
-            chunk = handle.read(read_size)
-            lines = (chunk + pending).splitlines()
-            if position and lines:
-                pending = lines[0]
-                lines = lines[1:]
-            else:
-                pending = b""
-            for line in reversed(lines):
-                yield line.decode("utf-8", errors="ignore")
-        if pending:
-            yield pending.decode("utf-8", errors="ignore")
-
-
-def read_out_time_bounds(out_file: Path) -> tuple[float, float]:
-    if not out_file.exists():
-        raise _missing_out_file_error(out_file)
-    first_time: float | None = None
-    with out_file.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
-            first_time = _first_time_value(line)
-            if first_time is not None:
-                break
-    last_time: float | None = None
-    for line in _reverse_text_lines(out_file):
-        last_time = _first_time_value(line)
-        if last_time is not None:
-            break
-    if first_time is None or last_time is None:
-        raise ValueError(f"{out_file} contains no numeric time values.")
-    return first_time, last_time
 
 
 def load_out_frame(out_file: Path) -> WaveformFrame:

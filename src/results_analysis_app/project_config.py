@@ -19,6 +19,12 @@ class VoltageConfig:
     um: float
 
 
+@dataclass(frozen=True)
+class ProjectTiming:
+    frequency: float | None = None
+    final_duration: float | None = None
+
+
 def normalize_voltage(value: Any) -> str:
     try:
         number = float(str(value).strip())
@@ -46,24 +52,44 @@ def _positive_number(value: Any) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
-def load_project_frequency(project_root: str | Path) -> float | None:
+def load_project_timing(project_root: str | Path) -> ProjectTiming:
     workbook_path = input_data_workbook(project_root)
     if workbook_path is None:
-        return None
+        return ProjectTiming()
 
     try:
         from openpyxl import load_workbook
 
         workbook = load_workbook(workbook_path, read_only=True, data_only=True)
     except (OSError, BadZipFile, KeyError, ValueError):
-        return None
+        return ProjectTiming()
 
     try:
         if "Input_Data" not in workbook.sheetnames:
-            return None
-        return _positive_number(workbook["Input_Data"]["B16"].value)
+            return ProjectTiming()
+        sheet = workbook["Input_Data"]
+        values: dict[str, float] = {}
+        for label, value in sheet.iter_rows(
+            min_col=1,
+            max_col=2,
+            values_only=True,
+        ):
+            key = str(label or "").strip().casefold()
+            if key not in {"frequency", "final duration"}:
+                continue
+            number = _positive_number(value)
+            if number is not None:
+                values[key] = number
+        return ProjectTiming(
+            frequency=values.get("frequency") or _positive_number(sheet["B16"].value),
+            final_duration=values.get("final duration"),
+        )
     finally:
         workbook.close()
+
+
+def load_project_frequency(project_root: str | Path) -> float | None:
+    return load_project_timing(project_root).frequency
 
 
 def discover_voltage_prefixes(project_root: str | Path) -> dict[str, str]:

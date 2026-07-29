@@ -26,7 +26,7 @@ TIME_HEADER = "Time (s)"
 VALUE_HEADER = "Max_all"
 VALUE_HEADER_FALLBACKS = ("Max",)
 
-CHART_TITLE = "Representative overvotlages envelope curve"
+CHART_TITLE = "Representative overvoltages envelope curve"
 X_AXIS_TITLE = "Time (s)"
 Y_AXIS_TITLE = "Voltage (kV)"
 CHART_TOP_LEFT_CELL = "H1"
@@ -150,14 +150,18 @@ def create_combined_envelope_plot(
     return output_path
 
 
-def create_resonance_check_charts(workbook_path: Path, excel=None) -> bool:
+def create_resonance_check_charts(
+    workbook_path: Path,
+    excel=None,
+    x_max: float | None = None,
+) -> bool:
     workbook_path = Path(workbook_path).resolve()
     if not workbook_path.is_file():
         return False
     if excel is None:
         with excel_app() as app:
-            return _create_resonance_check_charts_with_excel(app, workbook_path)
-    return _create_resonance_check_charts_with_excel(excel, workbook_path)
+            return _create_resonance_check_charts_with_excel(app, workbook_path, x_max)
+    return _create_resonance_check_charts_with_excel(excel, workbook_path, x_max)
 
 
 def _create_combined_envelope_plot_with_excel(
@@ -510,8 +514,10 @@ def _create_combined_plot(
     while chart.SeriesCollection().Count > 0:
         chart.SeriesCollection(1).Delete()
 
+    data_ends: list[float] = []
     for series_cfg in series_definitions:
         source_ws, time_col, value_col, last_row, _value_header = _series_source(series_cfg, wb)
+        data_ends.append(_worksheet_time_end(source_ws, time_col, last_row))
         _add_chart_series(
             chart,
             series_cfg["name"],
@@ -523,12 +529,16 @@ def _create_combined_plot(
         for target_time in series_cfg["annotation_times"]:
             _find_time_row(source_ws, time_col, value_col, last_row, target_time)
 
-    _format_chart(chart, axis_limits)
+    _format_chart(chart, _bounded_x_axis(axis_limits, max(data_ends)))
     chart_obj.Activate()
     time.sleep(0.2)
 
 
-def _create_resonance_check_charts_with_excel(excel, workbook_path: Path) -> bool:
+def _create_resonance_check_charts_with_excel(
+    excel,
+    workbook_path: Path,
+    x_max: float | None,
+) -> bool:
     wb = excel.Workbooks.Open(str(workbook_path), UpdateLinks=0, ReadOnly=False)
     changed = False
     try:
@@ -536,7 +546,7 @@ def _create_resonance_check_charts_with_excel(excel, workbook_path: Path) -> boo
             if not _is_resonance_chart_data_sheet(ws):
                 continue
             _delete_existing_charts(ws)
-            if _create_resonance_check_chart(ws):
+            if _create_resonance_check_chart(ws, x_max):
                 changed = True
         if changed:
             wb.Save()
@@ -555,7 +565,7 @@ def _is_resonance_chart_data_sheet(ws) -> bool:
         return False
 
 
-def _create_resonance_check_chart(ws) -> bool:
+def _create_resonance_check_chart(ws, x_max: float | None = None) -> bool:
     last_row = int(ws.Cells(ws.Rows.Count, 1).End(xlUp).Row)
     if last_row < 3:
         return False
@@ -564,7 +574,7 @@ def _create_resonance_check_chart(ws) -> bool:
     vlim = _as_float(ws.Range("G6").Value)
     if vlim is None:
         vlim = _as_float(ws.Cells(2, 4).Value) or 0.0
-    t_end = max(_excel_range_max(ws, 1, last_row, 1.0), t_start, 1.0)
+    t_end = _worksheet_time_end(ws, 1, last_row)
     y_max = max(
         _excel_range_max(ws, 2, last_row, 0.0),
         _excel_range_max(ws, 3, last_row, 0.0),
@@ -618,7 +628,10 @@ def _create_resonance_check_chart(ws) -> bool:
 
     _format_chart(
         chart,
-        {"x_min": 0.0, "x_max": t_end, "y_min": 0.0, "y_max": y_max},
+        _bounded_x_axis(
+            {"x_min": 0.0, "x_max": x_max, "y_min": 0.0, "y_max": y_max},
+            t_end,
+        ),
         title=_resonance_chart_title(ws),
         y_title=Y_AXIS_TITLE,
         x_number_format="0.000",
@@ -635,6 +648,22 @@ def _excel_range_max(ws, col: int, last_row: int, default: float) -> float:
     except EXCEL_AUTOMATION_ERRORS:
         return default
     return value if value == value else default
+
+
+def _worksheet_time_end(ws, time_col: int, last_row: int) -> float:
+    last_time = _as_float(ws.Cells(last_row, time_col).Value) or 0.0
+    previous_time = _as_float(ws.Cells(last_row - 1, time_col).Value) if last_row > 2 else None
+    if previous_time is None or previous_time >= last_time:
+        return last_time
+    return last_time + (last_time - previous_time)
+
+
+def _bounded_x_axis(axis_limits: dict, data_end: float) -> dict:
+    bounded = dict(axis_limits)
+    requested = _as_float(bounded.get("x_max"))
+    if data_end > 0:
+        bounded["x_max"] = min(requested, data_end) if requested is not None else data_end
+    return bounded
 
 
 def _set_vlim_label_cell(cell, vlim: float) -> None:

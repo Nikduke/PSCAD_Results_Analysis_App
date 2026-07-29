@@ -5,6 +5,14 @@ from pathlib import Path
 import re
 from typing import Any
 
+from results_analysis_app.exclusions import (
+    ExclusionRule,
+    migrate_legacy_project_exclusions,
+    normalize_exclusion_rules,
+    normalize_project_case_run_exclusions,
+    normalize_project_exclusion_rules,
+    normalize_project_high_voltage_exclusions,
+)
 from results_analysis_app.project_config import DEFAULT_EVENT_TIMES, normalize_voltage
 
 DEFAULT_VOLTAGES: tuple[str, ...] = ()
@@ -13,6 +21,7 @@ DEFAULT_RESONANCE_CHECKS = ("Post_Event_Stress", "Late_Growth", "No_Settle_Growt
 DEFAULT_ENVELOPE_TIME_STEP = 0.002
 DEFAULT_ENVELOPE_TIME_END = 1.0
 DEFAULT_ENVELOPE_FALLBACK_FREQUENCY = 50.0
+DEFAULT_ENVELOPE_WORKERS = 4
 DEFAULT_ENVELOPE_CHART_X_MAX = 0.5
 DEFAULT_ENVELOPE_CHART_X_MAJOR = 0.05
 DEFAULT_ENVELOPE_CHART_TOP_LEFT_CELL = "H1"
@@ -73,129 +82,11 @@ def safe_token(token: str) -> str:
     return value or "Token"
 
 
-def normalize_bus_exclusions(value: Any) -> dict[str, list[str]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, list[str]] = {}
-    for raw_voltage, raw_buses in value.items():
-        voltage = normalize_voltage(raw_voltage)
-        if not voltage:
-            continue
-        try:
-            float(voltage)
-        except ValueError:
-            continue
-        if isinstance(raw_buses, str):
-            buses = normalize_tokens(raw_buses)
-        elif isinstance(raw_buses, (list, tuple, set)):
-            buses = normalize_tokens([str(bus) for bus in raw_buses])
-        else:
-            continue
-        if buses:
-            output[voltage] = buses
-    return output
-
-
-def normalize_case_run_exclusions(value: Any) -> list[tuple[str, int]]:
-    if not isinstance(value, (list, tuple, set)):
-        return []
-    output: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
-    for item in value:
-        case = ""
-        run_raw: Any = None
-        if isinstance(item, dict):
-            case = str(item.get("case", "")).strip()
-            run_raw = item.get("run")
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            case = str(item[0]).strip()
-            run_raw = item[1]
-        if not case:
-            continue
-        try:
-            run = int(float(str(run_raw).strip()))
-        except (TypeError, ValueError):
-            continue
-        key = (case, run)
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(key)
-    return output
-
-
-def normalize_high_voltage_exclusions(value: Any) -> list[tuple[str, str, int, str]]:
-    if not isinstance(value, (list, tuple, set)):
-        return []
-    output: list[tuple[str, str, int, str]] = []
-    seen: set[tuple[str, str, int, str]] = set()
-    for item in value:
-        voltage = ""
-        case = ""
-        run_raw: Any = None
-        bus = ""
-        if isinstance(item, dict):
-            voltage = normalize_voltage(item.get("voltage", ""))
-            case = str(item.get("case", "")).strip()
-            run_raw = item.get("run")
-            bus = str(item.get("bus", item.get("MM_name", ""))).strip()
-        elif isinstance(item, (list, tuple)) and len(item) >= 4:
-            voltage = normalize_voltage(item[0])
-            case = str(item[1]).strip()
-            run_raw = item[2]
-            bus = str(item[3]).strip()
-        if not voltage or not case or not bus:
-            continue
-        try:
-            run = int(float(str(run_raw).strip()))
-        except (TypeError, ValueError):
-            continue
-        key = (voltage, case, run, bus)
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(key)
-    return output
-
-
-def normalize_project_bus_exclusions(value: Any) -> dict[str, dict[str, list[str]]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, dict[str, list[str]]] = {}
-    for project, exclusions in value.items():
-        normalized = normalize_bus_exclusions(exclusions)
-        if normalized:
-            output[str(project)] = normalized
-    return output
-
-
-def normalize_project_case_run_exclusions(value: Any) -> dict[str, list[tuple[str, int]]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, list[tuple[str, int]]] = {}
-    for project, exclusions in value.items():
-        normalized = normalize_case_run_exclusions(exclusions)
-        if normalized:
-            output[str(project)] = normalized
-    return output
-
-
-def normalize_project_high_voltage_exclusions(value: Any) -> dict[str, list[tuple[str, str, int, str]]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, list[tuple[str, str, int, str]]] = {}
-    for project, exclusions in value.items():
-        normalized = normalize_high_voltage_exclusions(exclusions)
-        if normalized:
-            output[str(project)] = normalized
-    return output
-
-
 def normalize_worker_count(value: Any) -> int:
     try:
         return max(1, int(value))
     except (TypeError, ValueError):
-        return 32
+        return DEFAULT_ENVELOPE_WORKERS
 
 
 def normalize_positive_int(value: Any, default: int) -> int:
@@ -368,7 +259,7 @@ class AppSession:
     voltages: list[str] = field(default_factory=lambda: list(DEFAULT_VOLTAGES))
     events: list[str] = field(default_factory=lambda: list(DEFAULT_EVENTS))
     event_times: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_EVENT_TIMES))
-    envelope_workers: int = 32
+    envelope_workers: int = DEFAULT_ENVELOPE_WORKERS
     envelope_time_step: float = DEFAULT_ENVELOPE_TIME_STEP
     envelope_time_end: float = DEFAULT_ENVELOPE_TIME_END
     envelope_fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY
@@ -401,8 +292,7 @@ class AppSession:
     resonance_min_level_over_vlim: float = DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM
     resonance_min_growth_delta_factor: float = DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR
     voltage_um_overrides_by_project: dict[str, dict[str, float]] = field(default_factory=dict)
-    bus_exclusions_by_project: dict[str, dict[str, list[str]]] = field(default_factory=dict)
-    manual_case_run_exclusions_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    manual_exclusions_by_project: dict[str, list[ExclusionRule]] = field(default_factory=dict)
     disabled_nonconv_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     high_voltage_exclusions_by_project: dict[str, list[tuple[str, str, int, str]]] = field(default_factory=dict)
     dashboard_figure_selection: list[str] = field(default_factory=list)
@@ -481,10 +371,9 @@ class AppSession:
             "resonance_min_level_over_vlim": self.resonance_min_level_over_vlim,
             "resonance_min_growth_delta_factor": self.resonance_min_growth_delta_factor,
             "voltage_um_overrides_by_project": self.voltage_um_overrides_by_project,
-            "bus_exclusions_by_project": self.bus_exclusions_by_project,
-            "manual_case_run_exclusions_by_project": {
-                project: [{"case": case, "run": run} for case, run in exclusions]
-                for project, exclusions in self.manual_case_run_exclusions_by_project.items()
+            "manual_exclusions_by_project": {
+                project: [rule.to_dict() for rule in exclusions]
+                for project, exclusions in self.manual_exclusions_by_project.items()
             },
             "disabled_nonconv_by_project": {
                 project: [{"case": case, "run": run} for case, run in exclusions]
@@ -504,6 +393,17 @@ class AppSession:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppSession":
+        manual_exclusions = normalize_project_exclusion_rules(
+            data.get("manual_exclusions_by_project", {})
+        )
+        legacy_exclusions = migrate_legacy_project_exclusions(
+            data.get("bus_exclusions_by_project", {}),
+            data.get("manual_case_run_exclusions_by_project", {}),
+        )
+        for project, rules in legacy_exclusions.items():
+            manual_exclusions[project] = normalize_exclusion_rules(
+                [*manual_exclusions.get(project, []), *rules]
+            )
         dashboard_selection = [
             str(item) for item in data.get("dashboard_figure_selection", []) if str(item)
         ]
@@ -541,7 +441,7 @@ class AppSession:
             ],
             events=[event for event in DEFAULT_EVENTS if event in raw_events],
             event_times=event_times,
-            envelope_workers=normalize_worker_count(data.get("envelope_workers", 32)),
+            envelope_workers=normalize_worker_count(data.get("envelope_workers", DEFAULT_ENVELOPE_WORKERS)),
             envelope_time_step=normalize_positive_float(
                 data.get("envelope_time_step", DEFAULT_ENVELOPE_TIME_STEP),
                 DEFAULT_ENVELOPE_TIME_STEP,
@@ -667,12 +567,7 @@ class AppSession:
             voltage_um_overrides_by_project=normalize_project_voltage_um_overrides(
                 data.get("voltage_um_overrides_by_project", {})
             ),
-            bus_exclusions_by_project=normalize_project_bus_exclusions(
-                data.get("bus_exclusions_by_project", {})
-            ),
-            manual_case_run_exclusions_by_project=normalize_project_case_run_exclusions(
-                data.get("manual_case_run_exclusions_by_project", {})
-            ),
+            manual_exclusions_by_project=manual_exclusions,
             disabled_nonconv_by_project=normalize_project_case_run_exclusions(
                 data.get("disabled_nonconv_by_project", {})
             ),

@@ -6,11 +6,6 @@ from pathlib import Path
 
 RUN_PATTERN = re.compile(r"^(?P<case>.+?)_r(?P<run>\d+)$")
 MANUAL_RUN_PATTERN = re.compile(r"^(?P<base>.+?)(?:_r\d+)?_m(?P<run>\d+)(?:_.+)?$", re.IGNORECASE)
-CB_VOLTAGE_PATTERN = re.compile(r"^CB_(?P<voltage>\d+(?:\.\d+)?)_", re.IGNORECASE)
-PHASE_PATTERNS = [
-    re.compile(r"^(?P<base>.+):(?P<phase>\d+)$", re.IGNORECASE),
-    re.compile(r"^(?P<base>.+)_(?P<phase>[abc])$", re.IGNORECASE),
-]
 FAULT_CODE_LABELS = {
     "0": "No fault",
     "1": "AG",
@@ -202,25 +197,4 @@ def load_run_event_info(stat_path: Path, run_number: int) -> dict[str, object] |
     for row in parse_stat_rows(stat_path):
         if int(row["run_number"]) == int(run_number):
             return row
-    return None
-
-
-def cb_voltage_from_name(value) -> float | None:
-    if value is None:
-        return None
-    match = CB_VOLTAGE_PATTERN.match(str(value).strip())
-    if not match:
-        return None
-    try:
-        return float(match.group("voltage"))
-    except ValueError:
-        return None
-
-
-def normalize_bundle_signal_name(description: str) -> tuple[str, str] | None:
-    for pattern in PHASE_PATTERNS:
-        match = pattern.match(description)
-        if not match:
-            continue
-        return match.group("base"), match.group("phase")
     return None

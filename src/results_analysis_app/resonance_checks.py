@@ -395,6 +395,8 @@ def write_workbooks(
                     for result in scope_results
                     if result.check == check and result.voltage_type == voltage_type
                 ]
+                if not rows:
+                    continue
                 _write_result_sheet(wb.create_sheet(sheet_name(check, voltage_type)), rows)
         for result in scope_results:
             _write_chart_data_sheet(wb, result)

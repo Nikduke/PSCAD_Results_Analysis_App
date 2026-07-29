@@ -18,6 +18,7 @@ APP_ROOT = _app_root()
 STATE_DIR = APP_ROOT / ".state"
 SESSION_DIR = APP_ROOT / "sessions"
 AUTOSAVE_PATH = STATE_DIR / "last_session.json"
+PROJECT_SCAN_CACHE_PATH = STATE_DIR / "project_scan_cache.json"
 
 
 def read_json(path: Path) -> dict[str, Any]:

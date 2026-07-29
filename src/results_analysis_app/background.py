@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 from PySide6 import QtCore
 
 
@@ -22,7 +24,7 @@ class CancelToken:
 class BackgroundTask(QtCore.QThread):
     message = QtCore.Signal(str)
     succeeded = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
+    failed = QtCore.Signal(str, str)
 
     def __init__(self, work, cancel_token: CancelToken, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
@@ -33,4 +35,4 @@ class BackgroundTask(QtCore.QThread):
         try:
             self.succeeded.emit(self._work(self.message.emit, self.cancel_token))
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), traceback.format_exc())

@@ -19,26 +19,26 @@ from openpyxl.utils import get_column_letter
 from results_analysis_app import resonance_checks
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
 from results_analysis_app.excel import excel_app
+from results_analysis_app.exclusions import ExclusionMatcher, ExclusionRule
 from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_X_MAJOR,
     DEFAULT_ENVELOPE_CHART_X_MAX,
     DEFAULT_ENVELOPE_CHART_HEIGHT,
     DEFAULT_ENVELOPE_CHART_WIDTH,
     DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
+    DEFAULT_ENVELOPE_WORKERS,
     DEFAULT_ENVELOPE_TIME_END,
     DEFAULT_ENVELOPE_TIME_STEP,
     DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR,
     DEFAULT_NONCONV_CB_IIP_LIMIT,
     DEFAULT_NONCONV_CB_IIR_LIMIT,
     ScopeEntry,
-    normalize_bus_exclusions,
-    normalize_case_run_exclusions,
-    normalize_high_voltage_exclusions,
 )
-from results_analysis_app.project_config import load_project_frequency, load_voltage_configs
+from results_analysis_app.project_config import load_project_timing, load_voltage_configs
 from pscad_plotter_app_v3.services.waveform_io import (
     InfDescriptor,
     case_run_from_inf_path,
+    hash_inf_file,
     load_out_columns,
     out_file_for_pgb,
     parse_inf_descriptors,
@@ -56,7 +56,6 @@ NONCONV_CB_IIP_LIMIT = DEFAULT_NONCONV_CB_IIP_LIMIT
 NONCONV_CB_IIR_LIMIT = DEFAULT_NONCONV_CB_IIR_LIMIT
 TIME_STEP = DEFAULT_ENVELOPE_TIME_STEP
 TIME_END = DEFAULT_ENVELOPE_TIME_END
-DEFAULT_MAX_WORKERS = 8
 MAX_WORKERS_ENV = "RESULTS_ANALYSIS_ENVELOPE_WORKERS"
 
 ENVELOPE_HEADERS = [
@@ -86,9 +85,7 @@ def build_voltage_envelopes(
     log: LogFn | None = None,
     check_cancel: CancelFn | None = None,
     envelope_workers: int | None = None,
-    bus_exclusions_by_voltage: dict[str, list[str]] | None = None,
-    manual_case_run_exclusions: list[tuple[str, int]] | None = None,
-    high_voltage_exclusions: list[tuple[str, str, int, str]] | None = None,
+    exclusions: list[ExclusionRule] | None = None,
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
     envelope_fallback_frequency: float | None = None,
@@ -118,21 +115,37 @@ def build_voltage_envelopes(
     df_stat = _read_stat_files(project_root)
     cb_iip_limit = _positive_float(nonconv_cb_iip_limit, NONCONV_CB_IIP_LIMIT)
     cb_iir_limit = _positive_float(nonconv_cb_iir_limit, NONCONV_CB_IIR_LIMIT)
-    df_nonconv = _find_non_convergent_cases(case_root, df_stat, cb_iip_limit, cb_iir_limit)
+    nonconv_warnings: list[str] = []
+    df_nonconv = _find_non_convergent_cases(
+        case_root,
+        df_stat,
+        cb_iip_limit,
+        cb_iir_limit,
+        warnings=nonconv_warnings,
+    )
+    for warning in nonconv_warnings:
+        _log(log, warning)
     _log(log, f"Envelope setup complete: {project_root.name} | {_elapsed(stat_started)}")
     detected_nonconv_keys = _nonconv_keys(df_nonconv)
-    manual_nonconv_keys = set(normalize_case_run_exclusions(manual_case_run_exclusions or []))
-    nonconv_keys = manual_nonconv_keys
+    exclusion_matcher = ExclusionMatcher(exclusions or [])
     if detected_nonconv_keys:
         _log(log, f"Detected non-convergent proposals: {len(detected_nonconv_keys)}")
-    if manual_nonconv_keys:
-        _log(log, f"Applied case/run exclusions: {len(manual_nonconv_keys)}")
-    bus_exclusions = normalize_bus_exclusions(bus_exclusions_by_voltage or {})
-    applied_high_voltage = normalize_high_voltage_exclusions(high_voltage_exclusions or [])
+    if exclusion_matcher.rules:
+        _log(log, f"Applied exclusion rules: {len(exclusion_matcher.rules)}")
     chart_axis_limits = _chart_axis_limits(envelope_chart_x_max, envelope_chart_x_major)
     limit_factor = _positive_float(high_voltage_limit_factor, HIGH_VOLTAGE_LIMIT_FACTOR)
     time_step = _positive_float(envelope_time_step, TIME_STEP)
-    time_end = _positive_float(envelope_time_end, TIME_END)
+    requested_time_end = _positive_float(envelope_time_end, TIME_END)
+    project_timing = load_project_timing(project_root)
+    time_end = min(requested_time_end, project_timing.final_duration or requested_time_end)
+    if project_timing.final_duration is not None:
+        _log(
+            log,
+            f"Envelope time end: {time_end:g} s "
+            f"(Settings limit {requested_time_end:g} s; Input_Data Final duration {project_timing.final_duration:g} s)",
+        )
+    else:
+        _log(log, f"Envelope time end from Settings: {time_end:g} s")
     resonance_settings_obj = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
     if resonance_settings_obj.enabled and not resonance_settings_obj.auto_release:
         if not (0.0 <= resonance_settings_obj.manual_analysis_start < time_end):
@@ -140,7 +153,7 @@ def build_voltage_envelopes(
         if resonance_checks.NO_SETTLE_GROWTH in resonance_settings_obj.enabled_checks:
             _log(log, "No-settle growth skipped: manual analysis start time is enabled, so physical release detection is bypassed.")
     settings_fallback_frequency = _positive_float(envelope_fallback_frequency, DEFAULT_ENVELOPE_FALLBACK_FREQUENCY)
-    project_frequency = load_project_frequency(project_root)
+    project_frequency = project_timing.frequency
     fallback_frequency = project_frequency or settings_fallback_frequency
     if project_frequency is not None:
         _log(log, f"Fallback frequency from Input_Data!B16: {fallback_frequency:g} Hz")
@@ -173,8 +186,9 @@ def build_voltage_envelopes(
     outputs: list[Path] = []
 
     selected_scopes = list(scopes)
+    inf_inventory = _inf_inventory(case_root, exclusion_matcher)
     scope_inf_paths = {
-        scope.folder: _selected_inf_paths(case_root, scope, nonconv_keys)
+        scope.folder: _selected_inf_paths(inf_inventory, scope)
         for scope in selected_scopes
     }
     for scope in selected_scopes:
@@ -184,18 +198,15 @@ def build_voltage_envelopes(
     voltage_keys = [str(voltage).strip() for voltage in voltages if str(voltage).strip()]
     all_inf_paths = sorted({path for paths in scope_inf_paths.values() for path in paths})
     total_workers = _configured_worker_count(envelope_workers)
-    inf_descriptor_cache = _read_inf_descriptor_cache(all_inf_paths, total_workers, check_cancel)
-    voltage_worker_count = max(1, min(len(voltage_keys) or 1, total_workers))
-    per_voltage_workers = max(1, total_workers // voltage_worker_count)
-    _log(log, f"Envelope worker plan: voltages={voltage_worker_count}, per voltage={per_voltage_workers}, total={total_workers}")
-
+    inf_descriptor_cache = _read_inf_descriptor_cache(all_inf_paths, total_workers, check_cancel, log)
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
     resonance_results: list[resonance_checks.ResonanceResult] = []
-    with ThreadPoolExecutor(max_workers=voltage_worker_count) as executor:
-        futures = {
-            executor.submit(
-                _build_voltage_workbooks,
+    _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads sequential")
+    with ThreadPoolExecutor(max_workers=total_workers) as executor:
+        for voltage_key in voltage_keys:
+            _cancel(check_cancel)
+            result = _build_voltage_workbooks(
                 project_root,
                 selected_scopes,
                 scope_inf_paths,
@@ -203,26 +214,21 @@ def build_voltage_envelopes(
                 inf_descriptor_cache,
                 voltage_key,
                 voltage_configs,
-                bus_exclusions,
-                applied_high_voltage,
+                exclusion_matcher,
                 limit_factor,
                 time_step,
                 time_end,
                 fallback_frequency,
                 df_stat,
                 df_nonconv,
-                per_voltage_workers,
+                total_workers,
                 log,
                 check_cancel,
                 notify_frequency_fallback,
                 resonance_settings_obj,
                 event_times,
-            ): voltage_key
-            for voltage_key in voltage_keys
-        }
-        for future in as_completed(futures):
-            _cancel(check_cancel)
-            result = future.result()
+                executor,
+            )
             chart_inputs.extend(result.chart_inputs)
             data_outputs.extend(result.data_outputs)
             resonance_results.extend(result.resonance_results)
@@ -260,7 +266,11 @@ def build_voltage_envelopes(
                 _log(log, f"Envelope chart finished: {voltage_key} kV | {combined_path.name} | {_elapsed(chart_started)}")
             for workbook_path in resonance_workbooks:
                 chart_started = time.perf_counter()
-                if create_resonance_check_charts(workbook_path, excel):
+                if create_resonance_check_charts(
+                    workbook_path,
+                    excel,
+                    x_max=chart_axis_limits["x_max"],
+                ):
                     _log(log, f"Analysis charts finished: {workbook_path.name} | {_elapsed(chart_started)}")
     else:
         outputs.extend(data_outputs)
@@ -288,9 +298,9 @@ def _configured_worker_count(envelope_workers: int | None = None) -> int:
     if envelope_workers is not None:
         return max(1, int(envelope_workers))
     try:
-        configured = int(os.environ.get(MAX_WORKERS_ENV, str(DEFAULT_MAX_WORKERS)))
+        configured = int(os.environ.get(MAX_WORKERS_ENV, str(DEFAULT_ENVELOPE_WORKERS)))
     except ValueError:
-        configured = DEFAULT_MAX_WORKERS
+        configured = DEFAULT_ENVELOPE_WORKERS
     return max(1, configured)
 
 
@@ -325,8 +335,7 @@ def _build_voltage_workbooks(
     inf_descriptor_cache: dict[Path, list[InfDescriptor]],
     voltage_key: str,
     voltage_configs,
-    bus_exclusions: dict[str, list[str]],
-    applied_high_voltage: list[tuple[str, str, int, str]],
+    exclusion_matcher: ExclusionMatcher,
     high_voltage_limit_factor: float,
     time_step: float,
     time_end: float,
@@ -339,6 +348,7 @@ def _build_voltage_workbooks(
     frequency_fallback: FrequencyFallbackFn | None = None,
     resonance_settings: resonance_checks.ResonanceSettings | None = None,
     event_times: dict[str, float] | None = None,
+    run_executor: ThreadPoolExecutor | None = None,
 ) -> _VoltageBuildResult:
     started = time.perf_counter()
     _cancel(check_cancel)
@@ -352,25 +362,15 @@ def _build_voltage_workbooks(
 
     bus_prefix, bus_um = config.bus_prefix, config.um
     nominal_voltage = _nominal_voltage_from_key(voltage_key, bus_um)
-    excluded_buses = set(bus_exclusions.get(voltage_key, []))
-    if excluded_buses:
-        _log(log, f"Bus exclusions: {voltage_key} kV | {len(excluded_buses)} buses")
-    excluded_bus_runs = {
-        (case, run, bus)
-        for voltage, case, run, bus in applied_high_voltage
-        if voltage == voltage_key
-    }
-    if excluded_bus_runs:
-        _log(log, f"High-voltage bus/run exclusions: {voltage_key} kV | {len(excluded_bus_runs)}")
 
     _log(log, f"Envelope source read started: {voltage_key} kV | {len(all_inf_paths)} unique runs")
     read_started = time.perf_counter()
     run_cache = _read_voltage_run_cache(
         all_inf_paths,
+        voltage_key,
         bus_prefix,
         bus_um,
-        excluded_buses,
-        excluded_bus_runs,
+        exclusion_matcher,
         worker_count,
         log,
         check_cancel,
@@ -380,6 +380,7 @@ def _build_voltage_workbooks(
         fallback_frequency=fallback_frequency,
         frequency_fallback=frequency_fallback,
         inf_descriptor_cache=inf_descriptor_cache,
+        executor=run_executor,
     )
     _log(log, f"Envelope source read finished: {voltage_key} kV | {_elapsed(read_started)}")
 
@@ -455,18 +456,25 @@ def _path_matches_scope(path: Path, scope: ScopeEntry) -> bool:
     return matched if scope.mode == "include" else not matched
 
 
-def _selected_inf_paths(case_root: Path, scope: ScopeEntry, excluded_keys: set[tuple[str, int]]) -> list[Path]:
+def _inf_inventory(
+    case_root: Path,
+    exclusion_matcher: ExclusionMatcher | None = None,
+) -> list[Path]:
     paths: list[Path] = []
+    matcher = exclusion_matcher or ExclusionMatcher()
     for path in sorted(case_root.rglob("*.inf")):
         try:
-            key = case_run_from_inf_path(path)
+            case, run = case_run_from_inf_path(path)
         except ValueError:
             continue
-        if key in excluded_keys:
+        if matcher.excludes_run("", case, run):
             continue
-        if _path_matches_scope(path, scope):
-            paths.append(path)
+        paths.append(path)
     return paths
+
+
+def _selected_inf_paths(inf_inventory: Iterable[Path], scope: ScopeEntry) -> list[Path]:
+    return [path for path in inf_inventory if _path_matches_scope(path, scope)]
 
 
 def _worker_count(item_count: int, configured: int) -> int:
@@ -479,30 +487,46 @@ def _read_inf_descriptor_cache(
     inf_paths: list[Path],
     worker_count: int,
     check_cancel: CancelFn | None,
+    log: LogFn | None = None,
 ) -> dict[Path, list[InfDescriptor]]:
     if not inf_paths:
         return {}
 
-    descriptor_cache: dict[Path, list[InfDescriptor]] = {}
     workers = _worker_count(len(inf_paths), worker_count)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(parse_inf_descriptors, inf_path): inf_path for inf_path in inf_paths}
-        for future in as_completed(futures):
+        hash_futures = {executor.submit(hash_inf_file, inf_path): inf_path for inf_path in inf_paths}
+        paths_by_digest: dict[str, list[Path]] = {}
+        for future in as_completed(hash_futures):
             _cancel(check_cancel)
-            inf_path = futures[future]
+            inf_path = hash_futures[future]
+            paths_by_digest.setdefault(future.result(), []).append(inf_path)
+
+        descriptor_cache: dict[Path, list[InfDescriptor]] = {}
+        parse_futures = {
+            executor.submit(parse_inf_descriptors, paths[0]): (digest, paths)
+            for digest, paths in paths_by_digest.items()
+        }
+        for future in as_completed(parse_futures):
+            _cancel(check_cancel)
+            _digest, matching_paths = parse_futures[future]
             try:
-                descriptor_cache[inf_path] = future.result()
-            except ValueError:
+                descriptors = future.result()
+            except ValueError as exc:
+                names = ", ".join(path.name for path in matching_paths[:3])
+                extra = f" and {len(matching_paths) - 3} more" if len(matching_paths) > 3 else ""
+                _log(log, f"Skipped invalid .inf layout: {names}{extra} | {exc}")
                 continue
+            for inf_path in matching_paths:
+                descriptor_cache[inf_path] = descriptors
     return descriptor_cache
 
 
 def _read_voltage_run_cache(
     inf_paths: list[Path],
+    voltage_key: str,
     bus_prefix: str,
     bus_um: float,
-    excluded_buses: set[str],
-    excluded_bus_runs: set[tuple[str, int, str]],
+    exclusion_matcher: ExclusionMatcher,
     worker_count: int,
     log: LogFn | None,
     check_cancel: CancelFn | None,
@@ -512,25 +536,32 @@ def _read_voltage_run_cache(
     fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
     frequency_fallback: FrequencyFallbackFn | None = None,
     inf_descriptor_cache: dict[Path, list[InfDescriptor]] | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]]:
     limit = high_voltage_limit_factor * bus_um * math.sqrt(2)
     run_cache: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]] = {}
 
     workers = _worker_count(len(inf_paths), worker_count)
     completed = 0
-    executor = ThreadPoolExecutor(max_workers=workers)
+    owns_executor = executor is None
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {}
         for inf_path in inf_paths:
             _cancel(check_cancel)
+            case_name, run = case_run_from_inf_path(inf_path)
+            if exclusion_matcher.excludes_run(voltage_key, case_name, run):
+                run_cache[inf_path] = ([], [])
+                continue
             futures[
                 executor.submit(
                     _read_run_entries,
                     inf_path,
                     limit,
+                    voltage_key,
                     bus_prefix,
-                    excluded_buses,
-                    excluded_bus_runs,
+                    exclusion_matcher,
                     time_step,
                     time_end,
                     fallback_frequency,
@@ -539,6 +570,9 @@ def _read_voltage_run_cache(
                     inf_descriptor_cache,
                 )
             ] = inf_path
+        completed = len(run_cache)
+        if completed and not futures:
+            _log(log, f"Envelope source files read: {bus_prefix} | {completed}/{len(inf_paths)}")
         for future in as_completed(futures):
             _cancel(check_cancel)
             inf_path = futures[future]
@@ -556,7 +590,8 @@ def _read_voltage_run_cache(
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     else:
-        executor.shutdown(wait=True)
+        if owns_executor:
+            executor.shutdown(wait=True)
 
     return run_cache
 
@@ -577,9 +612,9 @@ def _entries_for_inf_paths(
 def _read_run_entries(
     inf_path: Path,
     limit: float,
+    voltage_key: str,
     bus_prefix: str,
-    excluded_buses: set[str],
-    excluded_bus_runs: set[tuple[str, int, str]],
+    exclusion_matcher: ExclusionMatcher,
     time_step: float = TIME_STEP,
     time_end: float = TIME_END,
     fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
@@ -590,9 +625,23 @@ def _read_run_entries(
     _cancel(check_cancel)
     case_name, run = case_run_from_inf_path(inf_path)
     if inf_descriptor_cache is None or inf_path not in inf_descriptor_cache:
-        df_desc = _parse_inf(inf_path, bus_prefix, excluded_buses)
+        df_desc = _parse_inf(
+            inf_path,
+            bus_prefix,
+            voltage_key,
+            case_name,
+            run,
+            exclusion_matcher,
+        )
     else:
-        df_desc = _filter_inf_descriptors(inf_descriptor_cache[inf_path], bus_prefix, excluded_buses)
+        df_desc = _filter_inf_descriptors(
+            inf_descriptor_cache[inf_path],
+            bus_prefix,
+            voltage_key,
+            case_name,
+            run,
+            exclusion_matcher,
+        )
     _cancel(check_cancel)
     out_cache = _read_out_files(df_desc, inf_path, check_cancel)
     candidates: list[tuple[str, str, pd.DataFrame]] = []
@@ -626,8 +675,6 @@ def _read_run_entries(
     entries: list[tuple[str, pd.DataFrame]] = []
     for measurement, bus, envelope_df in candidates:
         _cancel(check_cancel)
-        if (case_name, int(run), bus) in excluded_bus_runs:
-            continue
         envelope_df["MM_name"] = bus
         envelope_df["Case"] = f"{case_name}-{run}"
         entries.append((measurement, envelope_df))
@@ -635,26 +682,43 @@ def _read_run_entries(
     return entries, high_voltage
 
 
-def _parse_inf(inf_path: Path, bus_prefix: str, excluded_buses: set[str] | None = None) -> pd.DataFrame:
+def _parse_inf(
+    inf_path: Path,
+    bus_prefix: str,
+    voltage_key: str = "",
+    case_name: str = "",
+    run: int = 0,
+    exclusion_matcher: ExclusionMatcher | None = None,
+) -> pd.DataFrame:
     try:
         descriptors = parse_inf_descriptors(inf_path)
     except ValueError as exc:
         raise ValueError("There are no results in your data") from exc
-    return _filter_inf_descriptors(descriptors, bus_prefix, excluded_buses)
+    return _filter_inf_descriptors(
+        descriptors,
+        bus_prefix,
+        voltage_key,
+        case_name,
+        run,
+        exclusion_matcher,
+    )
 
 
 def _filter_inf_descriptors(
     descriptors: list[InfDescriptor],
     bus_prefix: str,
-    excluded_buses: set[str] | None = None,
+    voltage_key: str = "",
+    case_name: str = "",
+    run: int = 0,
+    exclusion_matcher: ExclusionMatcher | None = None,
 ) -> pd.DataFrame:
-    excluded = {bus.strip() for bus in excluded_buses or () if bus.strip()}
+    matcher = exclusion_matcher or ExclusionMatcher()
     records = [
         {"PGB": descriptor.PGB, "Description": descriptor.Description, "Group": descriptor.Group}
         for descriptor in descriptors
         if descriptor.Group.startswith(bus_prefix)
         and "p_" in descriptor.Description
-        and descriptor.Group.strip() not in excluded
+        and not matcher.excludes(voltage_key, case_name, run, descriptor.Group)
     ]
     df_desc = pd.DataFrame(
         records,
@@ -711,6 +775,7 @@ def _build_bus_envelope(
 ) -> tuple[pd.DataFrame | None, list[dict[str, Any]]]:
     times: list[np.ndarray] = []
     values: list[np.ndarray] = []
+    absolute_values: list[np.ndarray] = []
     signals: list[str] = []
     exclusions: list[dict[str, Any]] = []
     for phase_index in df_bus.index:
@@ -719,12 +784,13 @@ def _build_bus_envelope(
         out_path, col_number = out_file_for_pgb(inf_path, int(phase_index) + 1)
         time_values, columns = out_cache[out_path]
         phase_values = columns[col_number]
+        phase_absolute_values = np.abs(phase_values)
         times.append(time_values)
         values.append(phase_values)
+        absolute_values.append(phase_absolute_values)
         signals.append(signal)
 
-        abs_values = np.abs(phase_values)
-        over_limit = abs_values > limit
+        over_limit = phase_absolute_values > limit
         if over_limit.any():
             exclusions.append(
                 {
@@ -735,7 +801,7 @@ def _build_bus_envelope(
                     "Signal": signal,
                     "File": out_path.name,
                     "Excluded_values": int(over_limit.sum()),
-                    "Max_abs": float(abs_values[over_limit].max()),
+                    "Max_abs": float(phase_absolute_values[over_limit].max()),
                     "Limit": limit,
                 }
             )
@@ -753,6 +819,7 @@ def _build_bus_envelope(
             fallback_frequency,
             context,
             frequency_fallback,
+            absolute_phase_values=absolute_values,
         )
         _cancel(check_cancel)
         return envelope, exclusions
@@ -793,6 +860,7 @@ def _apply_envelope_arrays(
     fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
     frequency_context: str = "",
     frequency_fallback: FrequencyFallbackFn | None = None,
+    absolute_phase_values: list[np.ndarray] | None = None,
 ) -> pd.DataFrame | None:
     dt = round(float(np.median(np.diff(time_values))), 6)
     if not np.isfinite(dt) or dt <= 0:
@@ -807,10 +875,14 @@ def _apply_envelope_arrays(
     )
 
     window_size = max(1, int((1 / (2 * detected_freq)) / dt))
-    new_time = np.round(np.arange(0.0, time_end, time_step), 6)
+    new_time = _bounded_time_grid([time_values], time_step, time_end)
     interpolated = {}
     for index, values in enumerate(phase_values):
-        abs_values = np.abs(values)
+        abs_values = (
+            absolute_phase_values[index]
+            if absolute_phase_values is not None
+            else np.abs(values)
+        )
         if np.nanmax(abs_values) < 1e-4:
             continue
         rolling_values = (
@@ -824,7 +896,7 @@ def _apply_envelope_arrays(
             time_values,
             rolling_values,
             left=rolling_values[0],
-            right=0.0,
+            right=np.nan,
         )
     if not interpolated:
         return None
@@ -860,7 +932,8 @@ def _apply_envelope(
     window_size = max(1, int((1 / (2 * detected_freq)) / dt))
     drop_cols = []
     for col in phase_cols:
-        if df[col].abs().max() < 1e-4:
+        maximum = df[col].abs().max()
+        if not np.isfinite(maximum) or maximum < 1e-4:
             drop_cols.append(col)
             continue
         df.loc[:, col] = df[col].abs().rolling(window=window_size, min_periods=1, center=True).max()
@@ -868,15 +941,44 @@ def _apply_envelope(
     if df.empty:
         return None
 
-    new_time = np.round(np.arange(0.0, time_end, time_step), 6)
+    valid_times = [
+        df.index.to_numpy(dtype=float)[np.isfinite(df[col].to_numpy(dtype=float))]
+        for col in df.columns
+    ]
+    new_time = _bounded_time_grid(valid_times, time_step, time_end)
     interpolated = {}
     for col in df.columns:
         x = df.index.to_numpy(dtype=float)
         y = df[col].to_numpy(dtype=float)
-        interpolated[max_phase_cols[col]] = np.interp(new_time, x, y, left=y[0], right=0.0)
+        finite = np.isfinite(x) & np.isfinite(y)
+        valid_x = x[finite]
+        valid_y = y[finite]
+        interpolated[max_phase_cols[col]] = np.interp(
+            new_time,
+            valid_x,
+            valid_y,
+            left=valid_y[0],
+            right=np.nan,
+        )
     output = pd.DataFrame(interpolated, index=new_time)
     output.index.name = "Time (s)"
     return output
+
+
+def _bounded_time_grid(
+    time_arrays: Iterable[np.ndarray],
+    time_step: float,
+    requested_end: float,
+) -> np.ndarray:
+    available_ends = [
+        float(np.max(finite))
+        for values in time_arrays
+        if len(finite := np.asarray(values, dtype=float)[np.isfinite(values)])
+    ]
+    if not available_ends:
+        return np.array([], dtype=float)
+    effective_end = min(float(requested_end), min(available_ends))
+    return np.round(np.arange(0.0, max(0.0, effective_end), time_step), 6)
 
 
 def _detect_frequency_from_arrays(
@@ -913,81 +1015,57 @@ def _final_envelope(
 
 
 def _reduce_merge(source_dfs: list[pd.DataFrame], time_step: float = TIME_STEP) -> pd.DataFrame:
-    work = list(source_dfs)
-    while len(work) > 1:
-        merged: list[pd.DataFrame] = []
-        for idx in range(0, len(work) - 1, 2):
-            merged.append(_merge_list([work[idx], work[idx + 1]], time_step))
-        if len(work) % 2 == 1:
-            merged.append(work[-1])
-        work = merged
+    phase_suffixes = list(
+        dict.fromkeys(
+            suffix
+            for source_df in source_dfs
+            for suffix in _phase_suffixes(source_df)
+        )
+    )
+    row_count = max(len(source_df) for source_df in source_dfs)
+    output = pd.DataFrame({"Time (s)": np.round(np.arange(row_count) * time_step, 6)})
+    run_columns: dict[str, pd.Series] = {}
 
-    df = _merge_list([work[0]], time_step)
-    df = _add_phase_source_cols(df)
-    df.reset_index(inplace=True)
-    for suffix in _phase_suffixes(df):
-        case_col = f"Case_{suffix}"
-        run_col = f"Run_{suffix}"
-        parts = df[case_col].astype(str).str.split("-", n=1, expand=True)
-        df[case_col] = parts[0].replace("nan", np.nan)
-        df[run_col] = pd.to_numeric(parts[1] if parts.shape[1] > 1 else np.nan, errors="coerce")
-        df[f"Max_{suffix}"] = df[f"Max_{suffix}"].round(1)
-    return df
-
-
-def _merge_list(source_dfs: list[pd.DataFrame], time_step: float = TIME_STEP) -> pd.DataFrame:
-    treated = []
-    for df in source_dfs:
-        sort_df = "MM_name" in df.columns and "Case" in df.columns
-        df = _add_phase_source_cols(df)
-        if sort_df:
-            phase_dfs = []
-            for suffix in _phase_suffixes(df):
-                max_col = f"Max_{suffix}"
-                mm_col = f"MM_name_{suffix}"
-                case_col = f"Case_{suffix}"
-                phase_df = df[[max_col, mm_col, case_col]].sort_values(by=max_col, ascending=False).reset_index(drop=True)
-                phase_df.index = np.round(np.arange(len(phase_df)) * time_step, 6)
-                phase_df.index.name = "Time (s)"
-                phase_dfs.append(phase_df)
-            df = pd.concat(phase_dfs, axis=1, join="outer", sort=False)
-        treated.append(df)
-
-    merged = pd.concat(treated, axis=1, join="outer", sort=False)
-    grouped = pd.DataFrame(index=merged.index)
-    for suffix in _phase_suffixes(merged):
+    for suffix in phase_suffixes:
         max_col = f"Max_{suffix}"
-        mm_col = f"MM_name_{suffix}"
-        case_col = f"Case_{suffix}"
-        max_cols = _duplicate_cols(merged, max_col)
-        case_cols = _duplicate_cols(merged, case_col)
-        mm_cols = _duplicate_cols(merged, mm_col)
-        max_values = max_cols.max(axis=1, skipna=True)
-        max_idx = max_cols.fillna(-np.inf).to_numpy().argmax(axis=1)
-        row_indices = np.arange(len(max_cols))
-        grouped[max_col] = max_values
-        grouped[mm_col] = mm_cols.to_numpy()[row_indices, max_idx]
-        grouped[case_col] = case_cols.to_numpy()[row_indices, max_idx]
-    grouped.index.name = "Time (s)"
-    return grouped
+        max_arrays: list[np.ndarray] = []
+        mm_arrays: list[np.ndarray] = []
+        case_arrays: list[np.ndarray] = []
+        for source_df in source_dfs:
+            if max_col not in source_df.columns:
+                continue
+            values = source_df[max_col].to_numpy(dtype=float)
+            order = np.argsort(np.where(np.isnan(values), -np.inf, values), kind="stable")[::-1]
+            max_arrays.append(values[order])
+            mm_arrays.append(source_df["MM_name"].to_numpy(dtype=object)[order])
+            case_arrays.append(source_df["Case"].to_numpy(dtype=object)[order])
+
+        max_matrix = np.full((row_count, len(max_arrays)), np.nan, dtype=float)
+        mm_matrix = np.full((row_count, len(mm_arrays)), np.nan, dtype=object)
+        case_matrix = np.full((row_count, len(case_arrays)), np.nan, dtype=object)
+        for index, values in enumerate(max_arrays):
+            max_matrix[: len(values), index] = values
+            mm_matrix[: len(values), index] = mm_arrays[index]
+            case_matrix[: len(values), index] = case_arrays[index]
+
+        comparable = np.where(np.isnan(max_matrix), -np.inf, max_matrix)
+        source_indices = comparable.argmax(axis=1)
+        row_indices = np.arange(row_count)
+        max_values = comparable[row_indices, source_indices]
+        max_values[max_values == -np.inf] = np.nan
+        output[max_col] = np.round(max_values, 1)
+        output[f"MM_name_{suffix}"] = mm_matrix[row_indices, source_indices]
+        selected_cases = pd.Series(case_matrix[row_indices, source_indices], dtype=object)
+        parts = selected_cases.astype(str).str.split("-", n=1, expand=True)
+        output[f"Case_{suffix}"] = parts[0].replace("nan", np.nan)
+        run_columns[f"Run_{suffix}"] = pd.to_numeric(parts[1] if parts.shape[1] > 1 else np.nan, errors="coerce")
+    for column, values in run_columns.items():
+        output[column] = values
+    return output
 
 
 def _phase_suffixes(df: pd.DataFrame) -> list[str]:
     return list(dict.fromkeys(col.replace("Max_", "") for col in df.columns if str(col).startswith("Max_")))
-
-
-def _add_phase_source_cols(df: pd.DataFrame) -> pd.DataFrame:
-    if "MM_name" not in df.columns or "Case" not in df.columns:
-        return df
-    df = df.copy()
-    for suffix in _phase_suffixes(df):
-        df[f"MM_name_{suffix}"] = df["MM_name"]
-        df[f"Case_{suffix}"] = df["Case"]
-    return df.drop(columns=["MM_name", "Case"])
-
-
-def _duplicate_cols(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    return df.loc[:, df.columns == col]
 
 
 def _map_fault_types_phase(df: pd.DataFrame, df_stat: pd.DataFrame) -> pd.DataFrame:
@@ -1063,10 +1141,15 @@ def _find_non_convergent_cases(
     df_stat: pd.DataFrame,
     cb_iip_limit: float = NONCONV_CB_IIP_LIMIT,
     cb_iir_limit: float = NONCONV_CB_IIR_LIMIT,
+    *,
+    warnings: list[str] | None = None,
 ) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for path in sorted(case_root.rglob("CB_*.out")):
-        records.extend(_read_non_convergent_file(path, cb_iip_limit, cb_iir_limit))
+        file_records, warning = _read_non_convergent_file(path, cb_iip_limit, cb_iir_limit)
+        records.extend(file_records)
+        if warning and warnings is not None:
+            warnings.append(warning)
     if not records:
         return pd.DataFrame(columns=NONCONV_COLUMNS)
     df_nonconv = pd.DataFrame(records).drop_duplicates()
@@ -1078,31 +1161,34 @@ def find_non_convergent_cases_for_project(
     project_root: str | Path,
     cb_iip_limit: float | None = None,
     cb_iir_limit: float | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     root = Path(project_root)
     case_root = root / "Case_folder"
     if not case_root.is_dir():
-        return []
+        return [], []
+    warnings: list[str] = []
     df_nonconv = _find_non_convergent_cases(
         case_root,
         _read_stat_files(root),
         _positive_float(cb_iip_limit, NONCONV_CB_IIP_LIMIT),
         _positive_float(cb_iir_limit, NONCONV_CB_IIR_LIMIT),
+        warnings=warnings,
     )
-    return df_nonconv.astype(object).where(pd.notna(df_nonconv), "").to_dict("records")
+    records = df_nonconv.astype(object).where(pd.notna(df_nonconv), "").to_dict("records")
+    return records, warnings
 
 
 def _read_non_convergent_file(
     path: Path,
     cb_iip_limit: float = NONCONV_CB_IIP_LIMIT,
     cb_iir_limit: float = NONCONV_CB_IIR_LIMIT,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str | None]:
     case_name = path.parent.name.split(".")[0]
     source = path.stem.replace("_01_0001", "")
     records: list[dict[str, Any]] = []
-    df_summary = _read_cb_summary(path)
+    df_summary, warning = _read_cb_summary(path)
     if df_summary.empty or "Run#" not in df_summary.columns:
-        return records
+        return records, warning
 
     current_cols = [col for col in df_summary.columns if "II" in str(col)]
     for _, row in df_summary.iterrows():
@@ -1123,18 +1209,22 @@ def _read_non_convergent_file(
                 reason = f"CB_IIr above {cb_iir_limit:g}"
             if reason:
                 records.append({"Case": case_name, "Run": int(run), "Source": source, "Signal": signal, "Reason": reason, "Value": value_raw, "File": path.name})
-    return records
+    return records, warning
 
 
-def _read_cb_summary(path: Path) -> pd.DataFrame:
+def _read_cb_summary(path: Path) -> tuple[pd.DataFrame, str | None]:
+    failures: list[str] = []
     for skiprows in ([0], None):
         try:
             df = pd.read_csv(path, skiprows=skiprows, header=0, sep=r"\s+", engine="python", dtype=str)
-        except Exception:
+        except (OSError, UnicodeError, pd.errors.ParserError, ValueError) as exc:
+            failures.append(str(exc))
             continue
         if "Run#" in df.columns:
-            return df
-    return pd.DataFrame()
+            return df, None
+        failures.append("missing Run# column")
+    reason = "; ".join(dict.fromkeys(failures)) or "unsupported file structure"
+    return pd.DataFrame(), f"Skipped unreadable CB summary {path.name}: {reason}"
 
 
 def _nonconv_keys(df_nonconv: pd.DataFrame) -> set[tuple[str, int]]:
@@ -1182,25 +1272,18 @@ def _write_workbook(
         ll_df.to_excel(writer, index=False, sheet_name="LLp")
         nonconv_df.to_excel(writer, index=False, sheet_name="NonConv cases")
         high_voltage_df.to_excel(writer, index=False, sheet_name="High voltage exclusions")
-    _format_workbook(path)
+        _format_workbook(writer.book)
 
 
-def _format_workbook(path: Path) -> None:
-    import openpyxl
-
-    wb = openpyxl.load_workbook(path)
-    try:
-        for ws in wb.worksheets:
-            if ws.max_column:
-                ws.freeze_panes = "A2"
-                ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}1"
-            for col_idx in range(1, ws.max_column + 1):
-                header = ws.cell(1, col_idx).value
-                cell = ws.cell(1, col_idx)
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill("solid", fgColor="D9EAF7")
-                cell.alignment = Alignment(horizontal="center")
-                ws.column_dimensions[get_column_letter(col_idx)].width = max(12, min(28, len(str(header or "")) + 2))
-        wb.save(path)
-    finally:
-        wb.close()
+def _format_workbook(workbook: Any) -> None:
+    for ws in workbook.worksheets:
+        if ws.max_column:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}1"
+        for col_idx in range(1, ws.max_column + 1):
+            header = ws.cell(1, col_idx).value
+            cell = ws.cell(1, col_idx)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.alignment = Alignment(horizontal="center")
+            ws.column_dimensions[get_column_letter(col_idx)].width = max(12, min(28, len(str(header or "")) + 2))

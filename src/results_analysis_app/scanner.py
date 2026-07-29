@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
 import posixpath
 import re
-from typing import Any
+from typing import Any, Callable
 from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
@@ -106,13 +106,85 @@ class ScopePreview:
 def _non_temp_files(root: Path, pattern: str) -> list[Path]:
     if not root.is_dir():
         return []
-    return sorted(path for path in root.rglob(pattern) if not path.name.startswith("~$"))
+    return sorted(path for path in root.rglob(pattern) if path.is_file() and not path.name.startswith("~$"))
 
 
 def _has_non_temp_file(root: Path, pattern: str) -> bool:
     if not root.is_dir():
         return False
-    return any(not path.name.startswith("~$") for path in root.rglob(pattern))
+    return any(path.is_file() and not path.name.startswith("~$") for path in root.rglob(pattern))
+
+
+def _has_dashboard_files(root: Path) -> bool:
+    return any(
+        _has_non_temp_file(root, pattern)
+        for pattern in ("*.xlsx", "*.xlsm", "*.xlsb")
+    )
+
+
+def _has_plot_files(root: Path) -> bool:
+    return any(
+        _has_non_temp_file(root, pattern)
+        for pattern in ("*.png", "*.jpg", "*.jpeg", "*.emf")
+    )
+
+
+def project_scan_manifest(project_root: str | Path) -> dict[str, Any]:
+    """Return metadata for files that can change an opening project scan."""
+    root = Path(project_root).resolve()
+    manifest: dict[str, Any] = {"exists": root.is_dir(), "files": []}
+    if not root.is_dir():
+        return manifest
+
+    paths: set[Path] = set()
+
+    def add_tree(scan_root: Path, include) -> None:
+        if not scan_root.is_dir():
+            return
+        paths.update(
+            path
+            for path in scan_root.rglob("*")
+            if path.is_file() and not path.name.startswith("~$") and include(path)
+        )
+
+    add_tree(
+        root / "Case_folder",
+        lambda path: path.suffix.casefold() == ".inf"
+        or (
+            path.suffix.casefold() == ".out"
+            and (path.name.casefold().startswith("statistic") or path.name.casefold().startswith("cb_"))
+        ),
+    )
+    paths.update(
+        path
+        for path in root.glob("Input_Data_PSCAD*.xlsx")
+        if path.is_file() and not path.name.startswith("~$")
+    )
+    add_tree(root / "Voltage_envelope", lambda path: path.suffix.casefold() == ".xlsx")
+    add_tree(root / "Results", lambda path: path.suffix.casefold() == ".csv")
+    add_tree(root / "Dashboards", lambda path: path.suffix.casefold() in {".xlsx", ".xlsm", ".xlsb"})
+    add_tree(root / "Plots" / "Generated", lambda path: path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".emf"})
+    add_tree(root / "Reports", lambda path: path.suffix.casefold() == ".docx")
+
+    files: list[dict[str, int | str]] = []
+    for path in sorted(paths):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        try:
+            relative_path = path.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        files.append(
+            {
+                "path": relative_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    manifest["files"] = files
+    return manifest
 
 
 def _case_name_from_inf(path: Path) -> str:
@@ -186,7 +258,10 @@ def _raw_high_voltage_records_for_inf(
     buses: set[str],
     voltage_by_bus: dict[str, str],
     limit_by_bus: dict[str, float],
+    check_cancel: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    if check_cancel is not None:
+        check_cancel()
     try:
         case, run = case_run_from_inf_path(inf_path)
     except ValueError:
@@ -200,6 +275,8 @@ def _raw_high_voltage_records_for_inf(
         return [], [f"Could not parse INF file: {inf_path.name} | {exc}"]
 
     for descriptor in descriptors:
+        if check_cancel is not None:
+            check_cancel()
         description = descriptor.Description.strip()
         bus = descriptor.Group.strip()
         if bus not in buses:
@@ -217,6 +294,8 @@ def _raw_high_voltage_records_for_inf(
     records: list[dict[str, Any]] = []
     warnings: list[str] = []
     for out_path, channels in channels_by_file.items():
+        if check_cancel is not None:
+            check_cancel()
         columns = sorted({column for column, _bus, _measurement, _signal in channels})
         try:
             values_by_column = load_out_columns(out_path, columns)
@@ -228,6 +307,8 @@ def _raw_high_voltage_records_for_inf(
             continue
 
         for column, bus, measurement, signal in channels:
+            if check_cancel is not None:
+                check_cancel()
             series = values_by_column.get(column)
             if series is None:
                 continue
@@ -308,15 +389,16 @@ def _collect_nonconv_cases(
     project_root: Path,
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
-) -> list[NonConvergentCase]:
+) -> tuple[list[NonConvergentCase], list[str]]:
     from results_analysis_app.voltage_envelope import find_non_convergent_cases_for_project
 
     rows = []
-    for record in find_non_convergent_cases_for_project(
+    records, warnings = find_non_convergent_cases_for_project(
         project_root,
         nonconv_cb_iip_limit,
         nonconv_cb_iir_limit,
-    ):
+    )
+    for record in records:
         run = _as_int(record.get("Run"))
         case = _as_text(record.get("Case")).strip()
         if not case or run is None:
@@ -333,7 +415,7 @@ def _collect_nonconv_cases(
                 file=_as_text(record.get("File")),
             )
         )
-    return rows
+    return rows, warnings
 
 
 def _read_xlsx_sheet_rows(path: Path, sheet_name: str) -> list[dict[str, Any]]:
@@ -362,9 +444,10 @@ def _read_xlsx_sheet_rows(path: Path, sheet_name: str) -> list[dict[str, Any]]:
         workbook.close()
 
 
-def _collect_high_voltage_exclusions(project_root: Path) -> list[HighVoltageExclusion]:
+def _collect_high_voltage_exclusions(project_root: Path) -> tuple[list[HighVoltageExclusion], list[str]]:
     envelope_root = project_root / "Voltage_envelope"
     rows: list[HighVoltageExclusion] = []
+    warnings: list[str] = []
     seen: set[tuple[str, str, int, str, str]] = set()
     for workbook_path in _non_temp_files(envelope_root, "MM_*_with_combined_plot.xlsx"):
         match = re.search(r"MM_(\d+(?:\.\d+)?)", workbook_path.stem, flags=re.IGNORECASE)
@@ -373,7 +456,8 @@ def _collect_high_voltage_exclusions(project_root: Path) -> list[HighVoltageExcl
         voltage = match.group(1)
         try:
             records = _read_xlsx_sheet_rows(workbook_path, "High voltage exclusions")
-        except (OSError, BadZipFile, KeyError, ValueError):
+        except (OSError, BadZipFile, KeyError, ValueError) as exc:
+            warnings.append(f"Could not read high-voltage proposals from {workbook_path.name}: {exc}")
             continue
         for record in records:
             run = _as_int(record.get("Run"))
@@ -401,14 +485,18 @@ def _collect_high_voltage_exclusions(project_root: Path) -> list[HighVoltageExcl
                     limit=_as_text(record.get("Limit")),
                 )
             )
-    return rows
+    return rows, warnings
 
 
 def scan_high_voltage_from_pscad_log(
     project_root: str | Path,
     high_voltage_limit_factor: float,
     um_overrides: dict[str, float] | None = None,
+    *,
+    check_cancel: Callable[[], None] | None = None,
 ) -> tuple[list[HighVoltageExclusion], list[str]]:
+    if check_cancel is not None:
+        check_cancel()
     root = Path(project_root).resolve()
     warnings: list[str] = []
     log_path = _pscad_log_path(root)
@@ -426,6 +514,8 @@ def scan_high_voltage_from_pscad_log(
     limit_by_bus: dict[str, float] = {}
     limit_factor = high_voltage_limit_factor if high_voltage_limit_factor > 0 else 1.0
     for case, bus in sorted(case_buses):
+        if check_cancel is not None:
+            check_cancel()
         voltage = _voltage_from_mm_bus(bus)
         if not voltage:
             continue
@@ -444,7 +534,10 @@ def scan_high_voltage_from_pscad_log(
     raw_records: list[dict[str, Any]] = []
     matched_runs = 0
     matched_cases: set[str] = set()
+    matched_inf_paths: list[tuple[Path, set[str]]] = []
     for inf_path in sorted(case_root.rglob("*.inf")):
+        if check_cancel is not None:
+            check_cancel()
         try:
             case, _run = case_run_from_inf_path(inf_path)
         except ValueError:
@@ -454,14 +547,28 @@ def scan_high_voltage_from_pscad_log(
             continue
         matched_runs += 1
         matched_cases.add(case)
-        records, record_warnings = _raw_high_voltage_records_for_inf(
-            inf_path,
-            buses,
-            voltage_by_bus,
-            limit_by_bus,
-        )
-        raw_records.extend(records)
-        warnings.extend(record_warnings)
+        matched_inf_paths.append((inf_path, buses))
+
+    if matched_inf_paths:
+        worker_count = min(2, len(matched_inf_paths))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _raw_high_voltage_records_for_inf,
+                    inf_path,
+                    buses,
+                    voltage_by_bus,
+                    limit_by_bus,
+                    check_cancel,
+                ): inf_path
+                for inf_path, buses in matched_inf_paths
+            }
+            for future in as_completed(futures):
+                if check_cancel is not None:
+                    check_cancel()
+                records, record_warnings = future.result()
+                raw_records.extend(records)
+                warnings.extend(record_warnings)
 
     rows = _aggregate_raw_high_voltage_records(raw_records)
 
@@ -482,6 +589,60 @@ def scan_high_voltage_from_pscad_log(
 
 def _collect_voltages(project_root: Path, inf_paths: list[Path]) -> list[str]:
     return available_voltage_keys(project_root, inf_paths=inf_paths)
+
+
+def _refresh_scan_chips(scan: ProjectScan, has_result_files: bool | None = None) -> None:
+    if not scan.exists:
+        scan.chips = ["Missing Project"]
+        return
+
+    if has_result_files is None:
+        base_chip = next(
+            (chip for chip in scan.chips if chip in {"Ready", "Missing Results"}),
+            "Ready" if scan.case_infos else "Missing Results",
+        )
+    else:
+        base_chip = "Ready" if has_result_files or scan.case_infos else "Missing Results"
+
+    scan.chips = [base_chip]
+    if not scan.has_dashboards:
+        scan.chips.append("No dashboards")
+    if not scan.has_envelopes:
+        scan.chips.append("No envelopes")
+    if scan.has_plots:
+        scan.chips.append("Plots exist")
+    if scan.has_reports:
+        scan.chips.append("Reports exist")
+    if scan.nonconv_cases:
+        scan.chips.append(f"NonConv proposals: {len(scan.nonconv_cases)}")
+    if scan.high_voltage_exclusions:
+        scan.chips.append(f"High voltage proposals: {len(scan.high_voltage_exclusions)}")
+
+
+def refresh_project_scan_outputs(
+    scan: ProjectScan,
+    *,
+    refresh_dashboards: bool = False,
+    refresh_envelopes: bool = False,
+    refresh_plots: bool = False,
+    refresh_reports: bool = False,
+    refresh_high_voltage_exclusions: bool = False,
+) -> ProjectScan:
+    """Refresh output flags after a targeted workflow action."""
+    project_root = scan.path
+    if refresh_dashboards:
+        scan.has_dashboards = _has_dashboard_files(project_root / "Dashboards")
+    if refresh_envelopes:
+        scan.has_envelopes = _has_non_temp_file(project_root / "Voltage_envelope", "*.xlsx")
+    if refresh_plots:
+        scan.has_plots = _has_plot_files(project_root / "Plots" / "Generated")
+    if refresh_reports:
+        scan.has_reports = _has_non_temp_file(project_root / "Reports", "*.docx")
+    if refresh_high_voltage_exclusions:
+        scan.high_voltage_exclusions, warnings = _collect_high_voltage_exclusions(project_root)
+        scan.messages.extend(warnings)
+    _refresh_scan_chips(scan)
+    return scan
 
 
 def scan_project(
@@ -512,26 +673,17 @@ def scan_project(
                 nonconv_cb_iip_limit,
                 nonconv_cb_iir_limit,
             ),
-            "has_dashboards": executor.submit(
-                lambda: any(
-                    _has_non_temp_file(dashboard_root, pattern)
-                    for pattern in ("*.xlsx", "*.xlsm", "*.xlsb")
-                )
-            ),
+            "has_dashboards": executor.submit(_has_dashboard_files, dashboard_root),
             "has_envelopes": executor.submit(_has_non_temp_file, envelope_root, "*.xlsx"),
-            "has_plots": executor.submit(
-                lambda: any(
-                    _has_non_temp_file(generated_root, pattern)
-                    for pattern in ("*.png", "*.jpg", "*.jpeg", "*.emf")
-                )
-            ),
+            "has_plots": executor.submit(_has_plot_files, generated_root),
             "has_reports": executor.submit(_has_non_temp_file, reports_root, "*.docx"),
             "available_voltages": executor.submit(_collect_voltages, project_root, inf_paths),
             "high_voltage_exclusions": executor.submit(_collect_high_voltage_exclusions, project_root),
         }
         has_result_files = bool(futures["has_result_files"].result())
         try:
-            scan.nonconv_cases = futures["nonconv_cases"].result()
+            scan.nonconv_cases, warnings = futures["nonconv_cases"].result()
+            scan.messages.extend(warnings)
         except Exception as exc:
             scan.messages.append(f"Could not scan NonConv proposals: {exc}")
         scan.has_dashboards = futures["has_dashboards"].result()
@@ -539,27 +691,12 @@ def scan_project(
         scan.has_plots = futures["has_plots"].result()
         scan.has_reports = futures["has_reports"].result()
         scan.available_voltages = futures["available_voltages"].result()
-        scan.high_voltage_exclusions = futures["high_voltage_exclusions"].result()
+        scan.high_voltage_exclusions, warnings = futures["high_voltage_exclusions"].result()
+        scan.messages.extend(warnings)
 
     has_results = bool(has_result_files or scan.case_infos)
 
-    if has_results:
-        scan.chips.append("Ready")
-    else:
-        scan.chips.append("Missing Results")
-
-    if not scan.has_dashboards:
-        scan.chips.append("No dashboards")
-    if not scan.has_envelopes:
-        scan.chips.append("No envelopes")
-    if scan.has_plots:
-        scan.chips.append("Plots exist")
-    if scan.has_reports:
-        scan.chips.append("Reports exist")
-    if scan.nonconv_cases:
-        scan.chips.append(f"NonConv proposals: {len(scan.nonconv_cases)}")
-    if scan.high_voltage_exclusions:
-        scan.chips.append(f"High voltage proposals: {len(scan.high_voltage_exclusions)}")
+    _refresh_scan_chips(scan, has_result_files=has_results)
 
     return scan
 

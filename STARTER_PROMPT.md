@@ -1,28 +1,47 @@
-# Starter Prompt For New Laptop
+# Starter Prompt For A New Machine
 
 You are working in this folder as the active PSCAD Results Analysis app root.
 
 Rules:
 
-- This project does not use Git.
-- First read `README.md`, `docs/CURRENT_CONTEXT.md`, and `pyproject.toml`.
-- Inspect the actual codebase before making claims or edits.
-- Verify documentation against code; do not assume docs are perfect.
-- Use Anaconda Python with the dedicated `../.conda/pscad-results-analysis` conda environment.
-- Do not use the base conda environment.
-- Report your current understanding before changing files.
-- Use only relative paths in documentation.
-- Make small targeted changes.
-- Prefer deletion/simplification over adding new abstractions.
-- Avoid broad rewrites, unnecessary abstractions, and style-only rewrites of working code.
-- Preserve existing behavior unless a requested change requires behavior change.
-- Run relevant tests when practical.
-- Update relevant documentation after meaningful workflow, setup, or behavior changes.
+- Work silently by default and provide a final report only, unless clarification or approval is required.
+- First read `AGENTS.md`, `README.md`, `docs/CURRENT_CONTEXT.md`, `pyproject.toml`, and `environment.yml`.
+- Inspect the actual codebase before making claims or edits; documentation may be stale.
+- Git is configured for this app. Inspect the worktree, preserve unrelated changes, and do not rely on history as a substitute for reading current code.
+- Use Anaconda Python with the dedicated `../.conda/pscad-results-analysis` environment, never `base`.
+- If the environment does not exist, create it from `environment.yml` with the project-local prefix.
+- Use only relative paths in project documentation.
+- Make small, targeted changes and preserve existing workflow and engineering logic unless a change has been explicitly agreed.
+- Prefer deletion, reuse, and simplification over new abstractions or duplicated helpers.
+- Keep project scanning, exclusions, envelope building, plotting, reporting, and theme behavior in their existing functional modules.
+- Run the relevant tests and import/smoke checks. Use `.tmp/` for test output and remove generated caches afterward.
+- Update all affected documentation after meaningful setup, workflow, behavior, or risk changes.
 
-Start by confirming:
+Current entry points:
 
-1. app purpose;
-2. current folder structure;
-3. conda setup command;
-4. run/test commands;
-5. the specific files likely relevant to my next request.
+```bat
+start_app.bat
+```
+
+```bat
+..\.conda\pscad-results-analysis\python.exe -m results_analysis_app
+```
+
+Current test command:
+
+```powershell
+New-Item -ItemType Directory -Force .tmp | Out-Null
+$env:TMP = "$PWD\.tmp"
+$env:TEMP = "$PWD\.tmp"
+..\.conda\pscad-results-analysis\python.exe -m pytest -q -o cache_dir=.tmp\pytest_cache
+```
+
+Before editing, establish:
+
+1. the app purpose and current folder structure;
+2. the current conda environment and dependencies;
+3. the relevant entry points and data flow;
+4. the files and tests affected by the request;
+5. any mismatch between documentation and code.
+
+Include that understanding in the final report unless it is needed earlier to resolve a blocker.

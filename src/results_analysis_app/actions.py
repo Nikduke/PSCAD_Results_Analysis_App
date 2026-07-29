@@ -8,6 +8,7 @@ from results_analysis_app import analysis_engine
 from results_analysis_app import resonance_checks
 from results_analysis_app import voltage_envelope
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
+from results_analysis_app.exclusions import ExclusionRule
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_HEIGHT,
@@ -28,21 +29,14 @@ def _log(log: LogFn | None, message: str) -> None:
 def ensure_output_tree(
     project_root: str | Path,
     scopes: Iterable[ScopeEntry],
-    events: Iterable[str],
 ) -> None:
-    """Create the agreed project-local output tree for selected scopes/events."""
+    """Create output roots needed for selected scopes and batch workbooks."""
     root = Path(project_root).resolve()
     for scope in scopes:
         for folder in (
             root / "Voltage_envelope" / scope.folder,
             root / "Reports" / scope.folder,
         ):
-            folder.mkdir(parents=True, exist_ok=True)
-
-        for event in events:
-            folder = resonance_checks.output_dir_for_event(root, scope.folder, event)
-            if folder is None:
-                folder = root / "Plots" / "Generated" / scope.folder / event
             folder.mkdir(parents=True, exist_ok=True)
 
     batch_dir = root / "Plots" / "Plot_batch"
@@ -106,9 +100,7 @@ def build_voltage_envelopes(
     nonconv_cb_iir_limit: float | None = None,
     event_times: dict[str, float] | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
-    bus_exclusions_by_project: dict[str, dict[str, list[str]]] | None = None,
-    manual_case_run_exclusions_by_project: dict[str, list[tuple[str, int]]] | None = None,
-    high_voltage_exclusions_by_project: dict[str, list[tuple[str, str, int, str]]] | None = None,
+    exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
     resonance_settings: dict[str, object] | None = None,
     build_charts: bool = True,
     log: LogFn | None = None,
@@ -117,12 +109,10 @@ def build_voltage_envelopes(
     """Build scope-aware voltage envelope workbooks for selected projects."""
     selected_scopes = list(scopes)
     selected_voltages = list(voltages)
-    selected_events = list(events)
-    all_plot_events = [*selected_events, *resonance_checks.selected_plot_events(resonance_settings)]
     outputs: list[Path] = []
     for project_root in project_roots:
         root = Path(project_root).resolve()
-        ensure_output_tree(root, selected_scopes, all_plot_events)
+        ensure_output_tree(root, selected_scopes)
         _log(log, f"Building voltage envelopes: {root.name}")
         project_key = str(root)
         outputs.extend(
@@ -133,9 +123,7 @@ def build_voltage_envelopes(
                 log=log,
                 check_cancel=check_cancel,
                 envelope_workers=envelope_workers,
-                bus_exclusions_by_voltage=(bus_exclusions_by_project or {}).get(project_key, {}),
-                manual_case_run_exclusions=(manual_case_run_exclusions_by_project or {}).get(project_key, []),
-                high_voltage_exclusions=(high_voltage_exclusions_by_project or {}).get(project_key, []),
+                exclusions=(exclusions_by_project or {}).get(project_key, []),
                 envelope_time_step=envelope_time_step,
                 envelope_time_end=envelope_time_end,
                 envelope_fallback_frequency=envelope_fallback_frequency,
@@ -184,7 +172,7 @@ def rebuild_envelope_charts(
     with excel_app() as excel:
         for project_root in project_roots:
             root = Path(project_root).resolve()
-            ensure_output_tree(root, selected_scopes, ())
+            ensure_output_tree(root, selected_scopes)
             _log(log, f"Rebuilding envelope charts: {root.name}")
             for scope in selected_scopes:
                 for voltage in selected_voltages:
@@ -218,6 +206,7 @@ def rebuild_envelope_charts(
 def rebuild_analysis_charts(
     project_roots: Iterable[str | Path],
     scopes: Iterable[ScopeEntry],
+    envelope_chart_x_max: float | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
 ) -> list[Path]:
@@ -225,29 +214,28 @@ def rebuild_analysis_charts(
     selected_scopes = list(scopes)
     outputs: list[Path] = []
     try:
-        excel_context = excel_app()
-        excel = excel_context.__enter__()
+        with excel_app() as excel:
+            for project_root in project_roots:
+                root = Path(project_root).resolve()
+                _log(log, f"Rebuilding analysis charts: {root.name}")
+                for scope in selected_scopes:
+                    if check_cancel is not None:
+                        check_cancel()
+                    workbook_path = root / "Voltage_envelope" / scope.folder / resonance_checks.WORKBOOK_NAME
+                    if not workbook_path.exists():
+                        _log(log, f"Analysis workbook missing, skipped: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
+                        continue
+                    if create_resonance_check_charts(
+                        workbook_path,
+                        excel,
+                        x_max=envelope_chart_x_max,
+                    ):
+                        outputs.append(workbook_path)
+                        _log(log, f"Rebuilt analysis charts: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
+                    else:
+                        _log(log, f"No analysis chart sheets found: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
     except EXCEL_AUTOMATION_ERRORS as exc:
         _log(log, f"Excel chart styling unavailable; analysis chart rebuild skipped: {exc}")
-        return []
-    try:
-        for project_root in project_roots:
-            root = Path(project_root).resolve()
-            _log(log, f"Rebuilding analysis charts: {root.name}")
-            for scope in selected_scopes:
-                if check_cancel is not None:
-                    check_cancel()
-                workbook_path = root / "Voltage_envelope" / scope.folder / resonance_checks.WORKBOOK_NAME
-                if not workbook_path.exists():
-                    _log(log, f"Analysis workbook missing, skipped: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
-                    continue
-                if create_resonance_check_charts(workbook_path, excel):
-                    outputs.append(workbook_path)
-                    _log(log, f"Rebuilt analysis charts: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
-                else:
-                    _log(log, f"No analysis chart sheets found: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
-    finally:
-        excel_context.__exit__(None, None, None)
     return outputs
 
 
@@ -265,11 +253,10 @@ def create_plot_batches(
     selected_scopes = list(scopes)
     selected_voltages = list(voltages)
     selected_events = list(events)
-    all_plot_events = [*selected_events, *resonance_checks.selected_plot_events(resonance_settings)]
     outputs: list[Path] = []
     for project_root in project_roots:
         root = Path(project_root).resolve()
-        ensure_output_tree(root, selected_scopes, all_plot_events)
+        ensure_output_tree(root, selected_scopes)
         _log(log, f"Creating plot batches: {root.name}")
         outputs.extend(
             analysis_engine.create_plot_batches(
@@ -299,7 +286,7 @@ def render_plot_batches(
     selected_events = [*list(events), *resonance_checks.selected_plot_events(resonance_settings)]
     for project_root in project_roots:
         root = Path(project_root).resolve()
-        ensure_output_tree(root, selected_scopes, selected_events)
+        ensure_output_tree(root, selected_scopes)
         _log(log, f"Rendering plot batches: {root.name}")
         analysis_engine.render_plot_batches(
             root,
@@ -332,9 +319,7 @@ def run_analysis_pipeline(
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
-    bus_exclusions_by_project: dict[str, dict[str, list[str]]] | None = None,
-    manual_case_run_exclusions_by_project: dict[str, list[tuple[str, int]]] | None = None,
-    high_voltage_exclusions_by_project: dict[str, list[tuple[str, str, int, str]]] | None = None,
+    exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
     resonance_settings: dict[str, object] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
@@ -371,9 +356,7 @@ def run_analysis_pipeline(
             nonconv_cb_iir_limit=nonconv_cb_iir_limit,
             event_times=event_times,
             voltage_um_overrides_by_project=voltage_um_overrides_by_project,
-            bus_exclusions_by_project=bus_exclusions_by_project,
-            manual_case_run_exclusions_by_project=manual_case_run_exclusions_by_project,
-            high_voltage_exclusions_by_project=high_voltage_exclusions_by_project,
+            exclusions_by_project=exclusions_by_project,
             resonance_settings=resonance_settings,
             log=log,
             check_cancel=check_cancel,

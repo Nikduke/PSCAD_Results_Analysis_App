@@ -8,6 +8,7 @@ from PySide6 import QtGui, QtWidgets
 
 from results_analysis_app.main_window import MainWindow
 from results_analysis_app.models import AppSession
+from results_analysis_app.styles import install_system_theme
 
 
 def _app_icon() -> QtGui.QIcon | None:
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("PSCAD Results Analysis")
     app.setOrganizationName("loMPE")
+    install_system_theme(app)
     icon = _app_icon()
     if icon is not None:
         app.setWindowIcon(icon)

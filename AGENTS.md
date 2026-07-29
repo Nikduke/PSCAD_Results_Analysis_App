@@ -13,7 +13,7 @@ Work silently by default. Do not send progress messages, implementation plans, o
 
 - Read `README.md`, `docs/CURRENT_CONTEXT.md`, `pyproject.toml`, `environment.yml`, and the relevant source and test files before editing.
 - Verify documentation against the current source; do not treat the handover document as authoritative when code differs.
-- Do not assume Git history or use Git as a prerequisite for any task.
+- Git is configured for this app. Inspect the current worktree before editing, preserve unrelated changes, and do not depend on history to understand current behavior.
 - Use evidence from the current files, tests, logs, or explicit user requirements. Do not invent project facts.
 
 ## Change policy
@@ -29,12 +29,16 @@ Work silently by default. Do not send progress messages, implementation plans, o
 ## Project structure and workflow
 
 - `src/results_analysis_app/` contains the PySide6 application, scanning, envelope building, analysis checks, settings, actions, and reporting.
-- `src/pscad_plotter_app_v3/` contains the embedded waveform plotting engine.
-- `tests/` contains focused contract tests.
+- `src/results_analysis_app/settings_dialog.py` owns Settings dialog construction and session updates; keep settings UI out of `main_window.py`.
+- `src/results_analysis_app/project_scan_cache.py` and `project_scan_runner.py` provide metadata-validated hot-start project scans.
+- `src/results_analysis_app/exclusions.py` owns shared Manual, NonConv, and High Voltage exclusion normalization and matching.
+- `src/results_analysis_app/styles.py` owns the system-aware light/dark palette and semantic widget styles. Do not add fixed light-only styles directly to UI widgets.
+- `src/pscad_plotter_app_v3/` contains the MM-only embedded waveform plotting and Excel-export engine used by report batches.
+- `tests/` contains focused plotting, reporting, scanning, envelope, UI-model, and resonance contract tests.
 - `docs/CURRENT_CONTEXT.md` is the current-state handover and must stay aligned with the implementation.
-- `Original_examples/` is outside this app folder and contains reference scripts and sample PSCAD data.
+- `../Original_examples/` is outside this app folder and contains reference scripts and sample PSCAD data.
 
-The main workflow is: add or rescan PSCAD projects, select scopes and analysis options, scan or refresh inputs, build envelope data and checks, create and render plot batches, and rebuild DOCX reports.
+The main workflow is: add cached PSCAD projects, select scopes and analysis options, review exclusions, scan or refresh inputs, build envelope data and checks, create and render plot batches, and rebuild DOCX reports.
 
 ## Environment and commands
 
@@ -84,4 +88,4 @@ Build the optional executable with `Create_executable.bat`. Rebuild it after sou
 
 ## Documentation
 
-Update `README.md` and/or `docs/CURRENT_CONTEXT.md` when setup, commands, dependencies, paths, workflow behavior, or known risks change. Use relative paths in project documentation.
+Update `README.md`, `docs/CURRENT_CONTEXT.md`, and any affected setup or starter documentation when setup, commands, dependencies, paths, workflow behavior, or known risks change. Use relative paths in project documentation.
