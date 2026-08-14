@@ -18,6 +18,7 @@ from results_analysis_app.project_config import (
     load_project_timing,
     load_voltage_configs,
 )
+from results_analysis_app import sustained_sdpf
 from results_analysis_app.styles import make_muted_label, make_section_label
 
 
@@ -359,6 +360,76 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     resonance_form.addRow("Manual analysis start time", resonance_manual_start_spin)
     resonance_layout.addLayout(resonance_form)
 
+    sustained_group = QtWidgets.QGroupBox("Sustained SDPF Stress", resonance_tab)
+    sustained_layout = QtWidgets.QVBoxLayout(sustained_group)
+    sustained_form = QtWidgets.QFormLayout()
+    sustained_use_tov_check = QtWidgets.QCheckBox("Use TOV setting", sustained_group)
+    sustained_use_tov_check.setChecked(bool(self.session.sustained_sdpf_use_tov))
+    sustained_form.addRow("Duration source", sustained_use_tov_check)
+    sustained_duration_spin = QtWidgets.QDoubleSpinBox(sustained_group)
+    sustained_duration_spin.setDecimals(4)
+    sustained_duration_spin.setRange(0.0001, 100.0)
+    sustained_duration_spin.setSingleStep(0.001)
+    sustained_duration_spin.setSuffix(" s")
+    sustained_custom_duration = {"value": float(self.session.sustained_sdpf_duration)}
+
+    def update_sustained_duration() -> None:
+        use_tov = sustained_use_tov_check.isChecked()
+        sustained_duration_spin.setEnabled(not use_tov)
+        effective_tov = float(event_spins["TOV"].value())
+        if effective_tov <= 0:
+            effective_tov = sustained_custom_duration["value"]
+        sustained_duration_spin.setValue(
+            effective_tov if use_tov else sustained_custom_duration["value"]
+        )
+
+    def remember_sustained_duration(value: float) -> None:
+        if not sustained_use_tov_check.isChecked():
+            sustained_custom_duration["value"] = float(value)
+
+    sustained_duration_spin.valueChanged.connect(remember_sustained_duration)
+    event_spins["TOV"].valueChanged.connect(lambda _value: update_sustained_duration())
+    sustained_use_tov_check.toggled.connect(lambda _checked: update_sustained_duration())
+    sustained_form.addRow("Duration criterion", sustained_duration_spin)
+    sustained_layout.addLayout(sustained_form)
+    sustained_limit_message = "SDPF limits are read from MM_blocks and resolved once per voltage level."
+    sustained_limit_label = make_muted_label(sustained_limit_message, sustained_group)
+    sustained_layout.addWidget(sustained_limit_label)
+
+    sustained_limit_table = QtWidgets.QTableWidget(0, 6, sustained_group)
+    sustained_limit_table.setHorizontalHeaderLabels(
+        ["kV", "Type", "SDPF RMS (kV)", "SDPF peak (kV)", "15% margin RMS (kV)", "15% margin peak (kV)"]
+    )
+    sustained_limit_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+    sustained_limit_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+    sustained_limit_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+    for column in range(2, sustained_limit_table.columnCount()):
+        sustained_limit_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Stretch)
+    if project_path:
+        limits, limit_warnings = sustained_sdpf.resolve_project_limits(project_path)
+        if limit_warnings:
+            sustained_limit_label.setText(
+                f"{sustained_limit_message} {' '.join(limit_warnings)}"
+            )
+        for voltage, limit in sorted(limits.items(), key=lambda item: float(item[0])):
+            for measurement in ("LGp", "LLp"):
+                row = sustained_limit_table.rowCount()
+                sustained_limit_table.insertRow(row)
+                value = limit.rms(measurement)
+                values = (
+                    voltage,
+                    measurement[:-1],
+                    f"{value:g}",
+                    f"{limit.peak(measurement):g}",
+                    f"{limit.margin_rms(measurement):g}",
+                    f"{limit.margin_peak(measurement):g}",
+                )
+                for column, text in enumerate(values):
+                    sustained_limit_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+    sustained_layout.addWidget(sustained_limit_table)
+    update_sustained_duration()
+    resonance_layout.addWidget(sustained_group)
+
     advanced_group = QtWidgets.QGroupBox("Algorithm constants", resonance_tab)
     advanced_form = QtWidgets.QFormLayout(advanced_group)
 
@@ -462,6 +533,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         float(self.session.nonconv_cb_iir_limit),
     )
     old_high_voltage_factor = float(self.session.high_voltage_limit_factor)
+    old_fallback_frequency = float(self.session.envelope_fallback_frequency)
     old_um_overrides = dict(
         self.session.voltage_um_overrides_by_project.get(project_path or "", {})
     )
@@ -542,13 +614,26 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     self.session.resonance_min_growth_ratio = float(min_growth_ratio_spin.value())
     self.session.resonance_min_level_over_vlim = float(min_level_spin.value())
     self.session.resonance_min_growth_delta_factor = float(min_delta_factor_spin.value())
+    self.session.sustained_sdpf_use_tov = sustained_use_tov_check.isChecked()
+    if not self.session.sustained_sdpf_use_tov:
+        self.session.sustained_sdpf_duration = float(sustained_duration_spin.value())
     event_times = {event: float(spin.value()) for event, spin in event_spins.items()}
     self.session.event_times = event_times
-    self.autosave()
     new_nonconv_limits = (
         float(self.session.nonconv_cb_iip_limit),
         float(self.session.nonconv_cb_iir_limit),
     )
+    if project_path and (
+        new_nonconv_limits != old_nonconv_limits
+        or float(self.session.high_voltage_limit_factor) != old_high_voltage_factor
+        or self.session.voltage_um_overrides_by_project.get(project_path, {}) != old_um_overrides
+        or (
+            project_frequency is None
+            and float(self.session.envelope_fallback_frequency) != old_fallback_frequency
+        )
+    ):
+        sustained_sdpf.invalidate_results(project_path)
+    self.autosave()
     if rebuild_cache_requested:
         QtCore.QTimer.singleShot(0, lambda: self.refresh_project_scans(force=True))
     elif (

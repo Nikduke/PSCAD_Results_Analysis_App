@@ -10,6 +10,7 @@ The main implementation modules are:
 - `src/results_analysis_app/scanner.py` - project discovery, NonConv proposals, and PSCAD-log high-voltage proposals.
 - `src/results_analysis_app/voltage_envelope.py` - raw waveform reads, high-voltage checks, per-run envelopes, and envelope workbook data.
 - `src/results_analysis_app/resonance_checks.py` - Stress, Late Growth, and No-settle Growth checks.
+- `src/results_analysis_app/sustained_sdpf.py` - chronological Sustained SDPF stress assessment and compact result persistence.
 - `src/results_analysis_app/envelope_chart.py` - Excel envelope and resonance charts.
 - `src/results_analysis_app/analysis_engine.py` - event and resonance plot batches, embedded waveform rendering, and Excel exports.
 - `src/results_analysis_app/reporting.py` - DOCX report assembly from generated outputs.
@@ -23,8 +24,8 @@ For each selected project, scope, and voltage, the app follows this sequence:
 3. Apply the selected Manual and NonConv exclusions before submitting waveform work. High Voltage rows are checked against raw waveforms during the build itself; an unchecked High Voltage row creates an exact include override.
 4. Read the selected raw `.out` channels, check high voltage, and create a chronological rolling envelope for every surviving case/run/bus and measurement type.
 5. Merge the per-run phase candidates into the base `MM_<voltage>.xlsx` workbook, preserving the source Case, Run, fault type, and MM name for each phase and for the overall maximum.
-6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. These checks do not reread raw `.out` files.
-7. Write the base workbook, resonance workbook, combined Excel charts, plot batches, rendered waveform plots, and DOCX reports through the selected workflow steps.
+6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. If Sustained SDPF is enabled, assess each raw fixed phase/pair from the same loaded worker data; no separate `.out` read is performed.
+7. Write the base workbook, resonance workbook, combined Excel charts, compact Sustained SDPF JSON metadata, plot batches, rendered waveform plots, and DOCX reports through the selected workflow steps.
 
 Voltage levels are processed sequentially. Runs within one voltage use one shared bounded process pool. The automatic worker setting selects logical CPUs minus one, capped at 60 and reduced when fewer runs exist.
 
@@ -264,7 +265,21 @@ It contains `Settings`, result tabs only for checks/voltage types with findings,
 
 Resonance charts use the same chart x-axis settings as envelope charts and are capped by each result's actual data end. A chart displaying `0.5 s` can therefore be a chart-axis setting even when the underlying analysis data extend farther; changing the chart x maximum does not rebuild envelope data.
 
-## 6. Event plots and reports
+## 6. Sustained SDPF stress
+
+Sustained SDPF is an optional analysis selected beside Stress, Late, and No-settle. It supplements the ranked representative envelope; it does not change the existing envelope, TOV/SFO/SA, or resonance methods and it does not classify frequency content with an FFT or a 10--500 Hz rule.
+
+The analysis runs while the normal envelope workers already hold the selected raw waveforms. It uses the resolved project fundamental frequency from `Input_Data_PSCAD*.xlsx` (with the existing fallback path) to form a chronological half-cycle peak-amplitude track. It does not hard-code 50/60 Hz or convert the duration criterion into a cycle count. The track is tied to one fixed physical path at a time: LG `A-G`, `B-G`, `C-G`, and LL `A-B`, `B-C`, `C-A`. No maximum-across-phases series is used. Separate windows on one phase are not added, and a window on one phase is never stitched to a window on another phase. NaN/missing portions split the chronological track; missing tails are not replaced with zero.
+
+`SDPF_LG` and `SDPF_LL` are resolved through the embedded plotter `LimitService` from the `MM_blocks` sheet, one validated row per voltage level (with project plotter overrides applied). Source values are RMS. The displayed peak is `RMS x sqrt(2)`, and the existing safety margin is `0.85 x SDPF` in both RMS and peak units. Missing, invalid, or inconsistent voltage-level values produce a warning and skip that voltage rather than inventing a limit.
+
+For each surviving Case/Run/MM and fixed phase/pair, the app records the longest single continuous duration above the 15% margin, the longest single continuous duration above SDPF, and the highest level that remains sustained for the effective duration. The normalized governing value is `sustained peak / SDPF peak`; one deterministic worst result is selected for each voltage-specific report across all cases, runs, MM locations, LG phases, and LL pairs. Classification is based on the effective duration: sustained SDPF, margin-only, or no sustained margin exceedance.
+
+The duration follows the existing TOV event time by default. Clearing **Use TOV setting** enables the persisted independent positive duration; changing ordinary TOV then has no effect on that independent value. Project frequency is not duplicated in the UI. Settings show one LG and one LL limit row per voltage with RMS, peak, and margin columns.
+
+No Sustained SDPF envelope/check workbook is created. Compact metadata is saved as `Voltage_envelope/<scope>/Sustained_SDpf.json`, including source-file metadata and the applied settings/exclusion signature. Plot batches reuse the existing MM renderer with SDPF and margin lines and no special interval markers. Reports add one concise `Sustained SDPF stress` section after the SFO/TOV/SA time-domain figures, with only the selected result's phase-duration table, highest sustained stress, classification, and one normal MM plot. A saved result is ignored when its settings, effective duration, or recorded source-file manifest is stale; rerun the envelope/check build after source, limit, frequency, or exclusion changes.
+
+## 7. Event plots and reports
 
 The event selection method uses envelope workbook rows to choose representative Case/Run/MM points:
 
@@ -280,7 +295,7 @@ Those Case/Run/MM selections are written to plot batch workbooks. The embedded M
 
 Reports reuse the generated dashboard, envelope, waveform, and resonance plot outputs. Envelope summary values use the same nearest-time helper as plot batch selection, so reports and event batches do not implement separate time-selection rules.
 
-## 7. Settings that change the method
+## 8. Settings that change the method
 
 The following values are persisted in the session and passed into the build/check functions:
 
@@ -301,14 +316,19 @@ The following values are persisted in the session and passed into the build/chec
 | Minimum growth ratio | `1.05` |
 | Minimum level over `Vlim` | `0.50` |
 | Minimum growth delta | `0.01 × Vlim` |
+| Sustained SDPF duration source | Existing TOV setting by default |
+| Sustained SDPF custom duration | `0.030 s`, retained when TOV reuse is disabled |
+| Sustained SDPF margin | `0.85 × SDPF` (fixed) |
 
 Changing envelope-build duration or High Voltage settings requires running the envelope build again to regenerate the affected workbook data. Changing chart-axis settings only requires rebuilding charts. Changing resonance thresholds requires rebuilding the checks; rebuilding only the charts does not recalculate findings.
 
-## 8. Important interpretation limits
+## 9. Important interpretation limits
 
 - The High Voltage threshold and the resonance `Vlim` are different calculations and use different configured quantities.
 - The base envelope workbook is a ranked representative envelope. The resonance checks use chronological per-run envelopes retained during the same build.
 - A short run is not extended with zeros. Missing tail samples are ignored during merge.
 - A High Voltage finding for one phase excludes the whole Case/Run/bus from both LGp and LLp, unless the exact UI include override is active.
+- Sustained SDPF is an insulation-stress duration check only; it is not an IEC/TOV frequency-content classifier.
+- The Sustained SDPF JSON is compact metadata, not a replacement for the representative envelope workbook and not a persisted waveform cache.
 - Excel COM is required for workbook AutoFit, chart creation, dashboard refresh, and some report figure workflows.
 - The methods describe the current implementation; changes to source modules or settings should be reflected here and in `docs/CURRENT_CONTEXT.md`.

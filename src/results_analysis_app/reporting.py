@@ -15,7 +15,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
-from results_analysis_app import resonance_checks
+from results_analysis_app import resonance_checks, sustained_sdpf
 from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import ScopeEntry
@@ -882,6 +882,84 @@ def _add_analysis_figure_sentence(
     )
 
 
+def _load_sustained_sdpf_report_result(
+    project_root: Path,
+    scope: ScopeEntry,
+    voltage: str,
+    settings: sustained_sdpf.SustainedSDPFSettings,
+    event_times: dict[str, float] | None,
+) -> sustained_sdpf.SustainedSDPFResult | None:
+    payload = sustained_sdpf.load_results(project_root, scope.folder)
+    if payload.get("settings") != settings.to_mapping() or not sustained_sdpf.result_inputs_current(
+        payload,
+        str(voltage),
+    ):
+        return None
+    raw = payload.get("results", {}).get(str(voltage))
+    if not isinstance(raw, dict):
+        return None
+    try:
+        result = sustained_sdpf.SustainedSDPFResult.from_dict(raw)
+    except (TypeError, ValueError, KeyError):
+        return None
+    if abs(result.duration_s - settings.effective_duration(event_times)) > 1e-9:
+        return None
+    return result
+
+
+def _add_sustained_sdpf_section(
+    doc,
+    result: sustained_sdpf.SustainedSDPFResult,
+    voltage: str,
+    image_path: Path | None,
+    figure_registry: _FigureRegistry,
+    check_cancel: CancelFn | None = None,
+) -> None:
+    _add_report_heading(doc, "Sustained SDPF stress", level=2)
+    duration_ms = result.duration_s * 1000.0
+    doc.add_paragraph(f"Duration criterion: {_format_float(duration_ms, 2)} ms", style="Body Text")
+    relevant = [phase for phase in result.phases if phase.longest_margin_s > 0]
+    if relevant:
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Table Grid"
+        for cell, text in zip(table.rows[0].cells, ("Phase", "> 15% margin", "> SDPF")):
+            cell.text = text
+        for phase in relevant:
+            cells = table.add_row().cells
+            cells[0].text = phase.phase
+            cells[1].text = f"{phase.longest_margin_s * 1000.0:.2f} ms"
+            cells[2].text = (
+                f"{phase.longest_sdpf_s * 1000.0:.2f} ms"
+                if phase.longest_sdpf_s > 0
+                else "-"
+            )
+    governing = result.governing
+    doc.add_paragraph(
+        f"Highest {_format_float(duration_ms, 2)} ms sustained stress: "
+        f"{_format_float(governing.sustained_peak_kv, 2)} kVpeak / "
+        f"{_format_float(governing.sustained_rms_kv, 2)} kVRMS - "
+        f"{_format_float(governing.sustained_ratio * 100.0, 2)}% SDPF",
+        style="Body Text",
+    )
+    if governing.longest_sdpf_s + 1e-12 >= result.duration_s:
+        classification = f"SDPF exceeded for >= {_format_float(duration_ms, 2)} ms"
+    elif governing.longest_margin_s + 1e-12 >= result.duration_s:
+        classification = (
+            f"SDPF safety margin exceeded; SDPF not exceeded for >= {_format_float(duration_ms, 2)} ms"
+        )
+    else:
+        classification = f"No SDPF safety-margin exceedance sustained for >= {_format_float(duration_ms, 2)} ms"
+    doc.add_paragraph(classification, style="Body Text")
+    if image_path is None:
+        return
+    _cancel(check_cancel)
+    reference = figure_registry.allocate()
+    _add_unumbered_plot_heading(doc, _plot_heading_from_image_path(image_path))
+    _add_figure_reference_sentence(doc, "", reference, " shows the governing Sustained SDPF MM time-domain plot.")
+    _add_centered_report_image(doc, image_path)
+    figure_registry.add_caption(doc, reference, f"Sustained SDPF stress at {voltage} kV")
+
+
 def _analysis_figure_caption(label: str, voltage_type: str, voltage: str) -> str:
     return f"{label} {voltage_type} results at {voltage} kV"
 
@@ -1109,6 +1187,7 @@ def build_reports_from_existing_plots(
     event_times: dict[str, float] | None = None,
     log: LogFn | None = None,
     check_cancel: CancelFn | None = None,
+    sustained_sdpf_settings: dict[str, object] | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -1121,6 +1200,7 @@ def build_reports_from_existing_plots(
     selected_events = list(events)
     selected_voltages = list(voltages)
     parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
+    parsed_sustained = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
     _cancel(check_cancel)
 
     with ExitStack() as stack:
@@ -1295,6 +1375,34 @@ def build_reports_from_existing_plots(
                                 _time_domain_figure_caption(event, str(voltage)),
                             )
                             plot_count += 1
+
+                    if parsed_sustained.enabled:
+                        _cancel(check_cancel)
+                        sustained_result = _load_sustained_sdpf_report_result(
+                            root,
+                            scope,
+                            str(voltage),
+                            parsed_sustained,
+                            event_times,
+                        )
+                        if sustained_result is not None:
+                            sustained_image = _find_event_images(
+                                root,
+                                scope,
+                                sustained_sdpf.SUSTAINED_SDPF,
+                                str(voltage),
+                                image_cache,
+                            )
+                            _add_sustained_sdpf_section(
+                                doc,
+                                sustained_result,
+                                str(voltage),
+                                sustained_image[0] if sustained_image else None,
+                                figure_registry,
+                                check_cancel,
+                            )
+                            if sustained_image:
+                                plot_count += 1
 
                     for check in parsed_resonance.effective_enabled_checks:
                         _cancel(check_cancel)

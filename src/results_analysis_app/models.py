@@ -59,6 +59,8 @@ DEFAULT_RESONANCE_MIN_POSITIVE_FRACTION = 0.60
 DEFAULT_RESONANCE_MIN_GROWTH_RATIO = 1.05
 DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM = 0.50
 DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR = 0.01
+DEFAULT_SUSTAINED_SDPF_USE_TOV = True
+DEFAULT_SUSTAINED_SDPF_DURATION = 0.03
 
 
 def _json_list(value: Any, default: tuple[Any, ...] = ()) -> list[Any]:
@@ -328,6 +330,9 @@ class AppSession:
     resonance_min_growth_ratio: float = DEFAULT_RESONANCE_MIN_GROWTH_RATIO
     resonance_min_level_over_vlim: float = DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM
     resonance_min_growth_delta_factor: float = DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR
+    sustained_sdpf_enabled: bool = False
+    sustained_sdpf_use_tov: bool = DEFAULT_SUSTAINED_SDPF_USE_TOV
+    sustained_sdpf_duration: float = DEFAULT_SUSTAINED_SDPF_DURATION
     voltage_um_overrides_by_project: dict[str, dict[str, float]] = field(default_factory=dict)
     manual_exclusions_by_project: dict[str, list[ExclusionRule]] = field(default_factory=dict)
     disabled_nonconv_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
@@ -423,6 +428,9 @@ class AppSession:
             "resonance_min_growth_ratio": self.resonance_min_growth_ratio,
             "resonance_min_level_over_vlim": self.resonance_min_level_over_vlim,
             "resonance_min_growth_delta_factor": self.resonance_min_growth_delta_factor,
+            "sustained_sdpf_enabled": self.sustained_sdpf_enabled,
+            "sustained_sdpf_use_tov": self.sustained_sdpf_use_tov,
+            "sustained_sdpf_duration": self.sustained_sdpf_duration,
             "voltage_um_overrides_by_project": self.voltage_um_overrides_by_project,
             "manual_exclusions_by_project": {
                 project: [rule.to_dict() for rule in exclusions]
@@ -630,6 +638,14 @@ class AppSession:
             resonance_min_growth_delta_factor=normalize_positive_float(
                 data.get("resonance_min_growth_delta_factor", DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR),
                 DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR,
+            ),
+            sustained_sdpf_enabled=bool(data.get("sustained_sdpf_enabled", False)),
+            sustained_sdpf_use_tov=bool(
+                data.get("sustained_sdpf_use_tov", DEFAULT_SUSTAINED_SDPF_USE_TOV)
+            ),
+            sustained_sdpf_duration=normalize_positive_float(
+                data.get("sustained_sdpf_duration", DEFAULT_SUSTAINED_SDPF_DURATION),
+                DEFAULT_SUSTAINED_SDPF_DURATION,
             ),
             voltage_um_overrides_by_project=normalize_project_voltage_um_overrides(
                 data.get("voltage_um_overrides_by_project", {})

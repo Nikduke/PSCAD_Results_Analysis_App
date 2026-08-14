@@ -16,6 +16,7 @@ from results_analysis_app import (
     resonance_checks,
     scanner,
     storage,
+    sustained_sdpf,
     voltage_envelope,
 )
 from results_analysis_app.background import BackgroundTask, CancelToken, OperationCancelled
@@ -319,6 +320,10 @@ class MainWindow(QtWidgets.QMainWindow):
             check.toggled.connect(self._on_global_selection_changed)
             self.resonance_checkboxes[check_name] = check
             layout.addWidget(check)
+        self.sustained_sdpf_checkbox = QtWidgets.QCheckBox("Sustained SDPF", bar)
+        self.sustained_sdpf_checkbox.setToolTip("Sustained SDPF Stress")
+        self.sustained_sdpf_checkbox.toggled.connect(self._on_global_selection_changed)
+        layout.addWidget(self.sustained_sdpf_checkbox)
 
         layout.addStretch(1)
 
@@ -742,6 +747,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 check.setChecked(event in self.session.events)
             for check_name, check in self.resonance_checkboxes.items():
                 check.setChecked(check_name in self.session.resonance_enabled_checks)
+            self.sustained_sdpf_checkbox.setChecked(bool(self.session.sustained_sdpf_enabled))
             self._reload_project_tree()
             self._reload_scope_list()
             self._reload_project_exclusions()
@@ -846,6 +852,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for check_name, check in self.resonance_checkboxes.items()
             if check.isChecked()
         ]
+        self.session.sustained_sdpf_enabled = self.sustained_sdpf_checkbox.isChecked()
         self._save_current_project_exclusions()
 
     def _voltage_sort_key(self, value: str) -> tuple[int, float | str]:
@@ -1388,6 +1395,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._loading:
             return
         self._save_current_project_exclusions()
+        project_path = self._current_project_path()
+        if project_path is not None:
+            sustained_sdpf.invalidate_results(project_path)
         self.autosave()
 
     def _on_manual_exclusion_table_changed(
@@ -2370,6 +2380,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
+        sustained_sdpf_settings = self._sustained_sdpf_settings()
 
         def work(log, cancel):
             log("Analysis plot batch creation started.")
@@ -2380,6 +2391,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 (),
                 dict(self.session.event_times),
                 resonance_settings=resonance_settings,
+                sustained_sdpf_settings=sustained_sdpf_settings,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -2394,6 +2406,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
+        sustained_sdpf_settings = self._sustained_sdpf_settings()
 
         def work(log, cancel):
             log("Analysis plot rendering started.")
@@ -2402,6 +2415,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 scopes,
                 (),
                 resonance_settings=resonance_settings,
+                sustained_sdpf_settings=sustained_sdpf_settings,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -2424,6 +2438,7 @@ class MainWindow(QtWidgets.QMainWindow):
         voltages = list(self.session.voltages)
         events = list(self.session.events)
         resonance_settings = self._resonance_settings()
+        sustained_sdpf_settings = self._sustained_sdpf_settings()
 
         def work(log, cancel):
             log("Report rebuild started.")
@@ -2437,6 +2452,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 events,
                 self.session.dashboard_figure_selection,
                 resonance_settings=resonance_settings,
+                sustained_sdpf_settings=sustained_sdpf_settings,
                 event_times=dict(self.session.event_times),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2499,6 +2515,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _resonance_settings(self) -> dict[str, object]:
         return resonance_checks.ResonanceSettings.from_session(self.session).to_mapping()
+
+    def _sustained_sdpf_settings(self) -> dict[str, object]:
+        return sustained_sdpf.SustainedSDPFSettings.from_session(self.session).to_mapping()
 
     def _project_chart_axis_kwargs(self, project_paths: Iterable[str]) -> dict[str, object]:
         x_max_by_project: dict[str, float | None] = {}
@@ -2567,6 +2586,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.session.high_voltage_include_overrides_by_project.get(path)
             },
             "resonance_settings": self._resonance_settings(),
+            "sustained_sdpf_settings": self._sustained_sdpf_settings(),
         }
 
     def _start_background_task(self, title: str, work, on_success=None) -> None:
@@ -2731,6 +2751,7 @@ class MainWindow(QtWidgets.QMainWindow):
             check.setEnabled(not busy)
         for check in self.resonance_checkboxes.values():
             check.setEnabled(not busy)
+        self.sustained_sdpf_checkbox.setEnabled(not busy)
         self.busy_progress.setVisible(busy)
         self.stop_button.setEnabled(busy)
         self.set_status(status)

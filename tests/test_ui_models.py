@@ -39,6 +39,9 @@ def test_session_event_times_round_trip() -> None:
     session.resonance_min_growth_ratio = 1.1
     session.resonance_min_level_over_vlim = 0.6
     session.resonance_min_growth_delta_factor = 0.02
+    session.sustained_sdpf_enabled = True
+    session.sustained_sdpf_use_tov = False
+    session.sustained_sdpf_duration = 0.02
     project = r"C:\Project"
     session.envelope_chart_x_max_overrides_by_project = {project: 1.0}
     session.envelope_chart_x_major_overrides_by_project = {project: 0.1}
@@ -95,6 +98,9 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.resonance_min_growth_ratio == 1.1
     assert loaded.resonance_min_level_over_vlim == 0.6
     assert loaded.resonance_min_growth_delta_factor == 0.02
+    assert loaded.sustained_sdpf_enabled is True
+    assert loaded.sustained_sdpf_use_tov is False
+    assert loaded.sustained_sdpf_duration == 0.02
     assert loaded.events == ["SFO", "TOV", "SA"]
     assert loaded.manual_exclusions_by_project == session.manual_exclusions_by_project
     assert loaded.disabled_nonconv_by_project == {project: [("C7_S1_66OFT2", 8)]}

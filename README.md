@@ -10,7 +10,7 @@ This is the active app root inside the copied project folder. It contains only t
 - Scans PSCAD project folders, dashboard workbooks, result files, scopes, voltage levels, and exclusions.
 - Builds voltage envelopes and combined envelope charts for selected scopes and voltages.
 - Creates TOV/SFO/SA plot batches, renders waveform plots with the embedded plotting engine, and builds DOCX reports.
-- Runs optional analysis checks: Stress, Late, and No-settle. These use chronological envelope data from envelope building and do not reread raw waveforms. Their `Resonance_Checks.xlsx` workbooks omit empty result tabs and retain only `Settings` when no findings exist.
+- Runs optional analysis checks: Stress, Late, No-settle, and Sustained SDPF. Stress/Late/No-settle use chronological envelope data from envelope building and do not reread raw waveforms. Sustained SDPF uses the already loaded chronological raw phase/pair data, never stitches phases or separated windows, and persists compact JSON metadata rather than another Excel check workbook. `Resonance_Checks.xlsx` omits empty result tabs and retains only `Settings` when no findings exist.
 - Supports high-voltage proposal import from envelope output and from `PSCAD_log.txt` plus fast raw waveform maxima for matching case/MM buses.
 - Uses `Input_Data_PSCAD*.xlsx` and `.inf` files as the project-opening voltage sources; treated result CSVs and generated plot filenames are not used to define available voltages.
 
@@ -22,6 +22,7 @@ This is the active app root inside the copied project folder. It contains only t
 - `src/results_analysis_app/project_scan_cache.py` - persistent metadata-validated project scan cache.
 - `src/results_analysis_app/exclusions.py` - shared exclusion rules, matching, normalization, and legacy-session migration.
 - `src/results_analysis_app/envelope_rows.py` - shared nearest-time envelope row selection used by batches and reports.
+- `src/results_analysis_app/sustained_sdpf.py` - fixed-phase/pair sustained SDPF stress calculation and result metadata.
 - `src/results_analysis_app/styles.py` - centralized light/dark palette and semantic widget styling.
 - `src/pscad_plotter_app_v3/` - compact MM waveform plotting and Excel-export engine used by report batches.
 - `src/results_analysis_app/assets/` - app icon and packaged assets.
@@ -99,7 +100,7 @@ Dependency smoke test:
 ..\.conda\pscad-results-analysis\python.exe -c "import PySide6.QtCore, pandas, openpyxl, docx, win32com.client, matplotlib, numpy, pyexpat; import results_analysis_app; print('ok')"
 ```
 
-The current contract-test baseline is 110 passing tests. Use the current command output, rather than this number alone, to determine whether validation succeeded.
+The current contract-test baseline is 128 passing tests. Use the current command output, rather than this number alone, to determine whether validation succeeded.
 
 ## Build executable
 
@@ -132,7 +133,7 @@ Inspect `git status` before editing or committing. Preserve unrelated worktree c
 ## Main workflow
 
 1. Add one or more PSCAD project folders in one selection. Duplicate folders are ignored and only newly added projects are scanned. Existing saved projects validate core `.inf`, NonConv, voltage-input, and targeted PSCAD-log waveform metadata; dashboard, envelope, plot, and report outputs are tracked separately so output-only changes do not trigger a core rescan. Unchanged scans are restored from `.state/project_scan_cache.json`. On a cold scan, `PSCAD_log.txt` warning candidates are checked automatically against raw waveform maxima for every matching run.
-2. Select projects, scopes, voltages, TOV/SFO/SA events, and optional analysis checks.
+2. Select projects, scopes, voltages, TOV/SFO/SA events, and optional analysis checks, including Sustained SDPF.
 3. Review exclusions for the current project. The `Manual` table accepts `Case`, `Run`, and `Bus`; blank cells are wildcards, while a completely blank row is ignored. `NonConv` and `High Voltage` provide detected proposals through the same `Apply` checkbox workflow. PSCAD-log High Voltage rows are checked automatically when the project is added. High Voltage rows show the mapped fault type when statistic data provide it, identify whether they came from the PSCAD log, analysis, or both, and can be unchecked to force that exact voltage/Case/Run/Bus back into the next build.
 4. Use `Scan figures` or `Dashboards update`.
 5. Use `Build envelope data/checks` to build the base envelope workbooks and checks. This remains the authoritative high-voltage check across every selected case, bus, and run, including cases not proposed by the PSCAD log. Newly detected violations are excluded from both LGp and LLp in that same build and appear checked afterward. The `High voltage exclusions` sheet contains the exclusions actually applied to that specific workbook.
@@ -148,6 +149,7 @@ Reports use numbered Word headings and add field-based figure captions plus clic
 Outputs are written inside each selected PSCAD project, normally under:
 
 - `Voltage_envelope/<scope>/`
+- `Voltage_envelope/<scope>/Sustained_SDpf.json` when Sustained SDPF is enabled (compact metadata; no Sustained SDPF Excel workbook)
 - `Plots/Plot_batch/`
 - `Plots/Generated/<scope>/` only for event/check folders that contain rendered plots
 - `Reports/<scope>/`
@@ -166,6 +168,7 @@ Outputs are written inside each selected PSCAD project, normally under:
 - Project opening automatically reads PSCAD-log warning case/MM pairs and uses a bounded pool to find one raw waveform maximum per matching case/run/bus. These maxima are cached. Changing only the high-voltage factor or `Um` reclassifies cached maxima without rereading waveforms. A changed log, matching `.inf`, or matching raw `.out` file refreshes only the log-derived high-voltage data. Projects without a log do not trigger a full raw-results scan.
 - Envelope builds enumerate `.inf` files once per build and hash each selected layout with BLAKE2b. Files with identical content share one parsed descriptor template across scopes and voltages. NonConv summary files and raw voltage runs are processed through bounded process workers; one run is submitted per worker, and each voltage run returns only processed envelope data. The process pool is reused for one voltage at a time, while voltage levels remain sequential. Envelope workers default to automatic selection: detected logical CPUs except one, capped at 60 for Windows process-pool compatibility and reduced when fewer runs exist. Settings expose an `Automatic` checkbox enabled by default; clearing it enables a positive manual override. Raw `.out` waveform reads remain voltage-specific.
 - `Envelope time end` uses the selected project's `Final duration` automatically by default. Clearing `Use project duration` enables a manual upper limit. Each run is capped again by the final timestamp already loaded with its raw waveform columns. No separate `.out` scan is performed and no zero-valued samples are generated after a run ends.
+- Sustained SDPF reuses the project frequency and the embedded plotter's per-voltage `MM_blocks` SDPF limits. It evaluates fixed LG phases and LL pairs independently, measures single continuous durations, ranks one governing result per voltage-specific report by normalized sustained peak, and writes no additional envelope/check workbook. The duration follows TOV by default or uses the persisted independent value in Settings. A source-file manifest in the JSON prevents stale results from being used for later batches/reports.
 - Project `Final duration` and frequency are read during project initialization and stored in the project scan cache. `Chart x max` defaults to that project-specific duration; `Chart x major` defaults to a readable interval near one tenth of the effective range. Both can be overridden per project in Settings and are saved in `.state`. Envelope and resonance charts share these values and remain capped by the available generated data duration.
 - Envelope waveform absolute values are reused between high-voltage checks and envelope rolling. Rolling envelopes are calculated only after a run's high-voltage scan, so automatically excluded buses do not perform work that will be discarded. Envelope workbooks keep the existing openpyxl table/filter formatting, then use Excel's native AutoFit through the already-packaged Excel automation support.
 - Envelope phase candidates are reduced directly with NumPy while preserving the existing source-order tie rule and Case/Run attribution; intermediate dataframe merge chains are no longer built.
@@ -191,6 +194,7 @@ Outputs are written inside each selected PSCAD project, normally under:
 - Existing files under `dist/` do not represent the latest source until the executable is rebuilt and tested.
 - Excel COM workflows require Microsoft Excel and remain machine-sensitive.
 - Full envelope and report workflows should be validated on representative PSCAD projects after material analysis or reporting changes.
+- Sustained SDPF engineering tests cover continuous-window handling, no phase stitching, separate LG/LL limits, 50/60 Hz processing, settings persistence, source-result metadata, and the no-extra-workbook contract. A representative end-to-end Sustained SDPF plot/report pass still requires a PSCAD project with valid Excel/plotter inputs.
 - The latest source-level cleanup was validated with synthetic MM rendering and Excel export, but not with a full representative PSCAD envelope/plot/report pass.
 - Project-cache validation uses file size and modification time. An external edit preserving both values may require `Rebuild project cache`.
 - Envelope waveform reads are parallel within one voltage level through one shared bounded process pool, while voltage levels are processed sequentially. Large projects should be evaluated with representative timing because parsing and Python-side processing can be CPU-bound as well as storage-bound.

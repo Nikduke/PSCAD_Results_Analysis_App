@@ -11,7 +11,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from results_analysis_app import resonance_checks
+from results_analysis_app import resonance_checks, sustained_sdpf
 from results_analysis_app.background import OperationCancelled
 from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.models import ScopeEntry
@@ -140,6 +140,7 @@ def create_plot_batches(
     resonance_settings: dict[str, Any] | None = None,
     log: LogFn | None = None,
     check_cancel: CancelFn | None = None,
+    sustained_sdpf_settings: dict[str, Any] | None = None,
 ) -> list[Path]:
     outputs: list[Path] = []
     selected_events = list(events)
@@ -183,6 +184,46 @@ def create_plot_batches(
             _create_batch_workbook(output_path, mm_rows)
             outputs.append(output_path)
             _log(log, f"Wrote batch: {output_path.name} | MM rows={len(mm_rows)}")
+
+        expected_settings = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
+        sustained_enabled = expected_settings.enabled
+        sustained_event = sustained_sdpf.SUSTAINED_SDPF
+        sustained_path = project_root / "Plots" / "Plot_batch" / f"batch_paste_{scope.folder}_{sustained_event}.xlsx"
+        if not sustained_enabled:
+            if sustained_path.is_file():
+                sustained_path.unlink()
+                _log(log, f"Removed obsolete Sustained SDPF batch: {sustained_path.name}")
+        else:
+            payload = sustained_sdpf.load_results(project_root, scope.folder)
+            sustained_rows: list[dict[str, Any]] = []
+            if payload.get("settings") == expected_settings.to_mapping():
+                for voltage in selected_voltages:
+                    if not sustained_sdpf.result_inputs_current(payload, str(voltage)):
+                        continue
+                    raw_result = payload.get("results", {}).get(str(voltage))
+                    if not isinstance(raw_result, dict):
+                        continue
+                    try:
+                        result = sustained_sdpf.SustainedSDPFResult.from_dict(raw_result)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if abs(result.duration_s - expected_settings.effective_duration(event_times)) > 1e-9:
+                        continue
+                    sustained_rows.append(
+                        {
+                            "case": result.case,
+                            "run": result.run,
+                            "element": result.mm_name,
+                            "trace": "Both",
+                            "overview": True,
+                            "tov_windows": False,
+                            "limits": True,
+                            "excel_export": True,
+                        }
+                    )
+            _create_batch_workbook(sustained_path, sustained_rows)
+            outputs.append(sustained_path)
+            _log(log, f"Wrote Sustained SDPF batch: {sustained_path.name} | MM rows={len(sustained_rows)}")
 
         if resonance_settings is None:
             continue
@@ -390,6 +431,8 @@ def _remove_generated_directory(output_dir: Path, scope_root: Path) -> None:
         parent = parent.parent
 
 def _desired_output_dir(project_root: Path, scope_folder: str, event_name: str) -> Path:
+    if event_name == sustained_sdpf.SUSTAINED_SDPF:
+        return project_root / "Plots" / "Generated" / scope_folder / sustained_sdpf.SUSTAINED_SDPF
     resonance_dir = resonance_checks.output_dir_for_event(project_root, scope_folder, event_name)
     if resonance_dir is not None:
         return resonance_dir

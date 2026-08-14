@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 import math
@@ -16,7 +16,7 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from results_analysis_app import resonance_checks
+from results_analysis_app import resonance_checks, sustained_sdpf
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
 from results_analysis_app.excel import autofit_workbook, excel_app
 from results_analysis_app.exclusions import ExclusionMatcher, ExclusionRule
@@ -54,6 +54,7 @@ LogFn = Callable[[str], None]
 CancelFn = Callable[[], None]
 FrequencyFallbackFn = Callable[[str], None]
 OutFileData = tuple[np.ndarray, dict[int, np.ndarray]]
+SUSTAINED_ENTRY = "__Sustained_SDPF__"
 
 FREQUENCY_FALLBACK_MESSAGE_PREFIX = "FREQUENCY_FALLBACK|"
 HIGH_VOLTAGE_LIMIT_FACTOR = DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR
@@ -81,6 +82,9 @@ class _VoltageBuildResult:
     chart_inputs: list[tuple[str, Path, Path]]
     resonance_results: list[resonance_checks.ResonanceResult]
     data_outputs: list[Path]
+    sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = field(default_factory=dict)
+    sustained_signatures: dict[tuple[str, str], str] = field(default_factory=dict)
+    sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -120,6 +124,7 @@ def build_voltage_envelopes(
     voltage_um_overrides: dict[str, float] | None = None,
     resonance_settings: dict[str, Any] | None = None,
     build_charts: bool = True,
+    sustained_sdpf_settings: dict[str, Any] | None = None,
 ) -> list[Path]:
     started = time.perf_counter()
     project_root = Path(project_root)
@@ -179,6 +184,15 @@ def build_voltage_envelopes(
         source = "automatic fallback" if automatic_time_end else "Settings"
         _log(log, f"Envelope time end from {source}: {time_end:g} s")
     resonance_settings_obj = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
+    sustained_settings_obj = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
+    sustained_worker_settings = (
+        replace(
+            sustained_settings_obj,
+            duration_s=sustained_settings_obj.effective_duration(event_times),
+        )
+        if sustained_settings_obj.enabled
+        else sustained_settings_obj
+    )
     if resonance_settings_obj.enabled and not resonance_settings_obj.auto_release:
         if not (0.0 <= resonance_settings_obj.manual_analysis_start < time_end):
             raise ValueError("Manual analysis start time must be within [0, envelope time end).")
@@ -215,6 +229,12 @@ def build_voltage_envelopes(
         "height": _positive_float(envelope_chart_height, DEFAULT_ENVELOPE_CHART_HEIGHT),
     }
     voltage_configs = load_voltage_configs(project_root, um_overrides=voltage_um_overrides)
+    sustained_limits_by_voltage: dict[str, sustained_sdpf.SDPFVoltageLimits] = {}
+    sustained_limit_warnings: list[str] = []
+    if sustained_settings_obj.enabled:
+        sustained_limits_by_voltage, sustained_limit_warnings = sustained_sdpf.resolve_project_limits(project_root)
+        for warning in sustained_limit_warnings:
+            _log(log, f"Sustained SDPF: {warning}")
     outputs: list[Path] = []
 
     selected_scopes = list(scopes)
@@ -233,6 +253,9 @@ def build_voltage_envelopes(
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
     resonance_results: list[resonance_checks.ResonanceResult] = []
+    sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = {}
+    sustained_signatures: dict[tuple[str, str], str] = {}
+    sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = {}
     _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads sequential")
     with ProcessPoolExecutor(max_workers=total_workers) as executor:
         for voltage_key in voltage_keys:
@@ -261,10 +284,50 @@ def build_voltage_envelopes(
                 resonance_settings_obj,
                 event_times,
                 executor,
+                sustained_worker_settings,
+                sustained_limits_by_voltage.get(voltage_key),
+                project_frequency or fallback_frequency,
             )
             chart_inputs.extend(result.chart_inputs)
             data_outputs.extend(result.data_outputs)
             resonance_results.extend(result.resonance_results)
+            sustained_results.update(result.sustained_results)
+            sustained_signatures.update(result.sustained_signatures)
+            sustained_signature_inputs.update(result.sustained_signature_inputs)
+
+    if sustained_settings_obj.enabled:
+        for scope in selected_scopes:
+            scope_results = {
+                voltage: sustained_results.get((scope.folder, voltage))
+                for voltage in voltage_keys
+                if (scope.folder, voltage) in sustained_results
+            }
+            scope_signatures = {
+                voltage: sustained_signatures.get((scope.folder, voltage), "")
+                for voltage in scope_results
+            }
+            scope_signature_inputs = {
+                voltage: sustained_signature_inputs.get((scope.folder, voltage), {})
+                for voltage in scope_results
+            }
+            result_path = sustained_sdpf.save_results(
+                project_root,
+                scope.folder,
+                sustained_settings_obj,
+                scope_results,
+                scope_signatures,
+                sustained_limit_warnings,
+                scope_signature_inputs,
+            )
+            outputs.append(result_path)
+            _log(log, f"Sustained SDPF result saved: {result_path}")
+    else:
+        for scope in selected_scopes:
+            stale_result = sustained_sdpf.result_path(project_root, scope.folder)
+            try:
+                stale_result.unlink(missing_ok=True)
+            except OSError:
+                _log(log, f"Could not remove obsolete Sustained SDPF result: {stale_result}")
 
     resonance_workbooks: list[Path] = []
     if resonance_settings_obj.enabled:
@@ -416,6 +479,9 @@ def _build_voltage_workbooks(
     resonance_settings: resonance_checks.ResonanceSettings | None = None,
     event_times: dict[str, float] | None = None,
     run_executor: Executor | None = None,
+    sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
+    sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
+    sustained_frequency: float | None = None,
 ) -> _VoltageBuildResult:
     started = time.perf_counter()
     _cancel(check_cancel)
@@ -450,12 +516,18 @@ def _build_voltage_workbooks(
         inf_descriptor_cache=inf_descriptor_cache,
         executor=run_executor,
         process_pool=isinstance(run_executor, ProcessPoolExecutor),
+        sustained_settings=sustained_settings,
+        sustained_limits=sustained_limits,
+        sustained_frequency=sustained_frequency,
     )
     _log(log, f"Envelope source read finished: {voltage_key} kV | {_elapsed(read_started)}")
 
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
     resonance_results: list[resonance_checks.ResonanceResult] = []
+    sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = {}
+    sustained_signatures: dict[tuple[str, str], str] = {}
+    sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = {}
     resonance_settings = resonance_settings or resonance_checks.ResonanceSettings()
     for scope in selected_scopes:
         inf_paths = scope_inf_paths[scope.folder]
@@ -465,7 +537,7 @@ def _build_voltage_workbooks(
         _cancel(check_cancel)
         scope_started = time.perf_counter()
         _log(log, f"Envelope merge started: {scope.folder} | {voltage_key} kV | {len(inf_paths)} runs")
-        entries, high_voltage = _entries_for_inf_paths(inf_paths, run_cache)
+        entries, high_voltage, sustained_rows = _entries_for_inf_paths(inf_paths, run_cache)
         if resonance_settings.enabled:
             records = []
             for voltage_type in resonance_checks.VOLTAGE_TYPES:
@@ -484,6 +556,33 @@ def _build_voltage_workbooks(
                 log,
                 f"Resonance checks finished: {scope.folder} | {voltage_key} kV | selected={len(scope_results)}",
             )
+        if sustained_settings is not None and sustained_settings.enabled and sustained_limits is not None:
+            signature, signature_inputs = _sustained_signature(
+                project_root,
+                scope.folder,
+                voltage_key,
+                inf_paths,
+                sustained_settings,
+                event_times,
+                sustained_limits,
+                sustained_frequency,
+                exclusion_matcher,
+                high_voltage_include_overrides,
+            )
+            sustained_candidates = _sustained_results_for_scope(
+                sustained_rows,
+                scope.folder,
+                voltage_key,
+                sustained_settings.effective_duration(event_times),
+                df_stat,
+                sustained_limits,
+                signature,
+            )
+            sustained_result = sustained_sdpf.select_governing(sustained_candidates)
+            key = (scope.folder, voltage_key)
+            sustained_results[key] = sustained_result
+            sustained_signatures[key] = signature
+            sustained_signature_inputs[key] = signature_inputs
         lg_df = _final_envelope([df for measurement, df in entries if measurement == "LGp"], df_stat, time_step)
         ll_df = _final_envelope([df for measurement, df in entries if measurement == "LLp"], df_stat, time_step)
         if lg_df.empty or ll_df.empty:
@@ -530,7 +629,134 @@ def _build_voltage_workbooks(
         )
 
     _log(log, f"Envelope voltage finished: {voltage_key} kV | {_elapsed(started)}")
-    return _VoltageBuildResult(chart_inputs, resonance_results, data_outputs)
+    return _VoltageBuildResult(
+        chart_inputs,
+        resonance_results,
+        data_outputs,
+        sustained_results,
+        sustained_signatures,
+        sustained_signature_inputs,
+    )
+
+
+def _sustained_results_for_scope(
+    rows: list[dict[str, Any]],
+    scope_folder: str,
+    voltage: str,
+    duration_s: float,
+    df_stat: pd.DataFrame,
+    limits: sustained_sdpf.SDPFVoltageLimits,
+    signature: str,
+) -> list[sustained_sdpf.SustainedSDPFResult]:
+    fault_types: dict[tuple[str, int], str] = {}
+    if not df_stat.empty and {"Case", "Run#", "Fault_type"} <= set(df_stat.columns):
+        for _, row in df_stat[["Case", "Run#", "Fault_type"]].iterrows():
+            try:
+                case_key = str(row["Case"])
+                run_key = int(float(row["Run#"]))
+                fault_types[(case_key, run_key)] = str(row["Fault_type"] or "")
+            except (TypeError, ValueError):
+                continue
+
+    grouped: dict[tuple[str, int, str], list[sustained_sdpf.PhaseStressResult]] = {}
+    results: list[sustained_sdpf.SustainedSDPFResult] = []
+    for row in rows:
+        raw_result = row.get("result") if isinstance(row, dict) else None
+        if isinstance(raw_result, dict):
+            try:
+                worker_result = sustained_sdpf.SustainedSDPFResult.from_dict(raw_result)
+            except (KeyError, TypeError, ValueError):
+                continue
+            results.append(
+                replace(
+                    worker_result,
+                    scope_folder=scope_folder,
+                    voltage=str(voltage),
+                    fault_type=fault_types.get((worker_result.case, worker_result.run), ""),
+                    signature=signature,
+                )
+            )
+            continue
+        try:
+            phase_result = sustained_sdpf.PhaseStressResult.from_dict(row)
+            key = (str(row["case"]), int(row["run"]), str(row["mm_name"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        # The worker used the same per-voltage limit object; reject malformed rows
+        # rather than silently replacing a missing source value.
+        expected_rms = limits.rms(phase_result.measurement)
+        if abs(phase_result.sdpf_rms_kv - expected_rms) > 1e-9:
+            continue
+        grouped.setdefault(key, []).append(phase_result)
+
+    for (case, run, mm_name), phase_rows in grouped.items():
+        result = sustained_sdpf.classify_rows(
+            scope_folder,
+            voltage,
+            case,
+            run,
+            mm_name,
+            phase_rows,
+            duration_s,
+            fault_types.get((case, run), ""),
+            signature,
+        )
+        if result is not None:
+            results.append(result)
+    return results
+
+
+def _sustained_signature(
+    project_root: Path,
+    scope_folder: str,
+    voltage: str,
+    inf_paths: list[Path],
+    settings: sustained_sdpf.SustainedSDPFSettings,
+    event_times: dict[str, float] | None,
+    limits: sustained_sdpf.SDPFVoltageLimits,
+    frequency: float | None,
+    exclusion_matcher: ExclusionMatcher,
+    high_voltage_include_overrides: set[tuple[str, str, int, str]],
+) -> tuple[str, dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    candidates = [
+        *sorted(project_root.glob("Input_Data_PSCAD*.xlsx")),
+        project_root / "PSCAD_log.txt",
+        project_root / "Plots" / ".plottool_v3" / "limits.json",
+    ]
+    case_root = project_root / "Case_folder"
+    candidates.extend(sorted(case_root.rglob("Statistic*.out")))
+    candidates.extend(sorted(case_root.rglob("CB_*.out")))
+    candidates.extend(inf_paths)
+    for inf_path in inf_paths:
+        candidates.extend(sorted(inf_path.parent.glob(f"{inf_path.stem}*.out")))
+    for path in dict.fromkeys(candidates):
+        try:
+            stat = path.stat()
+        except OSError:
+            files.append({"path": str(path.resolve()), "missing": True})
+            continue
+        files.append(
+            {
+                "path": str(path.resolve()),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    rules = [rule.to_dict() if hasattr(rule, "to_dict") else repr(rule) for rule in exclusion_matcher.rules]
+    inputs = {
+        "version": 1,
+        "scope": scope_folder,
+        "voltage": str(voltage),
+        "settings": settings.to_mapping(),
+        "event_times": dict(event_times or {}),
+        "frequency": frequency,
+        "limits": limits.to_dict(),
+        "exclusions": rules,
+        "high_voltage_include_overrides": sorted(high_voltage_include_overrides),
+        "files": files,
+    }
+    return sustained_sdpf.make_signature(inputs), inputs
 
 
 def _scope_text(path: Path) -> str:
@@ -632,6 +858,9 @@ def _read_voltage_run_cache(
     inf_descriptor_cache: dict[Path, list[InfDescriptor]] | None = None,
     executor: Executor | None = None,
     process_pool: bool = False,
+    sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
+    sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
+    sustained_frequency: float | None = None,
 ) -> dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]]:
     limit = high_voltage_limit_factor * bus_um * math.sqrt(2)
     run_cache: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]] = {}
@@ -670,6 +899,9 @@ def _read_voltage_run_cache(
                     fallback_frequency,
                     descriptors,
                     high_voltage_include_overrides,
+                    sustained_settings,
+                    sustained_limits,
+                    sustained_frequency,
                 )
             else:
                 future = executor.submit(
@@ -686,6 +918,9 @@ def _read_voltage_run_cache(
                     check_cancel,
                     inf_descriptor_cache,
                     high_voltage_include_overrides=high_voltage_include_overrides,
+                    sustained_settings=sustained_settings,
+                    sustained_limits=sustained_limits,
+                    sustained_frequency=sustained_frequency,
                 )
             futures[future] = inf_path
         completed = len(run_cache)
@@ -732,6 +967,9 @@ def _read_run_entries_process(
     fallback_frequency: float,
     inf_descriptors: list[InfDescriptor] | None,
     high_voltage_include_overrides: set[tuple[str, str, int, str]] | None,
+    sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
+    sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
+    sustained_frequency: float | None = None,
 ) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]], list[str]]:
     fallback_contexts: list[str] = []
     entries, exclusions = _read_run_entries(
@@ -750,6 +988,9 @@ def _read_run_entries_process(
             else None
         ),
         high_voltage_include_overrides=high_voltage_include_overrides,
+        sustained_settings=sustained_settings,
+        sustained_limits=sustained_limits,
+        sustained_frequency=sustained_frequency,
     )
     return entries, exclusions, fallback_contexts
 
@@ -757,14 +998,19 @@ def _read_run_entries_process(
 def _entries_for_inf_paths(
     inf_paths: list[Path],
     run_cache: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]],
-) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]:
+) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[tuple[str, pd.DataFrame]] = []
     high_voltage: list[dict[str, Any]] = []
+    sustained: list[dict[str, Any]] = []
     for inf_path in inf_paths:
         run_entries, run_exclusions = run_cache.get(inf_path, ([], []))
-        entries.extend(run_entries)
+        for measurement, value in run_entries:
+            if measurement == SUSTAINED_ENTRY:
+                sustained.extend(value)
+            else:
+                entries.append((measurement, value))
         high_voltage.extend(run_exclusions)
-    return entries, high_voltage
+    return entries, high_voltage, sustained
 
 
 def _read_run_entries(
@@ -780,6 +1026,9 @@ def _read_run_entries(
     check_cancel: CancelFn | None = None,
     inf_descriptor_cache: dict[Path, list[InfDescriptor]] | None = None,
     high_voltage_include_overrides: set[tuple[str, str, int, str]] | None = None,
+    sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
+    sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
+    sustained_frequency: float | None = None,
 ) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]:
     _cancel(check_cancel)
     case_name, run = case_run_from_inf_path(inf_path)
@@ -831,6 +1080,7 @@ def _read_run_entries(
 
     entries: list[tuple[str, pd.DataFrame]] = []
     high_voltage_buses = {str(record["MM_name"]) for record in high_voltage}
+    sustained_rows: list[dict[str, Any]] = []
     for measurement, bus, waveforms in candidates:
         _cancel(check_cancel)
         if bus in high_voltage_buses:
@@ -848,6 +1098,40 @@ def _read_run_entries(
         envelope_df["MM_name"] = bus
         envelope_df["Case"] = f"{case_name}-{run}"
         entries.append((measurement, envelope_df))
+
+        if sustained_settings is not None and sustained_settings.enabled and sustained_limits is not None:
+            phase_rows = sustained_sdpf.analyze_bus_waveforms(
+                measurement,
+                waveforms.times,
+                waveforms.values,
+                waveforms.signals,
+                sustained_limits,
+                case_name,
+                run,
+                bus,
+                sustained_settings.duration_s,
+                sustained_frequency or fallback_frequency,
+            )
+            phase_results = [
+                sustained_sdpf.PhaseStressResult.from_dict(row)
+                for row in phase_rows
+            ]
+            bus_result = sustained_sdpf.classify_rows(
+                "",
+                voltage_key,
+                case_name,
+                run,
+                bus,
+                phase_results,
+                sustained_settings.duration_s,
+            )
+            if bus_result is not None:
+                # Select the worst fixed phase in the worker so only compact
+                # per-bus metadata crosses the process boundary.
+                sustained_rows.append({"result": bus_result.to_dict()})
+
+    if sustained_rows:
+        entries.append((SUSTAINED_ENTRY, sustained_rows))
 
     return entries, high_voltage
 

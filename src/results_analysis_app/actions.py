@@ -6,6 +6,7 @@ import time
 
 from results_analysis_app import analysis_engine
 from results_analysis_app import resonance_checks
+from results_analysis_app import sustained_sdpf
 from results_analysis_app import voltage_envelope
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
 from results_analysis_app.exclusions import ExclusionRule
@@ -115,6 +116,7 @@ def build_voltage_envelopes(
     build_charts: bool = True,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    sustained_sdpf_settings: dict[str, object] | None = None,
 ) -> list[Path]:
     """Build scope-aware voltage envelope workbooks for selected projects."""
     selected_scopes = list(scopes)
@@ -164,6 +166,7 @@ def build_voltage_envelopes(
                 project_timing=project_timing,
                 voltage_um_overrides=(voltage_um_overrides_by_project or {}).get(project_key, {}),
                 resonance_settings=resonance_settings,
+                sustained_sdpf_settings=sustained_sdpf_settings,
                 build_charts=build_charts,
             )
         )
@@ -278,6 +281,7 @@ def create_plot_batches(
     resonance_settings: dict[str, object] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    sustained_sdpf_settings: dict[str, object] | None = None,
 ) -> list[Path]:
     """Create scope/event plot batch workbooks from existing envelope workbooks."""
     selected_scopes = list(scopes)
@@ -298,6 +302,7 @@ def create_plot_batches(
                 resonance_settings,
                 log,
                 check_cancel,
+                sustained_sdpf_settings=sustained_sdpf_settings,
             )
         )
     return outputs
@@ -310,10 +315,16 @@ def render_plot_batches(
     resonance_settings: dict[str, object] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    sustained_sdpf_settings: dict[str, object] | None = None,
 ) -> None:
     """Render existing scope/event plot batches into generated plot folders."""
     selected_scopes = list(scopes)
-    selected_events = [*list(events), *resonance_checks.selected_plot_events(resonance_settings)]
+    selected_events = [
+        *list(events),
+        *resonance_checks.selected_plot_events(resonance_settings),
+    ]
+    if sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings).enabled:
+        selected_events.append("Sustained_SDPF")
     for project_root in project_roots:
         root = Path(project_root).resolve()
         ensure_output_tree(root, selected_scopes)
@@ -358,6 +369,7 @@ def run_analysis_pipeline(
     resonance_settings: dict[str, object] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    sustained_sdpf_settings: dict[str, object] | None = None,
 ) -> list[Path]:
     """Run the connected analysis path end to end for selected projects/scopes."""
     selected_scopes = list(scopes)
@@ -398,6 +410,7 @@ def run_analysis_pipeline(
                 high_voltage_include_overrides_by_project
             ),
             resonance_settings=resonance_settings,
+            sustained_sdpf_settings=sustained_sdpf_settings,
             log=log,
             check_cancel=check_cancel,
         )
@@ -410,6 +423,7 @@ def run_analysis_pipeline(
             selected_events,
             event_times=event_times,
             resonance_settings=resonance_settings,
+            sustained_sdpf_settings=sustained_sdpf_settings,
             log=log,
             check_cancel=check_cancel,
         )
@@ -420,6 +434,7 @@ def run_analysis_pipeline(
             selected_scopes,
             selected_events,
             resonance_settings=resonance_settings,
+            sustained_sdpf_settings=sustained_sdpf_settings,
             log=log,
             check_cancel=check_cancel,
         )
@@ -433,6 +448,7 @@ def run_analysis_pipeline(
                 selected_events,
                 dashboard_figure_ids,
                 resonance_settings=resonance_settings,
+                sustained_sdpf_settings=sustained_sdpf_settings,
                 event_times=event_times,
                 log=log,
                 check_cancel=check_cancel,

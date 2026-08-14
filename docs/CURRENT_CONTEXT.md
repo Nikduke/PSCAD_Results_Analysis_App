@@ -1,6 +1,6 @@
 # Current Context
 
-Snapshot date: 2026-07-31.
+Snapshot date: 2026-08-14.
 
 This folder is the active app root for PSCAD Results Analysis. The parent folder keeps reference examples, backup material, and the existing dedicated conda environment.
 
@@ -15,7 +15,8 @@ Desktop app for PSCAD result analysis:
 - create waveform plot batch workbooks;
 - render waveform plots through the embedded plotting engine;
 - generate DOCX reports;
-- run optional Stress, Late, and No-settle checks using existing chronological envelope data.
+- run optional Stress, Late, and No-settle checks using existing chronological envelope data;
+- run optional Sustained SDPF stress on fixed chronological LG phases and LL pairs.
 
 ## Current code organisation
 
@@ -35,6 +36,7 @@ Desktop app for PSCAD result analysis:
 - `src/results_analysis_app/voltage_envelope.py` - envelope data build.
 - `src/results_analysis_app/envelope_chart.py` - Excel envelope chart generation.
 - `src/results_analysis_app/resonance_checks.py` - Stress/Late/No-settle checks and check chart workbook output.
+- `src/results_analysis_app/sustained_sdpf.py` - Sustained SDPF phase/pair analysis and compact JSON result metadata.
 - `src/results_analysis_app/reporting.py` - DOCX report generation and dashboard figure insertion.
 - `src/results_analysis_app/scanner.py` - project scan, dashboard scan, exclusions, high-voltage log scan.
 - `src/results_analysis_app/project_config.py` - voltage and frequency config from `Input_Data_PSCAD*.xlsx` and `.inf` files.
@@ -143,12 +145,14 @@ Envelope workflow:
 
 Analysis checks:
 
-- Top-bar analysis checkboxes are `Stress`, `Late`, and `No-settle`.
+- Top-bar analysis checkboxes are `Stress`, `Late`, `No-settle`, and `Sustained SDPF`.
 - Checks use chronological envelope data produced during envelope build.
-- Raw PSCAD `.out` files are not reread for these checks.
+- Raw PSCAD `.out` files are not reread for Stress/Late/No-settle; Sustained SDPF evaluates the raw arrays already loaded by the envelope worker.
 - LGp and LLp are evaluated separately for ranking.
 - `Vlim` for analysis checks uses nominal voltage level times the configured resonance limit multiplier, not `Um`.
 - Check workbook: `Voltage_envelope/<scope>/Resonance_Checks.xlsx`.
+- Sustained SDPF metadata: `Voltage_envelope/<scope>/Sustained_SDpf.json`; no additional Sustained SDPF envelope/check workbook is produced.
+- Sustained SDPF uses the project frequency and embedded `MM_blocks` SDPF limits, assesses fixed LG phases and LL pairs chronologically without phase/window stitching, and selects one governing result per voltage-specific report by normalized sustained peak. Its duration follows TOV by default or uses an independent persisted Settings value. Saved source-file metadata is checked before later batches/reports use the result.
 - Check result tabs are created only when findings exist for that check and voltage type. A workbook with no findings contains only `Settings`.
 - Check plot folders use `Plots/Generated/<scope>/<check>/<voltage_type>/`.
 - Generated event/check folders are app-owned authoritative outputs. Rendering uses a staging folder and swaps it into place only after all current plots and Excel exports succeed. Empty valid batches remove the prior event folder, obsolete resonance batches are removed, and partial failure keeps the previous good folder. Manual files must not be stored inside generated event/check folders.
@@ -183,6 +187,8 @@ Plotting:
 - Auto release/recovery detection or manual analysis start time.
 - Release/growth thresholds in the Settings dialog.
 - Envelope worker count.
+- Sustained SDPF duration source (TOV by default) and independent duration retained when TOV reuse is cleared.
+- Sustained SDPF limits table: one validated LG and LL row per voltage with RMS, peak, and fixed 15% margin values.
 
 ## Known risks
 
@@ -199,7 +205,7 @@ Plotting:
 
 ## Current validation state
 
-- Contract tests: 100 passed in the dedicated conda environment.
+- Contract tests: 128 passed in the dedicated conda environment.
 - Automatic project-opening HV scan on `../Original_examples/03_Test_project_case`: 300 cached case/run/bus maxima and 92 proposals at factor 5; cold scan completed in about 9.3 seconds. Hot cache validation avoids waveform parsing.
 - Dependency import check: passed.
 - Application `--smoke` check: passed.
