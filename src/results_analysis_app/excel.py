@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 import sys
 
 
@@ -46,3 +47,21 @@ def excel_app():
         if excel is not None:
             excel.Quit()
         pythoncom.CoUninitialize()
+
+
+def autofit_workbook(excel, path: str | Path) -> None:
+    """Apply Excel's native AutoFit to every used column in a workbook."""
+    workbook = excel.Workbooks.Open(
+        str(Path(path).resolve()),
+        UpdateLinks=0,
+        ReadOnly=False,
+    )
+    try:
+        for worksheet in workbook.Worksheets:
+            worksheet.UsedRange.Columns.AutoFit()
+        workbook.Save()
+    finally:
+        try:
+            workbook.Close(SaveChanges=True)
+        except EXCEL_AUTOMATION_ERRORS:
+            pass

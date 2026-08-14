@@ -15,6 +15,7 @@ from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_WIDTH,
     ScopeEntry,
 )
+from results_analysis_app.project_config import ProjectTiming
 from results_analysis_app.reporting import build_reports_from_existing_plots
 
 
@@ -24,6 +25,10 @@ LogFn = Callable[[str], None]
 def _log(log: LogFn | None, message: str) -> None:
     if log is not None:
         log(message)
+
+
+def _project_value(values: dict[str, object] | None, root: Path):
+    return (values or {}).get(str(root))
 
 
 def ensure_output_tree(
@@ -88,8 +93,8 @@ def build_voltage_envelopes(
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
     envelope_fallback_frequency: float | None = None,
-    envelope_chart_x_max: float | None = None,
-    envelope_chart_x_major: float | None = None,
+    envelope_chart_x_max_by_project: dict[str, float | None] | None = None,
+    envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
     envelope_chart_top_left_cell: str | None = None,
@@ -99,8 +104,13 @@ def build_voltage_envelopes(
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
     event_times: dict[str, float] | None = None,
+    project_timing_by_project: dict[str, dict[str, float | None]] | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
     exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
+    high_voltage_proposals_by_project: dict[str, list[dict[str, object]]] | None = None,
+    high_voltage_include_overrides_by_project: dict[
+        str, list[tuple[str, str, int, str]]
+    ] | None = None,
     resonance_settings: dict[str, object] | None = None,
     build_charts: bool = True,
     log: LogFn | None = None,
@@ -115,6 +125,12 @@ def build_voltage_envelopes(
         ensure_output_tree(root, selected_scopes)
         _log(log, f"Building voltage envelopes: {root.name}")
         project_key = str(root)
+        raw_timing = _project_value(project_timing_by_project, root)
+        project_timing = (
+            ProjectTiming(**raw_timing)
+            if isinstance(raw_timing, dict)
+            else None
+        )
         outputs.extend(
             voltage_envelope.build_voltage_envelopes(
                 root,
@@ -124,11 +140,18 @@ def build_voltage_envelopes(
                 check_cancel=check_cancel,
                 envelope_workers=envelope_workers,
                 exclusions=(exclusions_by_project or {}).get(project_key, []),
+                high_voltage_proposals=(high_voltage_proposals_by_project or {}).get(
+                    project_key,
+                    [],
+                ),
+                high_voltage_include_overrides=(
+                    high_voltage_include_overrides_by_project or {}
+                ).get(project_key, []),
                 envelope_time_step=envelope_time_step,
                 envelope_time_end=envelope_time_end,
                 envelope_fallback_frequency=envelope_fallback_frequency,
-                envelope_chart_x_max=envelope_chart_x_max,
-                envelope_chart_x_major=envelope_chart_x_major,
+                envelope_chart_x_max=_project_value(envelope_chart_x_max_by_project, root),
+                envelope_chart_x_major=_project_value(envelope_chart_x_major_by_project, root),
                 envelope_chart_y_limits_by_voltage=envelope_chart_y_limits_by_voltage,
                 envelope_chart_show_sa_label=envelope_chart_show_sa_label,
                 envelope_chart_top_left_cell=envelope_chart_top_left_cell,
@@ -138,6 +161,7 @@ def build_voltage_envelopes(
                 nonconv_cb_iip_limit=nonconv_cb_iip_limit,
                 nonconv_cb_iir_limit=nonconv_cb_iir_limit,
                 event_times=event_times,
+                project_timing=project_timing,
                 voltage_um_overrides=(voltage_um_overrides_by_project or {}).get(project_key, {}),
                 resonance_settings=resonance_settings,
                 build_charts=build_charts,
@@ -151,8 +175,8 @@ def rebuild_envelope_charts(
     scopes: Iterable[ScopeEntry],
     voltages: Iterable[str],
     event_times: dict[str, float] | None = None,
-    envelope_chart_x_max: float | None = None,
-    envelope_chart_x_major: float | None = None,
+    envelope_chart_x_max_by_project: dict[str, float | None] | None = None,
+    envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
     envelope_chart_top_left_cell: str | None = None,
@@ -172,6 +196,8 @@ def rebuild_envelope_charts(
     with excel_app() as excel:
         for project_root in project_roots:
             root = Path(project_root).resolve()
+            chart_x_max = _project_value(envelope_chart_x_max_by_project, root)
+            chart_x_major = _project_value(envelope_chart_x_major_by_project, root)
             ensure_output_tree(root, selected_scopes)
             _log(log, f"Rebuilding envelope charts: {root.name}")
             for scope in selected_scopes:
@@ -190,8 +216,8 @@ def rebuild_envelope_charts(
                             output_path,
                             excel,
                             axis_limits_override={
-                                "x_max": envelope_chart_x_max,
-                                "x_major": envelope_chart_x_major,
+                                "x_max": chart_x_max,
+                                "x_major": chart_x_major,
                             },
                             axis_limits_by_voltage=envelope_chart_y_limits_by_voltage,
                             event_times=event_times,
@@ -206,7 +232,8 @@ def rebuild_envelope_charts(
 def rebuild_analysis_charts(
     project_roots: Iterable[str | Path],
     scopes: Iterable[ScopeEntry],
-    envelope_chart_x_max: float | None = None,
+    envelope_chart_x_max_by_project: dict[str, float | None] | None = None,
+    envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
 ) -> list[Path]:
@@ -217,6 +244,8 @@ def rebuild_analysis_charts(
         with excel_app() as excel:
             for project_root in project_roots:
                 root = Path(project_root).resolve()
+                chart_x_max = _project_value(envelope_chart_x_max_by_project, root)
+                chart_x_major = _project_value(envelope_chart_x_major_by_project, root)
                 _log(log, f"Rebuilding analysis charts: {root.name}")
                 for scope in selected_scopes:
                     if check_cancel is not None:
@@ -228,7 +257,8 @@ def rebuild_analysis_charts(
                     if create_resonance_check_charts(
                         workbook_path,
                         excel,
-                        x_max=envelope_chart_x_max,
+                        x_max=chart_x_max,
+                        x_major=chart_x_major,
                     ):
                         outputs.append(workbook_path)
                         _log(log, f"Rebuilt analysis charts: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
@@ -308,8 +338,8 @@ def run_analysis_pipeline(
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
     envelope_fallback_frequency: float | None = None,
-    envelope_chart_x_max: float | None = None,
-    envelope_chart_x_major: float | None = None,
+    envelope_chart_x_max_by_project: dict[str, float | None] | None = None,
+    envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
     envelope_chart_top_left_cell: str | None = None,
@@ -318,8 +348,13 @@ def run_analysis_pipeline(
     high_voltage_limit_factor: float | None = None,
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
+    project_timing_by_project: dict[str, dict[str, float | None]] | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
     exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
+    high_voltage_proposals_by_project: dict[str, list[dict[str, object]]] | None = None,
+    high_voltage_include_overrides_by_project: dict[
+        str, list[tuple[str, str, int, str]]
+    ] | None = None,
     resonance_settings: dict[str, object] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
@@ -344,8 +379,8 @@ def run_analysis_pipeline(
             envelope_time_step=envelope_time_step,
             envelope_time_end=envelope_time_end,
             envelope_fallback_frequency=envelope_fallback_frequency,
-            envelope_chart_x_max=envelope_chart_x_max,
-            envelope_chart_x_major=envelope_chart_x_major,
+            envelope_chart_x_max_by_project=envelope_chart_x_max_by_project,
+            envelope_chart_x_major_by_project=envelope_chart_x_major_by_project,
             envelope_chart_y_limits_by_voltage=envelope_chart_y_limits_by_voltage,
             envelope_chart_show_sa_label=envelope_chart_show_sa_label,
             envelope_chart_top_left_cell=envelope_chart_top_left_cell,
@@ -355,8 +390,13 @@ def run_analysis_pipeline(
             nonconv_cb_iip_limit=nonconv_cb_iip_limit,
             nonconv_cb_iir_limit=nonconv_cb_iir_limit,
             event_times=event_times,
+            project_timing_by_project=project_timing_by_project,
             voltage_um_overrides_by_project=voltage_um_overrides_by_project,
             exclusions_by_project=exclusions_by_project,
+            high_voltage_proposals_by_project=high_voltage_proposals_by_project,
+            high_voltage_include_overrides_by_project=(
+                high_voltage_include_overrides_by_project
+            ),
             resonance_settings=resonance_settings,
             log=log,
             check_cancel=check_cancel,
@@ -395,6 +435,7 @@ def run_analysis_pipeline(
                 resonance_settings=resonance_settings,
                 event_times=event_times,
                 log=log,
+                check_cancel=check_cancel,
             )
         )
         _log(log, f"Analysis complete: {root.name}")

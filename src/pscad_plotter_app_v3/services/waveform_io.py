@@ -1,12 +1,53 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from hashlib import blake2b
 from pathlib import Path
 import re
 
 import numpy as np
+
+from pscad_plotter_app_v3.services.project_conventions import case_run_from_inf_path
+
+
+OUT_CANCEL_CHECK_INTERVAL = 4096
+
+
+def _out_data_lines(
+    out_file: Path,
+    check_cancel: Callable[[], None] | None,
+) -> Iterator[str]:
+    with out_file.open("r", encoding="utf-8", errors="ignore") as handle:
+        next(handle, None)
+        for index, line in enumerate(handle):
+            if check_cancel is not None and index % OUT_CANCEL_CHECK_INTERVAL == 0:
+                check_cancel()
+            yield line
+        if check_cancel is not None:
+            check_cancel()
+
+
+def _load_out_values(
+    out_file: Path,
+    *,
+    usecols: Iterable[int] | None = None,
+    check_cancel: Callable[[], None] | None = None,
+) -> np.ndarray:
+    if check_cancel is None:
+        return np.loadtxt(
+            out_file,
+            dtype=np.float64,
+            skiprows=1,
+            usecols=usecols,
+            ndmin=2,
+        )
+    return np.loadtxt(
+        _out_data_lines(out_file, check_cancel),
+        dtype=np.float64,
+        usecols=usecols,
+        ndmin=2,
+    )
 
 
 def hash_inf_file(inf_path: Path) -> str:
@@ -109,13 +150,6 @@ def pgb_to_out_location(pgb: int) -> tuple[int, int]:
     return ((pgb - 1) // 10) + 1, ((pgb - 1) % 10) + 1
 
 
-def case_run_from_inf_path(inf_path: Path) -> tuple[str, int]:
-    match = re.match(r"(?P<case>.+?)_r(?P<run>\d+)$", inf_path.stem, flags=re.IGNORECASE)
-    if not match:
-        raise ValueError(f"Cannot read case/run from {inf_path.name}")
-    return match.group("case"), int(match.group("run"))
-
-
 def standard_out_file_path(inf_file: Path, file_number: int) -> Path:
     return inf_file.with_suffix("").with_name(f"{inf_file.stem}_{file_number:02d}.out")
 
@@ -137,36 +171,39 @@ def _missing_out_file_error(out_file: Path) -> FileNotFoundError:
     return FileNotFoundError(detail)
 
 
-def load_out_frame(out_file: Path) -> WaveformFrame:
+def load_out_frame(
+    out_file: Path,
+    check_cancel: Callable[[], None] | None = None,
+) -> WaveformFrame:
     if not out_file.exists():
         raise _missing_out_file_error(out_file)
     try:
-        data = np.loadtxt(out_file, skiprows=1, ndmin=2)
+        data = _load_out_values(out_file, check_cancel=check_cancel)
         return WaveformFrame(data)
     except (OSError, ValueError, IndexError):
         rows: list[list[float]] = []
-        with out_file.open("r", encoding="utf-8", errors="ignore") as handle:
-            next(handle, None)
-            for line in handle:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                rows.append([float(token) for token in stripped.split()])
+        for line in _out_data_lines(out_file, check_cancel):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            rows.append([float(token) for token in stripped.split()])
         return WaveformFrame(np.asarray(rows, dtype=float))
 
 
-def load_out_columns(out_file: Path, columns: Iterable[int]) -> dict[int, np.ndarray]:
+def load_out_columns(
+    out_file: Path,
+    columns: Iterable[int],
+    check_cancel: Callable[[], None] | None = None,
+) -> dict[int, np.ndarray]:
     if not out_file.exists():
         raise _missing_out_file_error(out_file)
     ordered = list(dict.fromkeys(int(column) for column in columns))
     if not ordered:
         return {}
-    values = np.loadtxt(
+    values = _load_out_values(
         out_file,
-        dtype=np.float64,
-        skiprows=1,
         usecols=ordered,
-        ndmin=2,
+        check_cancel=check_cancel,
     )
     values = np.asarray(values, dtype=np.float64)
     if values.ndim == 1:

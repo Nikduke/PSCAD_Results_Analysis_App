@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
 import math
 import re
 from pathlib import Path
@@ -13,7 +14,7 @@ import numpy as np
 from matplotlib.gridspec import GridSpec
 
 from pscad_plotter_app_v3.models import DEFAULT_TOV_WINDOW_S, PlotJob, PlotMode
-from pscad_plotter_app_v3.services.project_conventions import find_stat_file, load_run_event_info
+from pscad_plotter_app_v3.services.project_conventions import find_stat_file, parse_stat_rows
 from pscad_plotter_app_v3.services.waveform_io import (
     InfDescriptor,
     WaveformFrame,
@@ -50,20 +51,27 @@ class MatplotlibRenderer:
     TIME_TOV = DEFAULT_TOV_WINDOW_S
     INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]+')
     MAX_INF_CACHE = 128
-    MAX_EVENT_INFO_CACHE = 256
+    MAX_STAT_FILE_CACHE = 256
+    MAX_EVENT_INFO_CACHE = 128
     MAX_OUT_FILE_CACHE = 256
 
-    def __init__(self, run_index: dict[str, dict[int, Path]]) -> None:
+    def __init__(
+        self,
+        run_index: dict[str, dict[int, Path]],
+        check_cancel: Callable[[], None] | None = None,
+    ) -> None:
         self.run_index = run_index
+        self._check_cancel = check_cancel
         self._inf_cache: OrderedDict[Path, list[InfDescriptor]] = OrderedDict()
-        self._event_info_cache: OrderedDict[tuple[Path, int], dict[str, object] | None] = OrderedDict()
+        self._stat_file_cache: OrderedDict[Path, Path | None] = OrderedDict()
+        self._event_info_cache: OrderedDict[Path, dict[int, dict[str, object]]] = OrderedDict()
         self._out_file_cache: OrderedDict[Path, WaveformFrame] = OrderedDict()
 
     def render(self, job: PlotJob) -> Path:
         if job.mode is not PlotMode.MM:
             raise ValueError(f"Unsupported plot mode: {job.mode.value}")
         inf_path = self._resolve_inf_path(job.case_name, job.run_number)
-        stat_path = find_stat_file(inf_path.parent)
+        stat_path = self._find_stat_file(inf_path.parent)
         event_info = self._load_event_info(stat_path, job.run_number) if stat_path is not None else None
         descriptors = self._load_inf_descriptors(inf_path)
         output_dir = Path(job.output_dir)
@@ -262,19 +270,38 @@ class MatplotlibRenderer:
     def _load_event_info(self, stat_path: Path, run_number: int) -> dict[str, object] | None:
         if not stat_path.exists():
             return None
-        cache_key = (stat_path, run_number)
-        if cache_key in self._event_info_cache:
-            self._event_info_cache.move_to_end(cache_key)
-            return self._event_info_cache[cache_key]
-        event_info = load_run_event_info(stat_path, run_number)
-        self._remember_cache_item(self._event_info_cache, cache_key, event_info, self.MAX_EVENT_INFO_CACHE)
-        return event_info
+        if stat_path in self._event_info_cache:
+            self._event_info_cache.move_to_end(stat_path)
+            return self._event_info_cache[stat_path].get(int(run_number))
+        event_info_by_run: dict[int, dict[str, object]] = {}
+        for row in parse_stat_rows(stat_path):
+            event_info_by_run.setdefault(int(row["run_number"]), row)
+        self._remember_cache_item(
+            self._event_info_cache,
+            stat_path,
+            event_info_by_run,
+            self.MAX_EVENT_INFO_CACHE,
+        )
+        return event_info_by_run.get(int(run_number))
+
+    def _find_stat_file(self, directory: Path) -> Path | None:
+        if directory in self._stat_file_cache:
+            self._stat_file_cache.move_to_end(directory)
+            return self._stat_file_cache[directory]
+        stat_path = find_stat_file(directory)
+        self._remember_cache_item(
+            self._stat_file_cache,
+            directory,
+            stat_path,
+            self.MAX_STAT_FILE_CACHE,
+        )
+        return stat_path
 
     def _load_out_frame(self, out_file: Path) -> WaveformFrame:
         if out_file in self._out_file_cache:
             self._out_file_cache.move_to_end(out_file)
             return self._out_file_cache[out_file]
-        frame = load_out_frame(out_file)
+        frame = load_out_frame(out_file, self._check_cancel)
         self._remember_cache_item(self._out_file_cache, out_file, frame, self.MAX_OUT_FILE_CACHE)
         return frame
 

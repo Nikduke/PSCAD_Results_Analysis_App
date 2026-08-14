@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import threading
-from typing import Iterable
+from typing import Any, Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -16,8 +16,9 @@ from results_analysis_app import (
     resonance_checks,
     scanner,
     storage,
+    voltage_envelope,
 )
-from results_analysis_app.background import BackgroundTask, CancelToken
+from results_analysis_app.background import BackgroundTask, CancelToken, OperationCancelled
 from results_analysis_app.exclusions import (
     ExclusionRule,
     normalize_case_run_exclusions,
@@ -50,6 +51,137 @@ USER_ROLE_SCOPE_FOLDER = QtCore.Qt.ItemDataRole.UserRole + 1
 USER_ROLE_FIGURE_ID = QtCore.Qt.ItemDataRole.UserRole + 2
 
 
+def _append_unique_csv(target: list[str], value: object) -> None:
+    for part in (item.strip() for item in str(value).split(",")):
+        if part and part not in target:
+            target.append(part)
+
+
+def _high_voltage_source(sources: set[str]) -> str:
+    normalized = {
+        scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS if source in {"", "Full scan"} else source
+        for source in sources
+    }
+    if (
+        scanner.HIGH_VOLTAGE_SOURCE_BOTH in normalized
+        or {
+            scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+            scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+        } <= normalized
+    ):
+        return scanner.HIGH_VOLTAGE_SOURCE_BOTH
+    return next(iter(normalized), scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS)
+
+
+def _is_pscad_log_high_voltage_row(row: scanner.HighVoltageExclusion) -> bool:
+    return row.source in {
+        scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+        scanner.HIGH_VOLTAGE_SOURCE_BOTH,
+    } or row.file in scanner.PSCAD_LOG_HIGH_VOLTAGE_SOURCES
+
+
+def _group_high_voltage_proposals(
+    rows: Iterable[scanner.HighVoltageExclusion],
+) -> dict[tuple[str, str, int, str], dict[str, Any]]:
+    grouped: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+    for proposal in rows:
+        normalized = normalize_high_voltage_exclusions(
+            [(proposal.voltage, proposal.case, proposal.run, proposal.bus)]
+        )
+        if not normalized:
+            continue
+        key = normalized[0]
+        values = grouped.setdefault(
+            key,
+            {
+                "fault_types": [],
+                "measurements": [],
+                "signals": [],
+                "files": [],
+                "excluded_values": [],
+                "max_abs": proposal.max_abs,
+                "max_value": None,
+                "limit": proposal.limit,
+                "sources": set(),
+                "excluded": False,
+            },
+        )
+        for target, value in (
+            (values["fault_types"], proposal.fault_type),
+            (values["measurements"], proposal.measurement),
+            (values["signals"], proposal.signal),
+            (values["files"], proposal.file),
+            (values["excluded_values"], proposal.excluded_values),
+        ):
+            _append_unique_csv(target, value)
+        try:
+            proposal_max = float(proposal.max_abs)
+        except (TypeError, ValueError):
+            proposal_max = None
+        if proposal_max is not None and (
+            values["max_value"] is None or proposal_max > values["max_value"]
+        ):
+            values["max_abs"] = proposal.max_abs
+            values["max_value"] = proposal_max
+        if not values["limit"] and proposal.limit:
+            values["limit"] = proposal.limit
+        source = proposal.source or (
+            scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG
+            if proposal.file in scanner.PSCAD_LOG_HIGH_VOLTAGE_SOURCES
+            else scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS
+        )
+        values["sources"].add(source)
+        values["excluded"] = values["excluded"] or proposal.excluded
+    return grouped
+
+
+def _fault_types_by_case_run(project_path: str) -> dict[tuple[str, int], str]:
+    try:
+        frame = voltage_envelope._read_stat_files(Path(project_path).resolve())
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if frame.empty or "Case" not in frame.columns or "Run#" not in frame.columns:
+        return {}
+    result: dict[tuple[str, int], str] = {}
+    for record in frame.to_dict("records"):
+        try:
+            run = int(record.get("Run#"))
+        except (TypeError, ValueError):
+            continue
+        case = str(record.get("Case", "")).strip().casefold()
+        fault_type = str(record.get("Fault_type", "")).strip()
+        if case and fault_type and fault_type.casefold() != "nan":
+            result[(case, run)] = fault_type
+    return result
+
+
+def _select_project_directories(
+    parent: QtWidgets.QWidget,
+    initial_directory: Path,
+) -> list[str]:
+    dialog = QtWidgets.QFileDialog(
+        parent,
+        "Select PSCAD result project folders",
+        str(initial_directory),
+    )
+    dialog.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
+    dialog.setOption(QtWidgets.QFileDialog.Option.ShowDirsOnly, True)
+    dialog.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
+    dialog.setLabelText(QtWidgets.QFileDialog.DialogLabel.Accept, "Add selected")
+    for view_type, object_name in (
+        (QtWidgets.QListView, "listView"),
+        (QtWidgets.QTreeView, "treeView"),
+    ):
+        view = dialog.findChild(view_type, object_name)
+        if view is not None:
+            view.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+    if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+        return []
+    return list(dict.fromkeys(dialog.selectedFiles()))
+
+
 class _FrequencyFallbackPrompt:
     def __init__(self, message: str) -> None:
         self.message = message
@@ -67,6 +199,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.ensure_full_scope()
         self.project_scans: dict[str, scanner.ProjectScan] = {}
         self.dashboard_figures: dict[str, list[DashboardFigure]] = {}
+        self._fault_types_by_project: dict[str, dict[tuple[str, int], str]] = {}
+        self._high_voltage_groups_by_project: dict[
+            str,
+            tuple[int, dict[tuple[str, str, int, str], dict[str, Any]]],
+        ] = {}
         self._loading = False
         self._busy = False
         self._worker: BackgroundTask | None = None
@@ -184,15 +321,6 @@ class MainWindow(QtWidgets.QMainWindow):
             layout.addWidget(check)
 
         layout.addStretch(1)
-
-        self.scan_high_voltage_log_button = QtWidgets.QPushButton("Scan HV log", bar)
-        self.scan_high_voltage_log_button.setMinimumWidth(104)
-        apply_secondary_button_style(self.scan_high_voltage_log_button)
-        self.scan_high_voltage_log_button.setToolTip(
-            "Read PSCAD_log.txt, then scan raw waveform maxima for matching case/MM buses before envelope build."
-        )
-        self.scan_high_voltage_log_button.clicked.connect(self.scan_high_voltage_log)
-        layout.addWidget(self.scan_high_voltage_log_button)
 
         self.scan_dashboard_figures_button = QtWidgets.QPushButton("Scan figures", bar)
         self.scan_dashboard_figures_button.setMinimumWidth(106)
@@ -383,25 +511,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.high_voltage_tab = QtWidgets.QWidget(tabs)
         high_layout = QtWidgets.QVBoxLayout(self.high_voltage_tab)
         high_layout.setContentsMargins(6, 6, 6, 6)
-        self.high_voltage_proposal_table = QtWidgets.QTableWidget(0, 8, self.high_voltage_tab)
+        self.high_voltage_proposal_table = QtWidgets.QTableWidget(0, 10, self.high_voltage_tab)
         self._configure_exclusion_table(
             self.high_voltage_proposal_table,
-            ["Apply", "kV", "Case", "Run", "Bus", "Max", "Limit", "Signal"],
+            ["Apply", "kV", "Case", "Run", "Fault", "Bus", "Max", "Limit", "Signal", "Source"],
         )
         high_header = self.high_voltage_proposal_table.horizontalHeader()
         high_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
         high_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
         high_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        high_header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        high_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        high_header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        high_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
         high_header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        high_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        high_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        high_header.setSectionResizeMode(8, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        high_header.setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.high_voltage_proposal_table.setColumnWidth(1, 52)
         self.high_voltage_proposal_table.setColumnWidth(2, 150)
         self.high_voltage_proposal_table.setColumnWidth(3, 54)
-        self.high_voltage_proposal_table.setColumnWidth(5, 82)
+        self.high_voltage_proposal_table.setColumnWidth(4, 90)
         self.high_voltage_proposal_table.setColumnWidth(6, 82)
-        self.high_voltage_proposal_table.setColumnWidth(7, 112)
+        self.high_voltage_proposal_table.setColumnWidth(7, 82)
+        self.high_voltage_proposal_table.setColumnWidth(8, 112)
+        self.high_voltage_proposal_table.setColumnWidth(9, 82)
         self.high_voltage_proposal_table.itemChanged.connect(self._on_high_voltage_table_changed)
         self._enable_table_clipboard(self.high_voltage_proposal_table)
         high_layout.addWidget(self.high_voltage_proposal_table)
@@ -599,6 +731,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return panel
 
     def _load_session_to_ui(self) -> None:
+        self._clear_project_ui_caches()
         was_loading = self._loading
         self._loading = True
         try:
@@ -824,38 +957,86 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_high_voltage_proposal_rows(self, rows: list[scanner.HighVoltageExclusion]) -> None:
         project_path = self._current_project_path() or ""
-        applied = set(
+        applied = self._applied_high_voltage_keys(project_path)
+        overrides = set(
             normalize_high_voltage_exclusions(
-                self.session.high_voltage_exclusions_by_project.get(project_path, [])
+                self.session.high_voltage_include_overrides_by_project.get(project_path, [])
             )
         )
-        seen: set[tuple[str, str, int, str]] = set()
+        if not rows:
+            grouped: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+            self._high_voltage_groups_by_project.pop(project_path, None)
+        else:
+            cached_groups = self._high_voltage_groups_by_project.get(project_path)
+            if cached_groups is None or cached_groups[0] != id(rows):
+                grouped = _group_high_voltage_proposals(rows)
+                self._high_voltage_groups_by_project[project_path] = (id(rows), grouped)
+            else:
+                grouped = cached_groups[1]
+        applied.update(
+            key
+            for key, values in grouped.items()
+            if values["excluded"]
+            or _high_voltage_source(values["sources"])
+            in {
+                scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+                scanner.HIGH_VOLTAGE_SOURCE_BOTH,
+            }
+        )
+        applied.difference_update(overrides)
+
+        fault_types: dict[tuple[str, int], str] = {}
+        needs_fault_types = bool((applied | overrides) - grouped.keys()) or any(
+            not values["fault_types"] for values in grouped.values()
+        )
+        if needs_fault_types:
+            fault_types = self._fault_types_by_project.get(project_path)
+            if fault_types is None:
+                fault_types = _fault_types_by_case_run(project_path)
+                self._fault_types_by_project[project_path] = fault_types
+
         prepared_rows = []
-        for proposal in rows:
-            normalized = normalize_high_voltage_exclusions(
-                [(proposal.voltage, proposal.case, proposal.run, proposal.bus)]
-            )
-            if not normalized:
-                continue
-            key = normalized[0]
-            seen.add(key)
+        for key, grouped_values in grouped.items():
+            voltage, case, run, bus = key
             prepared_rows.append(
                 (
                     key in applied,
                     (
-                        proposal.voltage,
-                        proposal.case,
-                        str(proposal.run),
-                        proposal.bus,
-                        proposal.max_abs,
-                        proposal.limit,
-                        proposal.signal,
+                        voltage,
+                        case,
+                        str(run),
+                        ", ".join(grouped_values["fault_types"])
+                        or fault_types.get((case.casefold(), run), ""),
+                        bus,
+                        grouped_values["max_abs"],
+                        grouped_values["limit"],
+                        ", ".join(grouped_values["signals"]),
+                        _high_voltage_source(grouped_values["sources"]),
                     ),
                 )
             )
 
-        for voltage, case, run, bus in sorted(applied - seen, key=lambda item: (item[0], item[1], item[2], item[3])):
-            prepared_rows.append((True, (voltage, case, str(run), bus, "", "", "")))
+        for key in sorted(
+            (applied | overrides) - grouped.keys(),
+            key=lambda item: (item[0], item[1], item[2], item[3]),
+        ):
+            voltage, case, run, bus = key
+            prepared_rows.append(
+                (
+                    key in applied,
+                    (
+                        voltage,
+                        case,
+                        str(run),
+                        fault_types.get((case.casefold(), run), ""),
+                        bus,
+                        "",
+                        "",
+                        "",
+                        scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+                    ),
+                )
+            )
 
         with self._table_bulk_update(self.high_voltage_proposal_table):
             self.high_voltage_proposal_table.setRowCount(len(prepared_rows))
@@ -870,7 +1051,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 for column, value in enumerate(values, start=1):
                     self.high_voltage_proposal_table.setItem(row, column, self._table_item(value))
-        self._set_high_voltage_ui_visible(bool(rows or applied))
+        self._set_high_voltage_ui_visible(bool(rows or applied or overrides))
+
+    def _clear_project_ui_caches(self, project_paths: Iterable[str] | None = None) -> None:
+        if project_paths is None:
+            self._fault_types_by_project.clear()
+            self._high_voltage_groups_by_project.clear()
+            return
+        for project_path in project_paths:
+            normalized = str(Path(project_path).resolve())
+            self._fault_types_by_project.pop(normalized, None)
+            self._high_voltage_groups_by_project.pop(normalized, None)
 
     def _set_high_voltage_ui_visible(self, visible: bool) -> None:
         index = self.exclusion_tabs.indexOf(self.high_voltage_tab)
@@ -1067,10 +1258,109 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.high_voltage_proposal_table.item(row, column).text()
                 if self.high_voltage_proposal_table.item(row, column) is not None
                 else ""
-                for column in range(1, 5)
+                for column in (1, 2, 3, 5)
             ]
             rows.append((values[0], values[1], values[2], values[3]))
         return normalize_high_voltage_exclusions(rows)
+
+    def _high_voltage_table_key(
+        self,
+        row: int,
+    ) -> tuple[str, str, int, str] | None:
+        values = [
+            self.high_voltage_proposal_table.item(row, column).text()
+            if self.high_voltage_proposal_table.item(row, column) is not None
+            else ""
+            for column in (1, 2, 3, 5)
+        ]
+        normalized = normalize_high_voltage_exclusions(
+            [(values[0], values[1], values[2], values[3])]
+        )
+        return normalized[0] if normalized else None
+
+    def _applied_high_voltage_keys(
+        self,
+        project_path: str,
+    ) -> set[tuple[str, str, int, str]]:
+        applied = set(
+            normalize_high_voltage_exclusions(
+                self.session.high_voltage_exclusions_by_project.get(project_path, [])
+            )
+        )
+        scan = self.project_scans.get(project_path)
+        if scan is not None:
+            applied.update(
+                key
+                for row in scan.high_voltage_exclusions
+                if row.excluded
+                or _is_pscad_log_high_voltage_row(row)
+                for key in normalize_high_voltage_exclusions(
+                    [(row.voltage, row.case, row.run, row.bus)]
+                )
+            )
+        overrides = set(
+            normalize_high_voltage_exclusions(
+                self.session.high_voltage_include_overrides_by_project.get(project_path, [])
+            )
+        )
+        return applied - overrides
+
+    def _high_voltage_proposals_by_project(
+        self,
+        project_paths: Iterable[str],
+    ) -> dict[str, list[dict[str, object]]]:
+        result: dict[str, list[dict[str, object]]] = {}
+        for project_path in project_paths:
+            scan = self.project_scans.get(project_path)
+            grouped = _group_high_voltage_proposals(
+                scan.high_voltage_exclusions if scan is not None else []
+            )
+            applied = self._applied_high_voltage_keys(project_path)
+            for key in applied - grouped.keys():
+                grouped[key] = {
+                    "fault_types": [],
+                    "measurements": [],
+                    "signals": [],
+                    "files": [],
+                    "excluded_values": [],
+                    "max_abs": "",
+                    "limit": "",
+                    "sources": {scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS},
+                    "excluded": True,
+                }
+            records: list[dict[str, object]] = []
+            for (voltage, case, run, bus), values in grouped.items():
+                records.append(
+                    {
+                        "Voltage": voltage,
+                        "Case": case,
+                        "Run": run,
+                        "Fault_type": ", ".join(values["fault_types"]),
+                        "MM_name": bus,
+                        "Measurement": ", ".join(values["measurements"]),
+                        "Signal": ", ".join(values["signals"]),
+                        "File": ", ".join(values["files"]),
+                        "Excluded_values": ", ".join(values["excluded_values"]),
+                        "Max_abs": values["max_abs"],
+                        "Limit": values["limit"],
+                        "Source": _high_voltage_source(values["sources"]),
+                        "Applied": (voltage, case, run, bus) in applied,
+                    }
+                )
+            if records:
+                result[project_path] = records
+        return result
+
+    def _set_high_voltage_include_overrides(
+        self,
+        project_path: str,
+        overrides: Iterable[tuple[str, str, int, str]],
+    ) -> None:
+        normalized = normalize_high_voltage_exclusions(list(overrides))
+        if normalized:
+            self.session.high_voltage_include_overrides_by_project[project_path] = normalized
+        else:
+            self.session.high_voltage_include_overrides_by_project.pop(project_path, None)
 
     def _save_current_project_exclusions(self) -> None:
         project_path = self._current_project_path()
@@ -1111,14 +1401,40 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_project_exclusions_changed()
 
     def _on_high_voltage_table_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if item.column() == 0:
-            self._on_project_exclusions_changed()
+        if item.column() != 0 or self._loading:
+            return
+        project_path = self._current_project_path()
+        key = self._high_voltage_table_key(item.row())
+        if project_path is not None and key is not None:
+            overrides = set(
+                normalize_high_voltage_exclusions(
+                    self.session.high_voltage_include_overrides_by_project.get(project_path, [])
+                )
+            )
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                overrides.discard(key)
+            elif key in self._applied_high_voltage_keys(project_path):
+                overrides.add(key)
+            self._set_high_voltage_include_overrides(project_path, overrides)
+        self._on_project_exclusions_changed()
 
     def _set_all_exclusion_rows_checked(
         self,
         table: QtWidgets.QTableWidget,
         checked: bool,
     ) -> None:
+        project_path = self._current_project_path()
+        applied_before = (
+            self._applied_high_voltage_keys(project_path)
+            if table is self.high_voltage_proposal_table and project_path is not None
+            else set()
+        )
+        visible_keys = {
+            key
+            for row in range(table.rowCount())
+            if table is self.high_voltage_proposal_table
+            and (key := self._high_voltage_table_key(row)) is not None
+        }
         was_loading = self._loading
         self._loading = True
         try:
@@ -1133,6 +1449,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
         finally:
             self._loading = was_loading
+        if table is self.high_voltage_proposal_table and project_path is not None:
+            overrides = set(
+                normalize_high_voltage_exclusions(
+                    self.session.high_voltage_include_overrides_by_project.get(project_path, [])
+                )
+            )
+            if checked:
+                overrides.difference_update(visible_keys)
+            else:
+                overrides.update(applied_before & visible_keys)
+            self._set_high_voltage_include_overrides(project_path, overrides)
         self._on_project_exclusions_changed()
 
     def _add_manual_exclusion_row(self) -> None:
@@ -1254,30 +1581,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self._loading = was_loading
 
     def add_project(self) -> None:
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "Select PSCAD result project folder",
-            str(Path.cwd()),
-        )
-        if not directory:
+        selected_paths = [
+            str(Path(path).resolve())
+            for path in _select_project_directories(self, Path.cwd())
+        ]
+        existing_paths = {
+            project.path.casefold()
+            for project in self.session.projects
+        }
+        project_paths = []
+        for path in selected_paths:
+            path_key = path.casefold()
+            if path_key in existing_paths:
+                continue
+            existing_paths.add(path_key)
+            project_paths.append(path)
+        if not project_paths:
             return
-        project_path = str(Path(directory).resolve())
-        self.session.add_project(project_path)
+        for project_path in project_paths:
+            self.session.add_project(project_path)
         self._loading = True
         try:
             self._reload_project_tree()
         finally:
             self._loading = False
         self.autosave()
-        self._select_project_path(project_path)
+        self._select_project_path(project_paths[0])
         self._reload_project_exclusions()
-        self.refresh_project_scans(project_paths=[project_path])
+        self.refresh_project_scans(project_paths=project_paths)
 
     def delete_selected_projects(self) -> None:
         selected_items = self.project_tree.selectedItems()
         if not selected_items:
             return
         paths = {str(item.data(0, USER_ROLE_PATH)) for item in selected_items}
+        self._clear_project_ui_caches(paths)
         self.session.remove_projects(paths)
         for path in paths:
             self.project_scans.pop(path, None)
@@ -1391,7 +1729,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path_text:
             return
-        self.session = storage.load_session(Path(path_text))
+        try:
+            loaded_session = storage.load_session(Path(path_text))
+        except (OSError, UnicodeDecodeError, TypeError, ValueError) as exc:
+            self.log(f"Session could not be loaded: {path_text} | {exc}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Load Session",
+                f"The selected session is invalid or unreadable.\n\n{exc}",
+            )
+            return
+        self.session = loaded_session
         self.session.ensure_full_scope()
         self._load_session_to_ui()
         self.autosave()
@@ -1487,10 +1835,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 if (row.case, row.run) not in disabled
             ]
             result.setdefault(project_path, []).extend(detected)
-        for project_path, exclusions in self.session.high_voltage_exclusions_by_project.items():
+        high_voltage_projects = {
+            *self.project_scans,
+            *self.session.high_voltage_exclusions_by_project,
+        }
+        for project_path in high_voltage_projects:
+            scan = self.project_scans.get(project_path)
+            log_keys = {
+                key
+                for row in (scan.high_voltage_exclusions if scan is not None else [])
+                if _is_pscad_log_high_voltage_row(row)
+                for key in normalize_high_voltage_exclusions(
+                    [(row.voltage, row.case, row.run, row.bus)]
+                )
+            }
             result.setdefault(project_path, []).extend(
                 ExclusionRule(voltage=voltage, case=case, run=run, bus=bus)
-                for voltage, case, run, bus in normalize_high_voltage_exclusions(exclusions)
+                for voltage, case, run, bus in self._applied_high_voltage_keys(project_path)
+                if (voltage, case, run, bus) not in log_keys
             )
         for project_path in list(result):
             normalized = normalize_exclusion_rules(result[project_path])
@@ -1521,6 +1883,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not paths:
             self.project_scans.clear()
+            self._clear_project_ui_caches()
             self.session.status_cache.clear()
             try:
                 project_scan_cache.clear()
@@ -1537,6 +1900,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 current_path,
                 iip_limit,
                 iir_limit,
+                float(self.session.high_voltage_limit_factor),
+                dict(self.session.voltage_um_overrides_by_project),
                 force=force,
                 check_cancel=cancel.throw_if_cancelled,
                 log=log,
@@ -1548,6 +1913,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _project_scans_finished(self, result: project_scan_runner.ProjectScanBatch) -> None:
         current_path = result.current_path
         scans = result.scans
+        self._clear_project_ui_caches(scans)
         known_paths = {project.path for project in self.session.projects}
         self.project_scans.update(
             {
@@ -1606,20 +1972,77 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh_plots: bool = False,
         refresh_reports: bool = False,
         refresh_high_voltage_exclusions: bool = False,
+        dashboard_failed_paths: Iterable[str] = (),
     ) -> None:
-        paths = list(dict.fromkeys(str(Path(path).resolve()) for path in project_paths))
+        failed_paths = {
+            str(Path(path).resolve()) for path in dashboard_failed_paths
+        }
+        paths = list(
+            dict.fromkeys(
+                [*(str(Path(path).resolve()) for path in project_paths), *failed_paths]
+            )
+        )
+        self._clear_project_ui_caches(paths)
         for project_path in paths:
             scan = self.project_scans.get(project_path)
             if scan is None:
                 continue
-            scanner.refresh_project_scan_outputs(
-                scan,
-                refresh_dashboards=refresh_dashboards,
-                refresh_envelopes=refresh_envelopes,
-                refresh_plots=refresh_plots,
-                refresh_reports=refresh_reports,
-                refresh_high_voltage_exclusions=refresh_high_voltage_exclusions,
-            )
+            previous_high_voltage = {
+                (row.voltage, row.case, row.run, row.bus)
+                for row in scan.high_voltage_exclusions
+                if row.excluded
+            }
+            if project_path in failed_paths:
+                scanner.mark_dashboard_changed(scan)
+            else:
+                scanner.refresh_project_scan_outputs(
+                    scan,
+                    refresh_dashboards=refresh_dashboards,
+                    refresh_envelopes=refresh_envelopes,
+                    refresh_plots=refresh_plots,
+                    refresh_reports=refresh_reports,
+                    refresh_high_voltage_exclusions=refresh_high_voltage_exclusions,
+                    high_voltage_limit_factor=float(self.session.high_voltage_limit_factor),
+                    voltage_um_overrides=self.session.voltage_um_overrides_by_project.get(
+                        project_path,
+                        {},
+                    ),
+                )
+                if refresh_high_voltage_exclusions:
+                    current_high_voltage = set(
+                        normalize_high_voltage_exclusions(
+                            [
+                                (row.voltage, row.case, row.run, row.bus)
+                                for row in scan.high_voltage_exclusions
+                                if row.excluded
+                            ]
+                        )
+                    )
+                    overrides = set(
+                        normalize_high_voltage_exclusions(
+                            self.session.high_voltage_include_overrides_by_project.get(
+                                project_path,
+                                [],
+                            )
+                        )
+                    )
+                    current_high_voltage.difference_update(overrides)
+                    if current_high_voltage:
+                        self.session.high_voltage_exclusions_by_project[project_path] = sorted(
+                            current_high_voltage,
+                            key=lambda item: (item[0], item[1], item[2], item[3]),
+                        )
+                    else:
+                        self.session.high_voltage_exclusions_by_project.pop(project_path, None)
+                    new_count = len(
+                        current_high_voltage
+                        - set(normalize_high_voltage_exclusions(previous_high_voltage))
+                    )
+                    if new_count:
+                        self.log(
+                            f"{Path(project_path).name}: {new_count} additional high-voltage "
+                            "exclusion(s) found by analysis, applied to this build, and marked checked."
+                        )
             self.session.status_cache[project_path] = scan.chips
 
         if not paths:
@@ -1632,6 +2055,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     float(self.session.nonconv_cb_iip_limit),
                     float(self.session.nonconv_cb_iir_limit),
                 ),
+                high_voltage_limit_factor=float(self.session.high_voltage_limit_factor),
+                voltage_um_overrides_by_project=dict(
+                    self.session.voltage_um_overrides_by_project
+                ),
+                preserve_input_manifest=True,
             )
         except (OSError, TypeError, ValueError) as exc:
             self.log(f"Project scan cache could not be saved: {exc}")
@@ -1687,20 +2115,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def work(log, cancel):
-            result: dict[str, tuple[list[DashboardFigure], list[str]]] = {}
+            result: dict[str, tuple[list[DashboardFigure], list[str], bool]] = {}
             for project_path in projects:
                 cancel.throw_if_cancelled()
                 root = Path(project_path)
                 log(f"Dashboard refresh started: {root.name}")
                 try:
                     actions.refresh_dashboards(root, log)
+                    refresh_succeeded = True
+                except OperationCancelled:
+                    raise
                 except Exception as exc:
+                    refresh_succeeded = False
                     log(f"Dashboard refresh failed for {root.name}: {exc}")
 
                 cancel.throw_if_cancelled()
                 log(f"Scanning available dashboard figures: {root.name}")
                 figures, warnings = scanner.scan_dashboard_figures(root)
-                result[project_path] = (figures, warnings)
+                result[project_path] = (figures, warnings, refresh_succeeded)
                 log(f"Dashboard figure scan complete: {root.name} | {len(figures)} figures")
                 for warning in warnings:
                     log(warning)
@@ -1714,14 +2146,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _dashboard_refresh_finished(
         self,
-        result: dict[str, tuple[list[DashboardFigure], list[str]]],
+        result: dict[str, tuple[list[DashboardFigure], list[str], bool]],
     ) -> None:
-        self._update_dashboard_figures(result)
+        figures = {
+            project_path: (project_figures, warnings)
+            for project_path, (project_figures, warnings, _succeeded) in result.items()
+        }
+        successful = [path for path, value in result.items() if value[2]]
+        failed = [path for path, value in result.items() if not value[2]]
+        self._update_dashboard_figures(figures)
         self._refresh_project_status_after_action(
-            result,
+            successful,
             refresh_dashboards=True,
+            dashboard_failed_paths=failed,
         )
-        self.autosave()
         self._load_dashboard_figure_list(self._current_project_path())
 
     def _update_dashboard_figures(
@@ -1739,77 +2177,11 @@ class MainWindow(QtWidgets.QMainWindow):
         result: dict[str, tuple[list[DashboardFigure], list[str]]],
     ) -> None:
         self._update_dashboard_figures(result)
-        self.autosave()
-        self._load_dashboard_figure_list(self._current_project_path())
-
-    def scan_high_voltage_log(self) -> None:
-        projects = self.selected_project_paths()
-        if not projects:
-            self.log("No checked projects for PSCAD log high-voltage scan.")
-            return
-        limit_factor = float(self.session.high_voltage_limit_factor)
-        voltage_overrides = dict(self.session.voltage_um_overrides_by_project)
-
-        def work(log, cancel):
-            result: dict[str, tuple[list[scanner.HighVoltageExclusion], list[str]]] = {}
-            for project_path in projects:
-                cancel.throw_if_cancelled()
-                root = Path(project_path)
-                log(f"Scanning PSCAD log high-voltage proposals: {root.name}")
-                rows, warnings = scanner.scan_high_voltage_from_pscad_log(
-                    root,
-                    limit_factor,
-                    voltage_overrides.get(project_path, {}),
-                    check_cancel=cancel.throw_if_cancelled,
-                )
-                result[project_path] = (rows, warnings)
-                log(f"PSCAD log high-voltage scan complete: {root.name} | {len(rows)} proposals")
-                for warning in warnings:
-                    log(warning)
-            return result
-
-        self._start_background_task(
-            "Scanning PSCAD log high voltage",
-            work,
-            self._high_voltage_log_scan_finished,
+        self._refresh_project_status_after_action(
+            result,
+            refresh_dashboards=True,
         )
-
-    def _high_voltage_log_scan_finished(
-        self,
-        result: dict[str, tuple[list[scanner.HighVoltageExclusion], list[str]]],
-    ) -> None:
-        current_path = self._current_project_path()
-        for project_path, (rows, _warnings) in result.items():
-            scan = self.project_scans.get(project_path)
-            if scan is None:
-                scan = scanner.ProjectScan(path=Path(project_path), exists=Path(project_path).is_dir())
-                self.project_scans[project_path] = scan
-            kept = [
-                row
-                for row in scan.high_voltage_exclusions
-                if row.file not in scanner.PSCAD_LOG_HIGH_VOLTAGE_SOURCES
-            ]
-            seen = {(row.voltage, row.case, row.run, row.bus) for row in kept}
-            for row in rows:
-                key = (row.voltage, row.case, row.run, row.bus)
-                if key not in seen:
-                    kept.append(row)
-                    seen.add(key)
-            scan.high_voltage_exclusions = kept
-            scan.chips = [chip for chip in scan.chips if not chip.startswith("High voltage proposals:")]
-            if scan.high_voltage_exclusions:
-                scan.chips.append(f"High voltage proposals: {len(scan.high_voltage_exclusions)}")
-            self.session.status_cache[project_path] = scan.chips
-
-        self._loading = True
-        try:
-            self._reload_project_tree()
-            if current_path is not None:
-                self._select_project_path(current_path)
-        finally:
-            self._loading = False
-        self._reload_project_exclusions()
-        self.autosave()
+        self._load_dashboard_figure_list(self._current_project_path())
 
     def run_full_analysis(self) -> None:
         selected = self._selected_work("Run analysis")
@@ -1821,7 +2193,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._ensure_voltage_um(projects, voltages):
             return
         dashboard_figure_ids = list(self.session.dashboard_figure_selection)
-        envelope_kwargs = self._envelope_build_kwargs()
+        envelope_kwargs = self._envelope_build_kwargs(projects)
 
         def work(log, cancel):
             log("Analysis started.")
@@ -1860,7 +2232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         voltages = list(self.session.voltages)
         if not self._ensure_voltage_um(projects, voltages):
             return
-        envelope_kwargs = self._envelope_build_kwargs()
+        envelope_kwargs = self._envelope_build_kwargs(projects)
 
         def work(log, cancel):
             log("Envelope build started.")
@@ -1884,6 +2256,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda _result: self._refresh_project_status_after_action(
                 projects,
                 refresh_envelopes=True,
+                refresh_high_voltage_exclusions=True,
             ),
         )
 
@@ -1899,7 +2272,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 projects,
                 scopes,
                 self.session.voltages,
-                **self._envelope_chart_kwargs(),
+                **self._envelope_chart_kwargs(projects),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -1975,7 +2348,7 @@ class MainWindow(QtWidgets.QMainWindow):
             written = actions.rebuild_analysis_charts(
                 projects,
                 scopes,
-                envelope_chart_x_max=self.session.envelope_chart_x_max,
+                **self._project_chart_axis_kwargs(projects),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -2066,6 +2439,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 resonance_settings=resonance_settings,
                 event_times=dict(self.session.event_times),
                 log=log,
+                check_cancel=cancel.throw_if_cancelled,
             )
             cancel.throw_if_cancelled()
             log(f"Report rebuild complete: {len(written)} files.")
@@ -2126,11 +2500,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _resonance_settings(self) -> dict[str, object]:
         return resonance_checks.ResonanceSettings.from_session(self.session).to_mapping()
 
-    def _envelope_chart_kwargs(self) -> dict[str, object]:
+    def _project_chart_axis_kwargs(self, project_paths: Iterable[str]) -> dict[str, object]:
+        x_max_by_project: dict[str, float | None] = {}
+        x_major_by_project: dict[str, float | None] = {}
+        for raw_path in project_paths:
+            project_path = str(Path(raw_path).resolve())
+            scan = self.project_scans.get(project_path)
+            x_max_by_project[project_path] = self.session.envelope_chart_x_max_overrides_by_project.get(
+                project_path,
+                scan.final_duration if scan is not None else None,
+            )
+            x_major_by_project[project_path] = self.session.envelope_chart_x_major_overrides_by_project.get(
+                project_path
+            )
+        return {
+            "envelope_chart_x_max_by_project": x_max_by_project,
+            "envelope_chart_x_major_by_project": x_major_by_project,
+        }
+
+    def _envelope_chart_kwargs(self, project_paths: Iterable[str]) -> dict[str, object]:
         return {
             "event_times": dict(self.session.event_times),
-            "envelope_chart_x_max": float(self.session.envelope_chart_x_max),
-            "envelope_chart_x_major": float(self.session.envelope_chart_x_major),
+            **self._project_chart_axis_kwargs(project_paths),
             "envelope_chart_y_limits_by_voltage": dict(self.session.envelope_chart_y_limits_by_voltage),
             "envelope_chart_show_sa_label": bool(self.session.envelope_chart_show_sa_label),
             "envelope_chart_top_left_cell": self.session.envelope_chart_top_left_cell,
@@ -2138,18 +2529,43 @@ class MainWindow(QtWidgets.QMainWindow):
             "envelope_chart_height": float(self.session.envelope_chart_height),
         }
 
-    def _envelope_build_kwargs(self) -> dict[str, object]:
+    def _envelope_build_kwargs(self, project_paths: Iterable[str]) -> dict[str, object]:
+        paths = [str(Path(path).resolve()) for path in project_paths]
         return {
-            "envelope_workers": int(self.session.envelope_workers),
+            "envelope_workers": (
+                None
+                if self.session.envelope_workers_auto
+                else int(self.session.envelope_workers)
+            ),
             "envelope_time_step": float(self.session.envelope_time_step),
-            "envelope_time_end": float(self.session.envelope_time_end),
+            "envelope_time_end": (
+                None
+                if self.session.envelope_time_end_auto
+                else float(self.session.envelope_time_end)
+            ),
             "envelope_fallback_frequency": float(self.session.envelope_fallback_frequency),
-            **self._envelope_chart_kwargs(),
+            **self._envelope_chart_kwargs(paths),
+            "project_timing_by_project": {
+                path: {
+                    "frequency": scan.project_frequency,
+                    "final_duration": scan.final_duration,
+                }
+                for path in paths
+                if (scan := self.project_scans.get(path)) is not None
+            },
             "high_voltage_limit_factor": float(self.session.high_voltage_limit_factor),
             "nonconv_cb_iip_limit": float(self.session.nonconv_cb_iip_limit),
             "nonconv_cb_iir_limit": float(self.session.nonconv_cb_iir_limit),
             "voltage_um_overrides_by_project": dict(self.session.voltage_um_overrides_by_project),
             "exclusions_by_project": self._effective_exclusions_by_project(),
+            "high_voltage_proposals_by_project": self._high_voltage_proposals_by_project(paths),
+            "high_voltage_include_overrides_by_project": {
+                path: normalize_high_voltage_exclusions(
+                    self.session.high_voltage_include_overrides_by_project.get(path, [])
+                )
+                for path in paths
+                if self.session.high_voltage_include_overrides_by_project.get(path)
+            },
             "resonance_settings": self._resonance_settings(),
         }
 
@@ -2167,6 +2583,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = worker
         worker.message.connect(self._on_worker_message)
         worker.succeeded.connect(lambda result: self._task_succeeded(title, result, on_success))
+        worker.cancelled.connect(lambda: self._task_cancelled(title))
         worker.failed.connect(lambda message, details: self._task_failed(title, message, details))
         worker.finished.connect(self._worker_finished)
         worker.finished.connect(worker.deleteLater)
@@ -2199,7 +2616,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if request.action == "continue":
                 return
             cancel.cancel()
-            raise RuntimeError("Operation stopped by user.")
+            raise OperationCancelled()
 
         return emit
 
@@ -2269,13 +2686,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_settings_if_requested()
 
     def _task_failed(self, title: str, message: str, details: str) -> None:
-        if message == "Operation stopped by user.":
-            self.log(f"{title} stopped by user.")
-            self._set_busy(False, "Stopped")
-        else:
-            self.log(f"{title} failed: {message}")
-            self.log(f"{title} traceback:\n{details.rstrip()}")
-            self._set_busy(False, f"{title} failed")
+        self.log(f"{title} failed: {message}")
+        self.log(f"{title} traceback:\n{details.rstrip()}")
+        self._set_busy(False, f"{title} failed")
+        self._worker = None
+        self._cancel_token = None
+        self._open_settings_if_requested()
+
+    def _task_cancelled(self, title: str) -> None:
+        self.log(f"{title} stopped by user.")
+        self._set_busy(False, "Stopped")
         self._worker = None
         self._cancel_token = None
         self._open_settings_if_requested()
@@ -2293,7 +2713,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_busy(self, busy: bool, status: str) -> None:
         self._busy = busy
         self.workspace_splitter.setEnabled(not busy)
-        self.scan_high_voltage_log_button.setEnabled(not busy)
         self.scan_dashboard_figures_button.setEnabled(not busy)
         self.refresh_dashboards_button.setEnabled(not busy)
         self.run_full_button.setEnabled(not busy)

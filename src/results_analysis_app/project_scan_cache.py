@@ -7,7 +7,7 @@ from typing import Any
 from results_analysis_app import scanner, storage
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 4
 
 
 def _empty_cache() -> dict[str, Any]:
@@ -39,11 +39,6 @@ def _path_from_cache(value: Any, root: Path) -> Path:
 
 
 def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
-    high_voltage_rows = [
-        row
-        for row in scan.high_voltage_exclusions
-        if row.file not in scanner.PSCAD_LOG_HIGH_VOLTAGE_SOURCES
-    ]
     return {
         "exists": scan.exists,
         "chips": list(scan.chips),
@@ -78,11 +73,29 @@ def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
                 "excluded_values": item.excluded_values,
                 "max_abs": item.max_abs,
                 "limit": item.limit,
+                "source": item.source,
+                "excluded": item.excluded,
             }
-            for item in high_voltage_rows
+            for item in scan.high_voltage_exclusions
+        ],
+        "high_voltage_log_measurements": [
+            {
+                "voltage": item.voltage,
+                "case": item.case,
+                "run": item.run,
+                "bus": item.bus,
+                "measurement": item.measurement,
+                "signal": item.signal,
+                "file": item.file,
+                "max_abs": item.max_abs,
+            }
+            for item in scan.high_voltage_log_measurements
         ],
         "available_voltages": list(scan.available_voltages),
+        "project_frequency": scan.project_frequency,
+        "final_duration": scan.final_duration,
         "has_dashboards": scan.has_dashboards,
+        "dashboard_changed": scan.dashboard_changed,
         "has_envelopes": scan.has_envelopes,
         "has_plots": scan.has_plots,
         "has_reports": scan.has_reports,
@@ -96,13 +109,25 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_list(payload: dict[str, Any], key: str) -> list[Any]:
+    value = payload.get(key)
+    return value if isinstance(value, list) else []
+
+
 def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | None:
     if not isinstance(payload, dict):
         return None
     root = Path(project_path).resolve()
 
     case_infos: list[scanner.CaseInfo] = []
-    for item in payload.get("case_infos", []):
+    for item in _payload_list(payload, "case_infos"):
         if not isinstance(item, dict) or not str(item.get("name", "")).strip():
             continue
         case_infos.append(
@@ -113,7 +138,7 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
         )
 
     nonconv_cases: list[scanner.NonConvergentCase] = []
-    for item in payload.get("nonconv_cases", []):
+    for item in _payload_list(payload, "nonconv_cases"):
         if not isinstance(item, dict):
             continue
         run = _as_int(item.get("run"))
@@ -134,7 +159,7 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
         )
 
     high_voltage_exclusions: list[scanner.HighVoltageExclusion] = []
-    for item in payload.get("high_voltage_exclusions", []):
+    for item in _payload_list(payload, "high_voltage_exclusions"):
         if not isinstance(item, dict):
             continue
         run = _as_int(item.get("run"))
@@ -155,19 +180,54 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
                 excluded_values=str(item.get("excluded_values", "")),
                 max_abs=str(item.get("max_abs", "")),
                 limit=str(item.get("limit", "")),
+                source=str(item.get("source", "")),
+                excluded=bool(item.get("excluded", False)),
             )
         )
 
+    high_voltage_log_measurements: list[scanner.HighVoltageMeasurement] = []
+    for item in _payload_list(payload, "high_voltage_log_measurements"):
+        if not isinstance(item, dict):
+            continue
+        run = _as_int(item.get("run"))
+        try:
+            max_abs = float(item.get("max_abs"))
+        except (TypeError, ValueError):
+            continue
+        case = str(item.get("case", "")).strip()
+        bus = str(item.get("bus", "")).strip()
+        if run is None or not case or not bus:
+            continue
+        high_voltage_log_measurements.append(
+            scanner.HighVoltageMeasurement(
+                voltage=str(item.get("voltage", "")),
+                case=case,
+                run=run,
+                bus=bus,
+                measurement=str(item.get("measurement", "")),
+                signal=str(item.get("signal", "")),
+                file=str(item.get("file", "")),
+                max_abs=max_abs,
+            )
+        )
+
+    chips = [str(value) for value in _payload_list(payload, "chips")]
     return scanner.ProjectScan(
         path=root,
         exists=bool(payload.get("exists", root.is_dir())),
-        chips=[str(value) for value in payload.get("chips", [])],
-        messages=[str(value) for value in payload.get("messages", [])],
+        chips=chips,
+        messages=[str(value) for value in _payload_list(payload, "messages")],
         case_infos=case_infos,
         nonconv_cases=nonconv_cases,
         high_voltage_exclusions=high_voltage_exclusions,
-        available_voltages=[str(value) for value in payload.get("available_voltages", [])],
+        high_voltage_log_measurements=high_voltage_log_measurements,
+        available_voltages=[str(value) for value in _payload_list(payload, "available_voltages")],
+        project_frequency=_as_float(payload.get("project_frequency")),
+        final_duration=_as_float(payload.get("final_duration")),
         has_dashboards=bool(payload.get("has_dashboards", False)),
+        dashboard_changed=bool(
+            payload.get("dashboard_changed", "Dashboards changed" in chips)
+        ),
         has_envelopes=bool(payload.get("has_envelopes", False)),
         has_plots=bool(payload.get("has_plots", False)),
         has_reports=bool(payload.get("has_reports", False)),
@@ -178,30 +238,115 @@ def _cache_entry(
     project_path: str,
     scan: scanner.ProjectScan,
     nonconv_limits: tuple[float | None, float | None],
+    high_voltage_limit_factor: float | None = None,
+    voltage_um_overrides: dict[str, float] | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(project_path).resolve()
     return {
-        "manifest": scanner.project_scan_manifest(root),
+        "manifest": manifest or scanner.project_scan_manifest(root),
         "nonconv_limits": [nonconv_limits[0], nonconv_limits[1]],
+        "high_voltage_settings": _high_voltage_settings(
+            high_voltage_limit_factor,
+            voltage_um_overrides,
+        ),
         "scan": _serialize_scan(scan, root),
     }
+
+
+def _high_voltage_settings(
+    high_voltage_limit_factor: float | None,
+    voltage_um_overrides: dict[str, float] | None,
+) -> dict[str, Any] | None:
+    if high_voltage_limit_factor is None:
+        return None
+    return {
+        "limit_factor": float(high_voltage_limit_factor),
+        "um_overrides": {
+            str(voltage): float(value)
+            for voltage, value in sorted((voltage_um_overrides or {}).items())
+        },
+    }
+
+
+def _manifest_section(manifest: Any, key: str) -> Any:
+    if not isinstance(manifest, dict):
+        return None
+    value = manifest.get(key)
+    if key == "output_state":
+        return value if isinstance(value, dict) else None
+    return value if isinstance(value, list) else None
+
+
+def manifest_section_changed(
+    data: dict[str, Any],
+    project_path: str,
+    current_manifest: dict[str, Any],
+    key: str,
+) -> bool:
+    entry = data.get("projects", {}).get(str(Path(project_path).resolve()))
+    stored_manifest = entry.get("manifest") if isinstance(entry, dict) else None
+    return _manifest_section(stored_manifest, key) != _manifest_section(current_manifest, key)
 
 
 def cached_scan(
     data: dict[str, Any],
     project_path: str,
     nonconv_limits: tuple[float | None, float | None],
+    *,
+    current_manifest: dict[str, Any] | None = None,
 ) -> scanner.ProjectScan | None:
     root = Path(project_path).resolve()
     entry = data.get("projects", {}).get(str(root))
     if not isinstance(entry, dict):
         return None
-    if entry.get("manifest") != scanner.project_scan_manifest(root):
+    stored_manifest = entry.get("manifest")
+    current_manifest = current_manifest or scanner.project_scan_manifest(root)
+    if (
+        not isinstance(stored_manifest, dict)
+        or stored_manifest.get("exists") != current_manifest.get("exists")
+        or _manifest_section(stored_manifest, "files")
+        != _manifest_section(current_manifest, "files")
+    ):
         return None
     expected_limits = [nonconv_limits[0], nonconv_limits[1]]
     if entry.get("nonconv_limits") != expected_limits:
         return None
-    return _deserialize_scan(str(root), entry.get("scan"))
+    scan = _deserialize_scan(str(root), entry.get("scan"))
+    if scan is None:
+        return None
+    scanner.apply_project_output_state(scan, current_manifest.get("output_state"))
+    current_dashboards = _manifest_section(current_manifest, "dashboard_files")
+    if _manifest_section(stored_manifest, "dashboard_files") != current_dashboards:
+        scanner.mark_dashboard_changed(scan)
+    return scan
+
+
+def high_voltage_cache_state(
+    data: dict[str, Any],
+    project_path: str,
+    current_manifest: dict[str, Any],
+    high_voltage_limit_factor: float,
+    voltage_um_overrides: dict[str, float] | None,
+) -> str:
+    entry = data.get("projects", {}).get(str(Path(project_path).resolve()))
+    if not isinstance(entry, dict):
+        return "files"
+    stored_manifest = entry.get("manifest")
+    stored_files = (
+        stored_manifest.get("high_voltage_files")
+        if isinstance(stored_manifest, dict)
+        else None
+    )
+    if stored_files != current_manifest.get("high_voltage_files", []):
+        return "files"
+    expected_settings = _high_voltage_settings(
+        high_voltage_limit_factor,
+        voltage_um_overrides,
+    )
+    if entry.get("high_voltage_settings") != expected_settings:
+        return "settings"
+    return "valid"
 
 
 def update_project_scans(
@@ -209,6 +354,11 @@ def update_project_scans(
     project_paths: Iterable[str],
     nonconv_limits: tuple[float | None, float | None],
     path: Path = storage.PROJECT_SCAN_CACHE_PATH,
+    *,
+    high_voltage_limit_factor: float | None = None,
+    voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
+    manifests_by_project: dict[str, dict[str, Any]] | None = None,
+    preserve_input_manifest: bool = False,
 ) -> None:
     data = load(path)
     projects = data["projects"]
@@ -218,7 +368,33 @@ def update_project_scans(
         if scan is None:
             projects.pop(key, None)
             continue
-        projects[key] = _cache_entry(key, scan, nonconv_limits)
+        manifest = (manifests_by_project or {}).get(key)
+        if manifest is None and preserve_input_manifest:
+            stored_entry = projects.get(key)
+            stored_manifest = (
+                stored_entry.get("manifest")
+                if isinstance(stored_entry, dict)
+                else None
+            )
+            if (
+                isinstance(stored_manifest, dict)
+                and isinstance(stored_manifest.get("files"), list)
+                and isinstance(stored_manifest.get("high_voltage_files"), list)
+            ):
+                manifest = {
+                    "exists": Path(key).is_dir(),
+                    "files": stored_manifest["files"],
+                    "high_voltage_files": stored_manifest["high_voltage_files"],
+                    **scanner.project_output_manifest(key),
+                }
+        projects[key] = _cache_entry(
+            key,
+            scan,
+            nonconv_limits,
+            high_voltage_limit_factor,
+            (voltage_um_overrides_by_project or {}).get(key, {}),
+            manifest,
+        )
     storage.write_json(path, data)
 
 

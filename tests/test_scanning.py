@@ -111,6 +111,112 @@ def test_project_scan_ignores_corrupt_envelope_workbook(tmp_path) -> None:
     assert any("Could not read high-voltage proposals" in message for message in scan.messages)
 
 
+def test_high_voltage_proposals_prefer_base_envelope_workbook(tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app.scanner import _collect_high_voltage_exclusions
+
+    envelope_dir = tmp_path / "Voltage_envelope" / "Full"
+    envelope_dir.mkdir(parents=True)
+    for name, case in (
+        ("MM_66.xlsx", "BaseCase"),
+        ("MM_66_with_combined_plot.xlsx", "StaleCombinedCase"),
+    ):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "High voltage exclusions"
+        sheet.append(["Case", "Run", "MM_name", "Signal"])
+        sheet.append([case, 1, "MM_66_A", "V_a"])
+        workbook.save(envelope_dir / name)
+        workbook.close()
+
+    rows, warnings = _collect_high_voltage_exclusions(tmp_path)
+
+    assert warnings == []
+    assert [row.case for row in rows] == ["BaseCase"]
+    assert rows[0].source == "Analysis"
+    assert rows[0].excluded is True
+
+
+def test_high_voltage_proposals_mark_log_and_analysis_sources(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import scanner
+
+    scan = scanner.ProjectScan(
+        path=tmp_path,
+        exists=True,
+        high_voltage_exclusions=[
+            scanner.HighVoltageExclusion(
+                voltage="66",
+                case="C1",
+                run=1,
+                bus="MM_66_A",
+                signal="Va",
+                source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+            ),
+            scanner.HighVoltageExclusion(
+                voltage="66",
+                case="C1",
+                run=1,
+                bus="MM_66_A",
+                signal="Vb",
+                source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+            ),
+        ],
+    )
+    log_rows = [
+        scanner.HighVoltageExclusion(
+            voltage="66",
+            case="C1",
+            run=1,
+            bus="MM_66_A",
+            source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+        ),
+        scanner.HighVoltageExclusion(
+            voltage="230",
+            case="C2",
+            run=2,
+            bus="MM_230_B",
+            source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+        ),
+    ]
+    monkeypatch.setattr(
+        scanner,
+        "high_voltage_exclusions_from_measurements",
+        lambda *_args, **_kwargs: (log_rows, []),
+    )
+
+    warnings = scanner.refresh_high_voltage_log_exclusions(scan, 5.0)
+
+    assert warnings == []
+    assert [row.source for row in scan.high_voltage_exclusions] == [
+        "Both",
+        "Both",
+        "PSCAD log",
+    ]
+    assert "High voltage proposals: 2" in scan.chips
+
+
+def test_scan_cache_deserializer_tolerates_null_collections(tmp_path) -> None:
+    from results_analysis_app.project_scan_cache import _deserialize_scan
+
+    scan = _deserialize_scan(
+        str(tmp_path),
+        {
+            "case_infos": None,
+            "nonconv_cases": None,
+            "high_voltage_exclusions": None,
+            "high_voltage_log_measurements": None,
+            "chips": None,
+            "messages": None,
+            "available_voltages": None,
+        },
+    )
+
+    assert scan is not None
+    assert scan.case_infos == []
+    assert scan.messages == []
+
+
 def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs(tmp_path) -> None:
     from results_analysis_app import project_scan_cache, scanner
 
@@ -125,6 +231,16 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
         exists=True,
         chips=["Ready"],
         case_infos=[scanner.CaseInfo(name="C1", inf_path=inf_path)],
+        high_voltage_exclusions=[
+            scanner.HighVoltageExclusion(
+                voltage="66",
+                case="C1",
+                run=1,
+                bus="MM_66_BUS1",
+                source=scanner.HIGH_VOLTAGE_SOURCE_BOTH,
+                excluded=True,
+            )
+        ],
         available_voltages=["66"],
     )
     cache_path = tmp_path / "project_scan_cache.json"
@@ -143,6 +259,8 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
 
     assert cached is not None
     assert cached.available_voltages == ["66"]
+    assert cached.high_voltage_exclusions[0].source == "Both"
+    assert cached.high_voltage_exclusions[0].excluded is True
     inf_path.write_text(inf_path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
 
     assert (
@@ -153,6 +271,284 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
         )
         is None
     )
+
+
+def test_project_scan_manifest_ignores_unrelated_waveform_files(tmp_path) -> None:
+    from results_analysis_app import scanner
+
+    project = tmp_path / "Project"
+    run_dir = project / "Case_folder" / "CaseA"
+    run_dir.mkdir(parents=True)
+    tracked = {
+        run_dir / "CaseA_r00001.inf",
+        run_dir / "Statistic1.out",
+        run_dir / "CB_1.out",
+    }
+    for path in tracked:
+        path.write_text("tracked\n", encoding="utf-8")
+    (run_dir / "CaseA_r00001_01.out").write_text("waveform\n", encoding="utf-8")
+    (run_dir / "~$Statistic2.out").write_text("temporary\n", encoding="utf-8")
+
+    manifest = scanner.project_scan_manifest(project)
+    manifest_paths = {str(item["path"]) for item in manifest["files"]}
+
+    assert manifest_paths == {
+        path.relative_to(project).as_posix()
+        for path in tracked
+    }
+
+
+def test_output_only_changes_update_cached_status_without_core_rescan(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    from results_analysis_app import project_scan_runner, scanner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    calls = 0
+
+    def fake_scan(path, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return scanner.ProjectScan(path=Path(path).resolve(), exists=True, chips=["Missing Results"])
+
+    monkeypatch.setattr(project_scan_runner.scanner, "scan_project", fake_scan)
+    project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        cache_path=cache_path,
+    )
+    generated = project / "Plots" / "Generated" / "Full" / "SFO"
+    generated.mkdir(parents=True)
+    (generated / "plot.png").write_bytes(b"plot")
+
+    refreshed = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        cache_path=cache_path,
+    ).scans[project_path]
+
+    assert calls == 1
+    assert refreshed.has_plots is True
+    assert "Plots exist" in refreshed.chips
+
+
+def test_envelope_change_refreshes_hv_proposals_without_core_rescan(tmp_path, monkeypatch) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app import project_scan_runner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    envelope = project / "Voltage_envelope" / "Full" / "MM_66.xlsx"
+    envelope.parent.mkdir(parents=True)
+
+    def write_proposal(case):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "High voltage exclusions"
+        sheet.append(["Case", "Run", "MM_name", "Signal"])
+        sheet.append([case, 1, "MM_66_A", "V_a"])
+        workbook.save(envelope)
+        workbook.close()
+
+    write_proposal("OldCase")
+    first = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        cache_path=cache_path,
+    ).scans[project_path]
+    assert [row.case for row in first.high_voltage_exclusions] == ["OldCase"]
+    write_proposal("NewCaseWithLongerName")
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "scan_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("envelope-only changes must not rescan core project data")
+        ),
+    )
+
+    refreshed = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        cache_path=cache_path,
+    ).scans[project_path]
+
+    assert [row.case for row in refreshed.high_voltage_exclusions] == ["NewCaseWithLongerName"]
+
+
+def test_cache_miss_hot_start_and_force_each_build_manifest_once(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    from results_analysis_app import project_scan_runner, scanner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    manifest_calls = 0
+    original_manifest = scanner.project_scan_manifest
+
+    def count_manifest(path):
+        nonlocal manifest_calls
+        manifest_calls += 1
+        return original_manifest(path)
+
+    monkeypatch.setattr(project_scan_runner.scanner, "project_scan_manifest", count_manifest)
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "scan_project",
+        lambda path, **_kwargs: scanner.ProjectScan(
+            path=Path(path).resolve(),
+            exists=True,
+            chips=["Ready"],
+        ),
+    )
+
+    project_scan_runner.scan_projects_cached(
+        [project_path], project_path, 1.0, 1.0, cache_path=cache_path
+    )
+    project_scan_runner.scan_projects_cached(
+        [project_path], project_path, 1.0, 1.0, cache_path=cache_path
+    )
+    project_scan_runner.scan_projects_cached(
+        [project_path], project_path, 1.0, 1.0, force=True, cache_path=cache_path
+    )
+
+    assert manifest_calls == 3
+
+
+def test_post_action_cache_update_preserves_input_manifest(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import project_scan_cache, scanner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    scan = scanner.ProjectScan(path=project.resolve(), exists=True, chips=["Ready"])
+    project_scan_cache.update_project_scans(
+        {project_path: scan},
+        [project_path],
+        (1.0, 1.0),
+        cache_path,
+    )
+    generated = project / "Plots" / "Generated" / "Full" / "SFO"
+    generated.mkdir(parents=True)
+    (generated / "plot.png").write_bytes(b"plot")
+    scan.has_plots = True
+
+    monkeypatch.setattr(
+        project_scan_cache.scanner,
+        "project_scan_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("post-action cache writes must not rescan core inputs")
+        ),
+    )
+    project_scan_cache.update_project_scans(
+        {project_path: scan},
+        [project_path],
+        (1.0, 1.0),
+        cache_path,
+        preserve_input_manifest=True,
+    )
+
+    entry = project_scan_cache.load(cache_path)["projects"][project_path]
+    assert entry["manifest"]["output_state"]["has_plots"] is True
+
+
+def test_dashboard_change_marks_cached_scan_without_rescanning_project(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import project_scan_cache, project_scan_runner, scanner
+
+    project = tmp_path / "Project"
+    case_root = project / "Case_folder"
+    dashboard_root = project / "Dashboards"
+    case_root.mkdir(parents=True)
+    dashboard_root.mkdir()
+    inf_path = case_root / "C1_r00001.inf"
+    inf_path.write_text("signals\n", encoding="utf-8")
+    dashboard_path = dashboard_root / "Dashboard.xlsx"
+    dashboard_path.write_bytes(b"first")
+    project_path = str(project.resolve())
+    limits = (450.0, 250.0)
+    cache_path = tmp_path / "project_scan_cache.json"
+    scan = scanner.ProjectScan(
+        path=project.resolve(),
+        exists=True,
+        chips=["Ready"],
+        case_infos=[scanner.CaseInfo(name="C1", inf_path=inf_path)],
+        has_dashboards=True,
+    )
+    project_scan_cache.update_project_scans(
+        {project_path: scan},
+        [project_path],
+        limits,
+        cache_path,
+    )
+    dashboard_path.write_bytes(b"changed dashboard")
+    scan_calls = 0
+    logs: list[str] = []
+
+    def fake_scan(*_args, **_kwargs):
+        nonlocal scan_calls
+        scan_calls += 1
+        raise AssertionError("Dashboard-only changes must not rescan the project")
+
+    monkeypatch.setattr(project_scan_runner.scanner, "scan_project", fake_scan)
+    result = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        *limits,
+        log=logs.append,
+        cache_path=cache_path,
+    )
+    changed_scan = result.scans[project_path]
+
+    assert scan_calls == 0
+    assert changed_scan.dashboard_changed is True
+    assert "Dashboards changed" in changed_scan.chips
+    assert any("Dashboard files changed" in message for message in logs)
+
+    project_scan_cache.update_project_scans(
+        result.scans,
+        [project_path],
+        limits,
+        cache_path,
+    )
+    still_changed = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        *limits,
+        cache_path=cache_path,
+    ).scans[project_path]
+    assert still_changed.dashboard_changed is True
+
+    scanner.refresh_project_scan_outputs(still_changed, refresh_dashboards=True)
+    project_scan_cache.update_project_scans(
+        {project_path: still_changed},
+        [project_path],
+        limits,
+        cache_path,
+    )
+    acknowledged = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        *limits,
+        cache_path=cache_path,
+    ).scans[project_path]
+    assert acknowledged.dashboard_changed is False
+    assert "Dashboards changed" not in acknowledged.chips
 
 
 def test_cached_project_scan_runner_skips_hot_scan_and_supports_force(tmp_path, monkeypatch) -> None:
@@ -206,6 +602,53 @@ def test_cached_project_scan_runner_skips_hot_scan_and_supports_force(tmp_path, 
 
     assert calls == 2
     assert cache_updates == 2
+
+
+def test_fresh_scan_messages_are_logged_once_but_not_replayed_from_cache(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    from results_analysis_app import project_scan_runner, scanner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "project_scan_cache.json"
+    calls = 0
+
+    def fake_scan(path, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return scanner.ProjectScan(
+            path=Path(path).resolve(),
+            exists=True,
+            chips=["Ready"],
+            messages=["Input workbook warning", "Input workbook warning"],
+        )
+
+    monkeypatch.setattr(project_scan_runner.scanner, "scan_project", fake_scan)
+    first_logs = []
+    second_logs = []
+
+    project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        log=first_logs.append,
+        cache_path=cache_path,
+    )
+    project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        log=second_logs.append,
+        cache_path=cache_path,
+    )
+
+    assert calls == 1
+    assert sum("Input workbook warning" in message for message in first_logs) == 1
+    assert not any("Input workbook warning" in message for message in second_logs)
 
 
 def test_dashboard_figure_list_falls_back_to_scanned_selected_projects() -> None:
@@ -287,6 +730,132 @@ def test_pscad_log_high_voltage_scan_uses_raw_waveform_runs(tmp_path) -> None:
     assert float(rows[0].limit) == pytest.approx(2.0 * 72.5 * 2**0.5)
 
 
+def test_project_open_scans_and_caches_hv_log_maxima_for_factor_changes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import pytest
+
+    from results_analysis_app import project_scan_runner, scanner
+
+    project = tmp_path / "Project"
+    case_dir = project / "Case_folder" / "C1.if18"
+    case_dir.mkdir(parents=True)
+    (project / "PSCAD_log.txt").write_text(
+        " WARNING: C1 - MM_66_A has very high values. Please check it. Values have been treated to lower\n",
+        encoding="utf-8",
+    )
+    inf_path = case_dir / "C1_r00001.inf"
+    inf_path.write_text(
+        'PGB(1) Output Desc="MM_LLp_a" Group="MM_66_A" Units="kV"\n',
+        encoding="utf-8",
+    )
+    out_path = case_dir / "C1_r00001_01.out"
+    out_path.write_text("time ch1\n0.0 260.0\n0.1 130.0\n", encoding="utf-8")
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    overrides = {project_path: {"66": 72.5}}
+
+    first = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        3.0,
+        overrides,
+        cache_path=cache_path,
+    ).scans[project_path]
+
+    assert first.high_voltage_exclusions == []
+    assert len(first.high_voltage_log_measurements) == 1
+    assert first.high_voltage_log_measurements[0].max_abs == pytest.approx(260.0)
+
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "scan_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("factor changes must not rescan the project")
+        ),
+    )
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "_scan_high_voltage_measurements_from_pscad_log",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("factor changes must reuse cached maxima")
+        ),
+    )
+    second = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        2.0,
+        overrides,
+        cache_path=cache_path,
+    ).scans[project_path]
+
+    assert len(second.high_voltage_exclusions) == 1
+    assert float(second.high_voltage_exclusions[0].max_abs) == pytest.approx(260.0)
+    assert float(second.high_voltage_exclusions[0].limit) == pytest.approx(2.0 * 72.5 * 2**0.5)
+
+
+def test_raw_hv_file_change_refreshes_only_hv_cache(tmp_path, monkeypatch) -> None:
+    import os
+
+    from results_analysis_app import project_scan_runner
+
+    project = tmp_path / "Project"
+    case_dir = project / "Case_folder"
+    case_dir.mkdir(parents=True)
+    (project / "PSCAD_log.txt").write_text(
+        "WARNING: C1 - MM_66_A has very high values\n",
+        encoding="utf-8",
+    )
+    (case_dir / "C1_r00001.inf").write_text(
+        'PGB(1) Output Desc="MM_LLp_a" Group="MM_66_A" Units="kV"\n',
+        encoding="utf-8",
+    )
+    out_path = case_dir / "C1_r00001_01.out"
+    out_path.write_text("time ch1\n0.0 220.0\n", encoding="utf-8")
+    project_path = str(project.resolve())
+    cache_path = tmp_path / "cache.json"
+    overrides = {project_path: {"66": 72.5}}
+    project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        2.0,
+        overrides,
+        cache_path=cache_path,
+    )
+
+    previous_stat = out_path.stat()
+    out_path.write_text("time ch1\n0.0 280.0\n", encoding="utf-8")
+    os.utime(
+        out_path,
+        ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns + 1_000_000),
+    )
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "scan_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("raw HV changes must not rescan core project data")
+        ),
+    )
+    refreshed = project_scan_runner.scan_projects_cached(
+        [project_path],
+        project_path,
+        450.0,
+        250.0,
+        2.0,
+        overrides,
+        cache_path=cache_path,
+    ).scans[project_path]
+
+    assert float(refreshed.high_voltage_exclusions[0].max_abs) == 280.0
+
+
 def test_raw_high_voltage_scan_checks_cancellation_inside_descriptor_loop(tmp_path) -> None:
     import pytest
 
@@ -309,11 +878,10 @@ def test_raw_high_voltage_scan_checks_cancellation_inside_descriptor_loop(tmp_pa
             raise RuntimeError("cancelled")
 
     with pytest.raises(RuntimeError, match="cancelled"):
-        scanner._raw_high_voltage_records_for_inf(
+        scanner._raw_high_voltage_measurements_for_inf(
             inf_path,
             {"MM_66_A"},
             {"MM_66_A": "66"},
-            {"MM_66_A": 100.0},
             cancel,
         )
 
@@ -345,10 +913,10 @@ def test_cached_project_scan_updates_only_changed_entry(tmp_path, monkeypatch) -
     updated: list[list[str]] = []
     original_update = project_scan_runner.project_scan_cache.update_project_scans
 
-    def capture_update(scans, project_paths, limits, path):
+    def capture_update(scans, project_paths, limits, path, **kwargs):
         selected = list(project_paths)
         updated.append(selected)
-        return original_update(scans, selected, limits, path)
+        return original_update(scans, selected, limits, path, **kwargs)
 
     monkeypatch.setattr(project_scan_runner.project_scan_cache, "update_project_scans", capture_update)
     changed_inf = projects[0] / "Case_folder" / "A_r00001.inf"

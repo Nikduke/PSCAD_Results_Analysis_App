@@ -32,13 +32,15 @@ Work silently by default. Do not send progress messages, implementation plans, o
 - `src/results_analysis_app/settings_dialog.py` owns Settings dialog construction and session updates; keep settings UI out of `main_window.py`.
 - `src/results_analysis_app/project_scan_cache.py` and `project_scan_runner.py` provide metadata-validated hot-start project scans.
 - `src/results_analysis_app/exclusions.py` owns shared Manual, NonConv, and High Voltage exclusion normalization and matching.
+- `src/results_analysis_app/envelope_rows.py` owns nearest-time envelope row selection shared by plot batches and reports.
 - `src/results_analysis_app/styles.py` owns the system-aware light/dark palette and semantic widget styles. Do not add fixed light-only styles directly to UI widgets.
 - `src/pscad_plotter_app_v3/` contains the MM-only embedded waveform plotting and Excel-export engine used by report batches.
+- `src/pscad_plotter_app_v3/services/waveform_io.py` owns shared `.inf`/`.out` parsing. Keep raw waveform reads cancellation-aware by passing the current cancellation callback through scanner, envelope, renderer, and exporter call paths.
 - `tests/` contains focused plotting, reporting, scanning, envelope, UI-model, and resonance contract tests.
 - `docs/CURRENT_CONTEXT.md` is the current-state handover and must stay aligned with the implementation.
 - `../Original_examples/` is outside this app folder and contains reference scripts and sample PSCAD data.
 
-The main workflow is: add cached PSCAD projects, select scopes and analysis options, review exclusions, scan or refresh inputs, build envelope data and checks, create and render plot batches, and rebuild DOCX reports.
+The main workflow is: add one or more cached PSCAD projects, select scopes and analysis options, review exclusions, scan or refresh inputs, build envelope data and checks, create and render plot batches, and rebuild DOCX reports.
 
 ## Environment and commands
 

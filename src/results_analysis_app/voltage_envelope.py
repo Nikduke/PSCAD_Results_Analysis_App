@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,23 +18,28 @@ from openpyxl.utils import get_column_letter
 
 from results_analysis_app import resonance_checks
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
-from results_analysis_app.excel import excel_app
+from results_analysis_app.excel import autofit_workbook, excel_app
 from results_analysis_app.exclusions import ExclusionMatcher, ExclusionRule
 from results_analysis_app.models import (
-    DEFAULT_ENVELOPE_CHART_X_MAJOR,
-    DEFAULT_ENVELOPE_CHART_X_MAX,
     DEFAULT_ENVELOPE_CHART_HEIGHT,
     DEFAULT_ENVELOPE_CHART_WIDTH,
     DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
     DEFAULT_ENVELOPE_WORKERS,
     DEFAULT_ENVELOPE_TIME_END,
     DEFAULT_ENVELOPE_TIME_STEP,
+    MAX_ENVELOPE_WORKERS,
     DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR,
     DEFAULT_NONCONV_CB_IIP_LIMIT,
     DEFAULT_NONCONV_CB_IIR_LIMIT,
     ScopeEntry,
+    automatic_worker_count,
 )
-from results_analysis_app.project_config import load_project_timing, load_voltage_configs
+from results_analysis_app.project_config import (
+    ProjectTiming,
+    load_project_timing,
+    load_voltage_configs,
+    normalize_voltage,
+)
 from pscad_plotter_app_v3.services.waveform_io import (
     InfDescriptor,
     case_run_from_inf_path,
@@ -78,6 +83,15 @@ class _VoltageBuildResult:
     data_outputs: list[Path]
 
 
+@dataclass
+class _BusWaveforms:
+    times: list[np.ndarray]
+    values: list[np.ndarray]
+    absolute_values: list[np.ndarray]
+    signals: list[str]
+    context: str
+
+
 def build_voltage_envelopes(
     project_root: Path,
     scopes: Iterable[ScopeEntry],
@@ -86,6 +100,8 @@ def build_voltage_envelopes(
     check_cancel: CancelFn | None = None,
     envelope_workers: int | None = None,
     exclusions: list[ExclusionRule] | None = None,
+    high_voltage_proposals: list[dict[str, object]] | None = None,
+    high_voltage_include_overrides: list[tuple[str, str, int, str]] | None = None,
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
     envelope_fallback_frequency: float | None = None,
@@ -100,6 +116,7 @@ def build_voltage_envelopes(
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
     event_times: dict[str, float] | None = None,
+    project_timing: ProjectTiming | None = None,
     voltage_um_overrides: dict[str, float] | None = None,
     resonance_settings: dict[str, Any] | None = None,
     build_charts: bool = True,
@@ -110,6 +127,7 @@ def build_voltage_envelopes(
     if not case_root.is_dir():
         raise FileNotFoundError(f"Case_folder not found: {case_root}")
 
+    total_workers = _configured_worker_count(envelope_workers)
     _log(log, f"Reading statistic and convergence data: {project_root.name}")
     stat_started = time.perf_counter()
     df_stat = _read_stat_files(project_root)
@@ -122,12 +140,19 @@ def build_voltage_envelopes(
         cb_iip_limit,
         cb_iir_limit,
         warnings=nonconv_warnings,
+        worker_count=total_workers,
+        check_cancel=check_cancel,
     )
     for warning in nonconv_warnings:
         _log(log, warning)
     _log(log, f"Envelope setup complete: {project_root.name} | {_elapsed(stat_started)}")
     detected_nonconv_keys = _nonconv_keys(df_nonconv)
     exclusion_matcher = ExclusionMatcher(exclusions or [])
+    include_override_keys = {
+        key
+        for voltage, case, run, bus in high_voltage_include_overrides or []
+        if (key := _high_voltage_key(voltage, case, run, bus)) is not None
+    }
     if detected_nonconv_keys:
         _log(log, f"Detected non-convergent proposals: {len(detected_nonconv_keys)}")
     if exclusion_matcher.rules:
@@ -135,17 +160,24 @@ def build_voltage_envelopes(
     chart_axis_limits = _chart_axis_limits(envelope_chart_x_max, envelope_chart_x_major)
     limit_factor = _positive_float(high_voltage_limit_factor, HIGH_VOLTAGE_LIMIT_FACTOR)
     time_step = _positive_float(envelope_time_step, TIME_STEP)
-    requested_time_end = _positive_float(envelope_time_end, TIME_END)
-    project_timing = load_project_timing(project_root)
+    project_timing = project_timing or load_project_timing(project_root)
+    automatic_time_end = envelope_time_end is None
+    requested_time_end = (
+        project_timing.final_duration or TIME_END
+        if automatic_time_end
+        else _positive_float(envelope_time_end, TIME_END)
+    )
     time_end = min(requested_time_end, project_timing.final_duration or requested_time_end)
     if project_timing.final_duration is not None:
+        source = "Use project duration" if automatic_time_end else f"Settings limit {requested_time_end:g} s"
         _log(
             log,
             f"Envelope time end: {time_end:g} s "
-            f"(Settings limit {requested_time_end:g} s; Input_Data Final duration {project_timing.final_duration:g} s)",
+            f"({source}; Input_Data Final duration {project_timing.final_duration:g} s)",
         )
     else:
-        _log(log, f"Envelope time end from Settings: {time_end:g} s")
+        source = "automatic fallback" if automatic_time_end else "Settings"
+        _log(log, f"Envelope time end from {source}: {time_end:g} s")
     resonance_settings_obj = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
     if resonance_settings_obj.enabled and not resonance_settings_obj.auto_release:
         if not (0.0 <= resonance_settings_obj.manual_analysis_start < time_end):
@@ -197,13 +229,12 @@ def build_voltage_envelopes(
 
     voltage_keys = [str(voltage).strip() for voltage in voltages if str(voltage).strip()]
     all_inf_paths = sorted({path for paths in scope_inf_paths.values() for path in paths})
-    total_workers = _configured_worker_count(envelope_workers)
     inf_descriptor_cache = _read_inf_descriptor_cache(all_inf_paths, total_workers, check_cancel, log)
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
     resonance_results: list[resonance_checks.ResonanceResult] = []
     _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads sequential")
-    with ThreadPoolExecutor(max_workers=total_workers) as executor:
+    with ProcessPoolExecutor(max_workers=total_workers) as executor:
         for voltage_key in voltage_keys:
             _cancel(check_cancel)
             result = _build_voltage_workbooks(
@@ -215,6 +246,8 @@ def build_voltage_envelopes(
                 voltage_key,
                 voltage_configs,
                 exclusion_matcher,
+                high_voltage_proposals or [],
+                include_override_keys,
                 limit_factor,
                 time_step,
                 time_end,
@@ -248,7 +281,10 @@ def build_voltage_envelopes(
     if build_charts:
         chart_inputs.sort(key=lambda item: (voltage_keys.index(item[0]) if item[0] in voltage_keys else 999, str(item[1])))
         with ExitStack() as stack:
-            excel = stack.enter_context(excel_app()) if chart_inputs or resonance_workbooks else None
+            excel = stack.enter_context(excel_app()) if data_outputs or chart_inputs or resonance_workbooks else None
+            for workbook_path in data_outputs:
+                autofit_workbook(excel, workbook_path)
+                _log(log, f"Envelope workbook columns autofitted: {workbook_path.name}")
             for voltage_key, envelope_path, combined_path in chart_inputs:
                 chart_started = time.perf_counter()
                 create_combined_envelope_plot(
@@ -270,9 +306,15 @@ def build_voltage_envelopes(
                     workbook_path,
                     excel,
                     x_max=chart_axis_limits["x_max"],
+                    x_major=chart_axis_limits["x_major"],
                 ):
                     _log(log, f"Analysis charts finished: {workbook_path.name} | {_elapsed(chart_started)}")
     else:
+        if data_outputs:
+            with excel_app() as excel:
+                for workbook_path in data_outputs:
+                    autofit_workbook(excel, workbook_path)
+                    _log(log, f"Envelope workbook columns autofitted: {workbook_path.name}")
         outputs.extend(data_outputs)
         outputs.extend(resonance_workbooks)
 
@@ -295,13 +337,18 @@ def _elapsed(started: float) -> str:
 
 
 def _configured_worker_count(envelope_workers: int | None = None) -> int:
-    if envelope_workers is not None:
-        return max(1, int(envelope_workers))
+    raw_value = envelope_workers
+    if raw_value is None:
+        raw_value = os.environ.get(MAX_WORKERS_ENV, str(DEFAULT_ENVELOPE_WORKERS))
     try:
-        configured = int(os.environ.get(MAX_WORKERS_ENV, str(DEFAULT_ENVELOPE_WORKERS)))
-    except ValueError:
-        configured = DEFAULT_ENVELOPE_WORKERS
-    return max(1, configured)
+        configured = int(raw_value)
+    except (TypeError, ValueError):
+        configured = 0
+    return min(MAX_ENVELOPE_WORKERS, configured) if configured > 0 else _automatic_worker_count()
+
+
+def _automatic_worker_count() -> int:
+    return automatic_worker_count()
 
 
 def _positive_float(value: float | None, default: float) -> float:
@@ -320,10 +367,28 @@ def _nominal_voltage_from_key(voltage_key: str, default: float) -> float:
     return number if math.isfinite(number) and number > 0 else default
 
 
-def _chart_axis_limits(x_max: float | None, x_major: float | None) -> dict[str, float]:
+def _high_voltage_key(
+    voltage: object,
+    case: object,
+    run: object,
+    bus: object,
+) -> tuple[str, str, int, str] | None:
+    try:
+        run_number = int(run)
+    except (TypeError, ValueError):
+        return None
+    voltage_key = normalize_voltage(voltage)
+    case_key = str(case).strip().casefold()
+    bus_key = str(bus).strip().casefold()
+    if not voltage_key or not case_key or not bus_key:
+        return None
+    return voltage_key, case_key, run_number, bus_key
+
+
+def _chart_axis_limits(x_max: float | None, x_major: float | None) -> dict[str, float | None]:
     return {
-        "x_max": _positive_float(x_max, DEFAULT_ENVELOPE_CHART_X_MAX),
-        "x_major": _positive_float(x_major, DEFAULT_ENVELOPE_CHART_X_MAJOR),
+        "x_max": float(x_max) if x_max is not None and x_max > 0 else None,
+        "x_major": float(x_major) if x_major is not None and x_major > 0 else None,
     }
 
 
@@ -336,6 +401,8 @@ def _build_voltage_workbooks(
     voltage_key: str,
     voltage_configs,
     exclusion_matcher: ExclusionMatcher,
+    high_voltage_proposals: list[dict[str, object]],
+    high_voltage_include_overrides: set[tuple[str, str, int, str]],
     high_voltage_limit_factor: float,
     time_step: float,
     time_end: float,
@@ -348,7 +415,7 @@ def _build_voltage_workbooks(
     frequency_fallback: FrequencyFallbackFn | None = None,
     resonance_settings: resonance_checks.ResonanceSettings | None = None,
     event_times: dict[str, float] | None = None,
-    run_executor: ThreadPoolExecutor | None = None,
+    run_executor: Executor | None = None,
 ) -> _VoltageBuildResult:
     started = time.perf_counter()
     _cancel(check_cancel)
@@ -374,6 +441,7 @@ def _build_voltage_workbooks(
         worker_count,
         log,
         check_cancel,
+        high_voltage_include_overrides=high_voltage_include_overrides,
         high_voltage_limit_factor=high_voltage_limit_factor,
         time_step=time_step,
         time_end=time_end,
@@ -381,6 +449,7 @@ def _build_voltage_workbooks(
         frequency_fallback=frequency_fallback,
         inf_descriptor_cache=inf_descriptor_cache,
         executor=run_executor,
+        process_pool=isinstance(run_executor, ProcessPoolExecutor),
     )
     _log(log, f"Envelope source read finished: {voltage_key} kV | {_elapsed(read_started)}")
 
@@ -420,7 +489,31 @@ def _build_voltage_workbooks(
         if lg_df.empty or ll_df.empty:
             _log(log, f"No waveform envelope data: {scope.folder} | {voltage_key} kV")
             continue
-        high_voltage_df = _map_exclusion_fault_types(pd.DataFrame(high_voltage), df_stat, HIGH_VOLTAGE_COLUMNS)
+        high_voltage_df = _high_voltage_exclusion_dataframe(
+            high_voltage,
+            high_voltage_proposals,
+            voltage_key,
+            inf_paths,
+            df_stat,
+            available_keys={
+                key
+                for inf_path in inf_paths
+                if inf_path in inf_descriptor_cache
+                for descriptor in inf_descriptor_cache[inf_path]
+                if descriptor.Group.startswith(bus_prefix)
+                and "p_" in descriptor.Description
+                for case, run in [case_run_from_inf_path(inf_path)]
+                if (
+                    key := _high_voltage_key(
+                        voltage_key,
+                        case,
+                        run,
+                        descriptor.Group,
+                    )
+                )
+                is not None
+            },
+        )
         high_voltage_df = _filter_dataframe_by_scope(high_voltage_df, scope)
         nonconv_df = _filter_dataframe_by_scope(df_nonconv, scope)
 
@@ -530,13 +623,15 @@ def _read_voltage_run_cache(
     worker_count: int,
     log: LogFn | None,
     check_cancel: CancelFn | None,
+    high_voltage_include_overrides: set[tuple[str, str, int, str]] | None = None,
     high_voltage_limit_factor: float = HIGH_VOLTAGE_LIMIT_FACTOR,
     time_step: float = TIME_STEP,
     time_end: float = TIME_END,
     fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
     frequency_fallback: FrequencyFallbackFn | None = None,
     inf_descriptor_cache: dict[Path, list[InfDescriptor]] | None = None,
-    executor: ThreadPoolExecutor | None = None,
+    executor: Executor | None = None,
+    process_pool: bool = False,
 ) -> dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]]:
     limit = high_voltage_limit_factor * bus_um * math.sqrt(2)
     run_cache: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]] = {}
@@ -554,8 +649,30 @@ def _read_voltage_run_cache(
             if exclusion_matcher.excludes_run(voltage_key, case_name, run):
                 run_cache[inf_path] = ([], [])
                 continue
-            futures[
-                executor.submit(
+            if process_pool:
+                descriptors = (inf_descriptor_cache or {}).get(inf_path)
+                if descriptors is not None:
+                    descriptors = [
+                        descriptor
+                        for descriptor in descriptors
+                        if descriptor.Group.startswith(bus_prefix)
+                        and "p_" in descriptor.Description
+                    ]
+                future = executor.submit(
+                    _read_run_entries_process,
+                    inf_path,
+                    limit,
+                    voltage_key,
+                    bus_prefix,
+                    exclusion_matcher,
+                    time_step,
+                    time_end,
+                    fallback_frequency,
+                    descriptors,
+                    high_voltage_include_overrides,
+                )
+            else:
+                future = executor.submit(
                     _read_run_entries,
                     inf_path,
                     limit,
@@ -568,8 +685,9 @@ def _read_voltage_run_cache(
                     frequency_fallback,
                     check_cancel,
                     inf_descriptor_cache,
+                    high_voltage_include_overrides=high_voltage_include_overrides,
                 )
-            ] = inf_path
+            futures[future] = inf_path
         completed = len(run_cache)
         if completed and not futures:
             _log(log, f"Envelope source files read: {bus_prefix} | {completed}/{len(inf_paths)}")
@@ -577,7 +695,14 @@ def _read_voltage_run_cache(
             _cancel(check_cancel)
             inf_path = futures[future]
             try:
-                run_entries, run_exclusions = future.result()
+                result = future.result()
+                if process_pool:
+                    run_entries, run_exclusions, fallback_contexts = result
+                    if frequency_fallback is not None:
+                        for context in fallback_contexts:
+                            frequency_fallback(context)
+                else:
+                    run_entries, run_exclusions = result
             except ValueError as exc:
                 if "no results" not in str(exc).casefold():
                     raise
@@ -594,6 +719,39 @@ def _read_voltage_run_cache(
             executor.shutdown(wait=True)
 
     return run_cache
+
+
+def _read_run_entries_process(
+    inf_path: Path,
+    limit: float,
+    voltage_key: str,
+    bus_prefix: str,
+    exclusion_matcher: ExclusionMatcher,
+    time_step: float,
+    time_end: float,
+    fallback_frequency: float,
+    inf_descriptors: list[InfDescriptor] | None,
+    high_voltage_include_overrides: set[tuple[str, str, int, str]] | None,
+) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]], list[str]]:
+    fallback_contexts: list[str] = []
+    entries, exclusions = _read_run_entries(
+        inf_path,
+        limit,
+        voltage_key,
+        bus_prefix,
+        exclusion_matcher,
+        time_step=time_step,
+        time_end=time_end,
+        fallback_frequency=fallback_frequency,
+        frequency_fallback=fallback_contexts.append,
+        inf_descriptor_cache=(
+            {inf_path: inf_descriptors}
+            if inf_descriptors is not None
+            else None
+        ),
+        high_voltage_include_overrides=high_voltage_include_overrides,
+    )
+    return entries, exclusions, fallback_contexts
 
 
 def _entries_for_inf_paths(
@@ -621,6 +779,7 @@ def _read_run_entries(
     frequency_fallback: FrequencyFallbackFn | None = None,
     check_cancel: CancelFn | None = None,
     inf_descriptor_cache: dict[Path, list[InfDescriptor]] | None = None,
+    high_voltage_include_overrides: set[tuple[str, str, int, str]] | None = None,
 ) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]:
     _cancel(check_cancel)
     case_name, run = case_run_from_inf_path(inf_path)
@@ -644,7 +803,7 @@ def _read_run_entries(
         )
     _cancel(check_cancel)
     out_cache = _read_out_files(df_desc, inf_path, check_cancel)
-    candidates: list[tuple[str, str, pd.DataFrame]] = []
+    candidates: list[tuple[str, str, _BusWaveforms]] = []
     high_voltage: list[dict[str, Any]] = []
 
     for measurement in ("LGp", "LLp"):
@@ -653,7 +812,7 @@ def _read_run_entries(
         for bus in df_meas["Group"].unique():
             _cancel(check_cancel)
             df_bus = df_meas[df_meas["Group"] == bus]
-            envelope_df, exclusions = _build_bus_envelope(
+            waveforms, exclusions = _read_bus_waveforms(
                 df_bus,
                 bus,
                 out_cache,
@@ -662,19 +821,30 @@ def _read_run_entries(
                 case_name,
                 run,
                 measurement,
-                time_step,
-                time_end,
-                fallback_frequency,
-                frequency_fallback,
                 check_cancel,
             )
-            if envelope_df is not None:
-                candidates.append((measurement, bus, envelope_df))
-            high_voltage.extend(exclusions)
+            if waveforms is not None:
+                candidates.append((measurement, bus, waveforms))
+            key = _high_voltage_key(voltage_key, case_name, run, bus)
+            if key not in (high_voltage_include_overrides or set()):
+                high_voltage.extend(exclusions)
 
     entries: list[tuple[str, pd.DataFrame]] = []
-    for measurement, bus, envelope_df in candidates:
+    high_voltage_buses = {str(record["MM_name"]) for record in high_voltage}
+    for measurement, bus, waveforms in candidates:
         _cancel(check_cancel)
+        if bus in high_voltage_buses:
+            continue
+        envelope_df = _apply_bus_waveforms(
+            waveforms,
+            time_step,
+            time_end,
+            fallback_frequency,
+            frequency_fallback,
+            check_cancel,
+        )
+        if envelope_df is None:
+            continue
         envelope_df["MM_name"] = bus
         envelope_df["Case"] = f"{case_name}-{run}"
         entries.append((measurement, envelope_df))
@@ -745,7 +915,7 @@ def _read_out_files(
     for out_path, cols in file_col_map.items():
         _cancel(check_cancel)
         read_cols = sorted([0, *cols])
-        columns = load_out_columns(out_path, read_cols)
+        columns = load_out_columns(out_path, read_cols, check_cancel)
         time_values = np.round(columns[0], 6)
         out_cache[out_path] = (
             time_values,
@@ -758,7 +928,7 @@ def _read_out_files(
     return out_cache
 
 
-def _build_bus_envelope(
+def _read_bus_waveforms(
     df_bus: pd.DataFrame,
     bus: str,
     out_cache: dict[Path, OutFileData],
@@ -767,12 +937,8 @@ def _build_bus_envelope(
     case_name: str,
     run: int,
     measurement: str,
-    time_step: float,
-    time_end: float,
-    fallback_frequency: float,
-    frequency_fallback: FrequencyFallbackFn | None = None,
     check_cancel: CancelFn | None = None,
-) -> tuple[pd.DataFrame | None, list[dict[str, Any]]]:
+) -> tuple[_BusWaveforms | None, list[dict[str, Any]]]:
     times: list[np.ndarray] = []
     values: list[np.ndarray] = []
     absolute_values: list[np.ndarray] = []
@@ -809,30 +975,45 @@ def _build_bus_envelope(
     if not values:
         return None, exclusions
     context = f"{case_name} run {run} | {bus} | {measurement}"
+    return _BusWaveforms(times, values, absolute_values, signals, context), exclusions
+
+
+def _apply_bus_waveforms(
+    waveforms: _BusWaveforms,
+    time_step: float,
+    time_end: float,
+    fallback_frequency: float,
+    frequency_fallback: FrequencyFallbackFn | None = None,
+    check_cancel: CancelFn | None = None,
+) -> pd.DataFrame | None:
     _cancel(check_cancel)
-    if _arrays_share_timebase(times):
+    if _arrays_share_timebase(waveforms.times):
         envelope = _apply_envelope_arrays(
-            times[0],
-            values,
+            waveforms.times[0],
+            waveforms.values,
             time_step,
             time_end,
             fallback_frequency,
-            context,
+            waveforms.context,
             frequency_fallback,
-            absolute_phase_values=absolute_values,
+            absolute_phase_values=waveforms.absolute_values,
         )
         _cancel(check_cancel)
-        return envelope, exclusions
+        return envelope
     envelope = _apply_envelope(
-        _phase_dataframe_from_arrays(times, values, signals),
+        _phase_dataframe_from_arrays(
+            waveforms.times,
+            waveforms.values,
+            waveforms.signals,
+        ),
         time_step,
         time_end,
         fallback_frequency,
-        context,
+        waveforms.context,
         frequency_fallback,
     )
     _cancel(check_cancel)
-    return envelope, exclusions
+    return envelope
 
 
 def _arrays_share_timebase(times: list[np.ndarray]) -> bool:
@@ -1143,10 +1324,30 @@ def _find_non_convergent_cases(
     cb_iir_limit: float = NONCONV_CB_IIR_LIMIT,
     *,
     warnings: list[str] | None = None,
+    worker_count: int | None = None,
+    check_cancel: CancelFn | None = None,
 ) -> pd.DataFrame:
+    paths = sorted(case_root.rglob("CB_*.out"))
     records: list[dict[str, Any]] = []
-    for path in sorted(case_root.rglob("CB_*.out")):
-        file_records, warning = _read_non_convergent_file(path, cb_iip_limit, cb_iir_limit)
+    results: dict[Path, tuple[list[dict[str, Any]], str | None]] = {}
+    if worker_count is not None and worker_count > 1 and len(paths) > 1:
+        workers = _worker_count(len(paths), worker_count)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_read_non_convergent_file, path, cb_iip_limit, cb_iir_limit): path
+                for path in paths
+            }
+            for future in as_completed(futures):
+                _cancel(check_cancel)
+                results[futures[future]] = future.result()
+    else:
+        for path in paths:
+            _cancel(check_cancel)
+            results[path] = _read_non_convergent_file(path, cb_iip_limit, cb_iir_limit)
+
+    for path in paths:
+        _cancel(check_cancel)
+        file_records, warning = results[path]
         records.extend(file_records)
         if warning and warnings is not None:
             warnings.append(warning)
@@ -1233,6 +1434,66 @@ def _nonconv_keys(df_nonconv: pd.DataFrame) -> set[tuple[str, int]]:
     return set(zip(df_nonconv["Case"], df_nonconv["Run"].astype(int)))
 
 
+def _high_voltage_exclusion_dataframe(
+    detected_rows: list[dict[str, Any]],
+    proposals: list[dict[str, object]],
+    voltage_key: str,
+    inf_paths: list[Path],
+    df_stat: pd.DataFrame,
+    available_keys: set[tuple[str, str, int, str]] | None = None,
+) -> pd.DataFrame:
+    """Build the original detailed HV sheet and retain applied log-only rows."""
+    actual_rows = [dict(row) for row in detected_rows]
+    detected_keys = {
+        key
+        for row in detected_rows
+        if (
+            key := _high_voltage_key(
+                voltage_key,
+                row.get("Case", ""),
+                row.get("Run", ""),
+                row.get("MM_name", ""),
+            )
+        )
+        is not None
+    }
+    scope_runs = {
+        (case.casefold(), run)
+        for inf_path in inf_paths
+        for case, run in [case_run_from_inf_path(inf_path)]
+    }
+    normalized_voltage = normalize_voltage(voltage_key)
+    for proposal in proposals:
+        key = _high_voltage_key(
+            proposal.get("Voltage", ""),
+            proposal.get("Case", ""),
+            proposal.get("Run", ""),
+            proposal.get("MM_name", ""),
+        )
+        if (
+            key is None
+            or key[0] != normalized_voltage
+            or (key[1], key[2]) not in scope_runs
+            or (available_keys is not None and key not in available_keys)
+            or not bool(proposal.get("Applied", False))
+            or key in detected_keys
+        ):
+            continue
+        actual_rows.append(
+            {
+                column: proposal.get(column, "")
+                for column in HIGH_VOLTAGE_COLUMNS
+                if column != "Fault_type"
+            }
+        )
+        detected_keys.add(key)
+    return _map_exclusion_fault_types(
+        pd.DataFrame(actual_rows),
+        df_stat,
+        HIGH_VOLTAGE_COLUMNS,
+    )
+
+
 def _map_exclusion_fault_types(df: pd.DataFrame, df_stat: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=columns)
@@ -1281,9 +1542,7 @@ def _format_workbook(workbook: Any) -> None:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}1"
         for col_idx in range(1, ws.max_column + 1):
-            header = ws.cell(1, col_idx).value
             cell = ws.cell(1, col_idx)
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="D9EAF7")
             cell.alignment = Alignment(horizontal="center")
-            ws.column_dimensions[get_column_letter(col_idx)].width = max(12, min(28, len(str(header or "")) + 2))

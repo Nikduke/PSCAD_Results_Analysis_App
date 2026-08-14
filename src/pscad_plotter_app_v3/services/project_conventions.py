@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 
-RUN_PATTERN = re.compile(r"^(?P<case>.+?)_r(?P<run>\d+)$")
+RUN_PATTERN = re.compile(r"^(?P<case>.+?)_r(?P<run>\d+)$", re.IGNORECASE)
 MANUAL_RUN_PATTERN = re.compile(r"^(?P<base>.+?)(?:_r\d+)?_m(?P<run>\d+)(?:_.+)?$", re.IGNORECASE)
 FAULT_CODE_LABELS = {
     "0": "No fault",
@@ -50,6 +50,13 @@ def parse_case_run_from_stem(stem: str) -> tuple[str, int] | None:
     if not match:
         return None
     return match.group("case"), int(match.group("run"))
+
+
+def case_run_from_inf_path(inf_path: Path) -> tuple[str, int]:
+    parsed = parse_case_run_from_stem(inf_path.stem)
+    if parsed is None:
+        raise ValueError(f"Cannot read case/run from {inf_path.name}")
+    return parsed
 
 
 def parse_manual_run_from_stem(stem: str, project_stem: str) -> tuple[str, int] | None:

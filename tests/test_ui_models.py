@@ -8,11 +8,11 @@ def test_session_event_times_round_trip() -> None:
     session = AppSession.default()
     session.event_times["SFO"] = 0.005
     session.envelope_workers = 32
+    session.envelope_workers_auto = False
     session.envelope_time_step = 0.001
     session.envelope_time_end = 0.5
+    session.envelope_time_end_auto = False
     session.envelope_fallback_frequency = 60.0
-    session.envelope_chart_x_max = 1.0
-    session.envelope_chart_x_major = 0.1
     session.envelope_chart_top_left_cell = "J2"
     session.envelope_chart_width = 800.0
     session.envelope_chart_height = 400.0
@@ -40,6 +40,8 @@ def test_session_event_times_round_trip() -> None:
     session.resonance_min_level_over_vlim = 0.6
     session.resonance_min_growth_delta_factor = 0.02
     project = r"C:\Project"
+    session.envelope_chart_x_max_overrides_by_project = {project: 1.0}
+    session.envelope_chart_x_major_overrides_by_project = {project: 0.1}
     session.manual_exclusions_by_project = {
         project: [
             ExclusionRule(case="C5_S1_66OFT2", run=4),
@@ -49,6 +51,9 @@ def test_session_event_times_round_trip() -> None:
     }
     session.disabled_nonconv_by_project = {project: [("C7_S1_66OFT2", 8)]}
     session.high_voltage_exclusions_by_project = {project: [("230", "C1", 39, "MM_230_StA")]}
+    session.high_voltage_include_overrides_by_project = {
+        project: [("66", "C2", 4, "MM_66_Interested")]
+    }
     session.voltage_um_overrides_by_project = {project: {"330": 362.0}}
 
     loaded = AppSession.from_dict(session.to_dict())
@@ -57,11 +62,13 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.event_times["SFO"] == 0.005
     assert loaded.event_times["SA"] == 0.1
     assert loaded.envelope_workers == 32
+    assert loaded.envelope_workers_auto is False
     assert loaded.envelope_time_step == 0.001
     assert loaded.envelope_time_end == 0.5
+    assert loaded.envelope_time_end_auto is False
     assert loaded.envelope_fallback_frequency == 60.0
-    assert loaded.envelope_chart_x_max == 1.0
-    assert loaded.envelope_chart_x_major == 0.1
+    assert loaded.envelope_chart_x_max_overrides_by_project == {project: 1.0}
+    assert loaded.envelope_chart_x_major_overrides_by_project == {project: 0.1}
     assert loaded.envelope_chart_top_left_cell == "J2"
     assert loaded.envelope_chart_width == 800.0
     assert loaded.envelope_chart_height == 400.0
@@ -92,9 +99,29 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.manual_exclusions_by_project == session.manual_exclusions_by_project
     assert loaded.disabled_nonconv_by_project == {project: [("C7_S1_66OFT2", 8)]}
     assert loaded.high_voltage_exclusions_by_project == {project: [("230", "C1", 39, "MM_230_StA")]}
+    assert loaded.high_voltage_include_overrides_by_project == {
+        project: [("66", "C2", 4, "MM_66_Interested")]
+    }
     assert loaded.voltage_um_overrides_by_project == {project: {"330": 362.0}}
     assert "bus_exclusions_by_project" not in loaded.to_dict()
     assert "manual_case_run_exclusions_by_project" not in loaded.to_dict()
+
+
+def test_session_ignores_legacy_global_chart_axis_settings() -> None:
+    from results_analysis_app.models import AppSession
+
+    loaded = AppSession.from_dict(
+        {
+            "projects": [{"path": r"C:\Project", "selected": True}],
+            "envelope_chart_x_max": 2.0,
+            "envelope_chart_x_major": 0.2,
+        }
+    )
+
+    assert loaded.envelope_chart_x_max_overrides_by_project == {}
+    assert loaded.envelope_chart_x_major_overrides_by_project == {}
+    assert "envelope_chart_x_max" not in loaded.to_dict()
+    assert "envelope_chart_x_major" not in loaded.to_dict()
 
 
 def test_session_migrates_legacy_exclusions() -> None:
@@ -122,10 +149,171 @@ def test_session_migrates_legacy_exclusions() -> None:
     }
 
 
-def test_session_default_envelope_workers_are_bounded() -> None:
+def test_removing_project_purges_all_project_specific_session_state() -> None:
+    from results_analysis_app.exclusions import ExclusionRule
+    from results_analysis_app.models import AppSession, ProjectEntry
+
+    project = r"C:\Project"
+    session = AppSession.default()
+    session.projects = [ProjectEntry(project)]
+    session.envelope_chart_x_max_overrides_by_project = {project: 0.5}
+    session.envelope_chart_x_major_overrides_by_project = {project: 0.05}
+    session.voltage_um_overrides_by_project = {project: {"66": 72.5}}
+    session.manual_exclusions_by_project = {project: [ExclusionRule(case="C1")]}
+    session.disabled_nonconv_by_project = {project: [("C1", 1)]}
+    session.high_voltage_exclusions_by_project = {project: [("66", "C1", 1, "MM_66_A")]}
+    session.high_voltage_include_overrides_by_project = {
+        project: [("230", "C2", 2, "MM_230_B")]
+    }
+    session.status_cache = {project: ["Ready"]}
+
+    session.remove_projects({project.lower()})
+
+    assert session.projects == []
+    for mapping in (
+        session.envelope_chart_x_max_overrides_by_project,
+        session.envelope_chart_x_major_overrides_by_project,
+        session.voltage_um_overrides_by_project,
+        session.manual_exclusions_by_project,
+        session.disabled_nonconv_by_project,
+        session.high_voltage_exclusions_by_project,
+        session.high_voltage_include_overrides_by_project,
+        session.status_cache,
+    ):
+        assert mapping == {}
+
+
+def test_session_default_envelope_workers_use_automatic_selection() -> None:
     from results_analysis_app.models import AppSession
 
-    assert AppSession.default().envelope_workers == 4
+    assert AppSession.default().envelope_workers == 0
+    assert AppSession.default().envelope_workers_auto is True
+    assert AppSession.default().envelope_time_end_auto is True
+
+
+def test_chart_axis_settings_use_project_duration_and_per_project_overrides() -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+    from results_analysis_app.scanner import ProjectScan
+
+    automatic_project = str(Path(r"C:\Automatic").resolve())
+    manual_project = str(Path(r"C:\Manual").resolve())
+    session = AppSession.default()
+    session.envelope_chart_x_max_overrides_by_project[manual_project] = 0.8
+    session.envelope_chart_x_major_overrides_by_project[manual_project] = 0.1
+    window = SimpleNamespace(
+        session=session,
+        project_scans={
+            automatic_project: ProjectScan(
+                path=Path(automatic_project),
+                exists=True,
+                final_duration=0.5,
+            ),
+            manual_project: ProjectScan(
+                path=Path(manual_project),
+                exists=True,
+                final_duration=0.4,
+            ),
+        },
+    )
+
+    values = MainWindow._project_chart_axis_kwargs(
+        window,
+        [automatic_project, manual_project],
+    )
+
+    assert values["envelope_chart_x_max_by_project"] == {
+        automatic_project: 0.5,
+        manual_project: 0.8,
+    }
+    assert values["envelope_chart_x_major_by_project"] == {
+        automatic_project: None,
+        manual_project: 0.1,
+    }
+
+
+def test_add_project_accepts_multiple_folders_without_rescanning_duplicates(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import main_window, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    first = tmp_path / "First"
+    second = tmp_path / "Second"
+    first.mkdir()
+    second.mkdir()
+    session = AppSession.default()
+    session.add_project(str(first))
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main_window,
+        "_select_project_directories",
+        lambda *_args: [str(first), str(second), str(second)],
+    )
+    window = MainWindow()
+    scan_requests = []
+    window.refresh_project_scans = lambda project_paths=None, **_kwargs: scan_requests.append(
+        project_paths
+    )
+    try:
+        window.add_project()
+
+        assert [project.path for project in window.session.projects] == [
+            str(first.resolve()),
+            str(second.resolve()),
+        ]
+        assert scan_requests == [[str(second.resolve())]]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_project_folder_dialog_returns_multiple_selected_folders(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from pathlib import Path
+
+    from PySide6 import QtCore, QtWidgets
+
+    from results_analysis_app.main_window import _select_project_directories
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    expected = {tmp_path / "First", tmp_path / "Second"}
+    for path in expected:
+        path.mkdir()
+
+    def select_folders(dialog) -> int:
+        dialog.show()
+        app.processEvents()
+        view = dialog.findChild(QtWidgets.QListView, "listView")
+        assert view.selectionMode() == QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        selection = view.selectionModel()
+        selection.clearSelection()
+        for path in expected:
+            index = view.model().index(str(path.resolve()))
+            assert index.isValid()
+            selection.select(
+                index,
+                QtCore.QItemSelectionModel.SelectionFlag.Select
+                | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+            )
+        return QtWidgets.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "exec", select_folders)
+
+    selected = _select_project_directories(None, tmp_path)
+
+    assert {Path(path) for path in selected} == {path.resolve() for path in expected}
 
 
 def test_exclusion_normalizers_drop_invalid_values() -> None:
@@ -264,6 +452,322 @@ def test_exclusion_table_is_universal_and_supports_tsv_paste(monkeypatch) -> Non
         ):
             labels = {button.text() for button in tab.findChildren(QtWidgets.QPushButton)}
             assert {"Apply all", "Apply none"} <= labels
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_high_voltage_fault_column_uses_statistic_run_mapping(monkeypatch) -> None:
+    import pandas as pd
+
+    from results_analysis_app import voltage_envelope
+    from results_analysis_app.main_window import _fault_types_by_case_run
+
+    monkeypatch.setattr(
+        voltage_envelope,
+        "_read_stat_files",
+        lambda _project: pd.DataFrame(
+            {
+                "Case": ["C1", "C1"],
+                "Run#": [1, 2],
+                "Fault_type": ["AG", "None"],
+            }
+        ),
+    )
+
+    assert _fault_types_by_case_run(r"C:\Project") == {
+        ("c1", 1): "AG",
+        ("c1", 2): "None",
+    }
+
+
+def test_high_voltage_project_switch_reuses_cached_rows_and_fault_types(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import main_window as main_window_module, scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str((tmp_path / "Project").resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+
+    calls = {"fault_types": 0, "groups": 0}
+    original_fault_types = main_window_module._fault_types_by_case_run
+    original_group = main_window_module._group_high_voltage_proposals
+
+    def counted_fault_types(path: str):
+        calls["fault_types"] += 1
+        return original_fault_types(path)
+
+    def counted_group(rows):
+        calls["groups"] += 1
+        return original_group(rows)
+
+    monkeypatch.setattr(main_window_module, "_fault_types_by_case_run", counted_fault_types)
+    monkeypatch.setattr(main_window_module, "_group_high_voltage_proposals", counted_group)
+    rows = [
+        scanner.HighVoltageExclusion(
+            voltage="66",
+            case="C1",
+            run=1,
+            bus="MM_66_A",
+            source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+        )
+    ]
+    window = MainWindow()
+    try:
+        window._select_project_path(project)
+        window._set_high_voltage_proposal_rows(rows)
+        window._set_high_voltage_proposal_rows(rows)
+        assert calls == {"fault_types": 1, "groups": 1}
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_high_voltage_rows_with_fault_types_skip_statistic_read(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import main_window as main_window_module, scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str((tmp_path / "Project").resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+
+    calls = {"fault_types": 0}
+
+    def counted_fault_types(_path: str):
+        calls["fault_types"] += 1
+        return {}
+
+    monkeypatch.setattr(main_window_module, "_fault_types_by_case_run", counted_fault_types)
+    rows = [
+        scanner.HighVoltageExclusion(
+            voltage="66",
+            case="C1",
+            run=1,
+            bus="MM_66_A",
+            fault_type="AG",
+            source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+        )
+    ]
+    window = MainWindow()
+    try:
+        window._select_project_path(project)
+        window._set_high_voltage_proposal_rows(rows)
+        assert calls == {"fault_types": 0}
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_high_voltage_table_checks_log_and_applied_analysis_exclusions(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtCore, QtWidgets
+
+    from results_analysis_app import scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str((tmp_path / "Project").resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    session.high_voltage_exclusions_by_project = {
+        project: [("66", "Earlier", 1, "MM_66_A")]
+    }
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        window._select_project_path(project)
+        window._set_high_voltage_proposal_rows(
+            [
+                scanner.HighVoltageExclusion(
+                    voltage="66",
+                    case="Earlier",
+                    run=1,
+                    bus="MM_66_A",
+                    fault_type="AG",
+                    max_abs="600",
+                    limit="500",
+                    signal="Va",
+                    source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+                ),
+                scanner.HighVoltageExclusion(
+                    voltage="230",
+                    case="Additional",
+                    run=2,
+                    bus="MM_230_B",
+                    max_abs="1800",
+                    limit="1700",
+                    signal="Va",
+                    source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+                    excluded=True,
+                ),
+                scanner.HighVoltageExclusion(
+                    voltage="230",
+                    case="Additional",
+                    run=2,
+                    bus="MM_230_B",
+                    max_abs="1900",
+                    limit="1700",
+                    signal="Vb",
+                    source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+                    excluded=True,
+                ),
+                scanner.HighVoltageExclusion(
+                    voltage="161",
+                    case="LogOnly",
+                    run=3,
+                    bus="MM_161_C",
+                    max_abs="1200",
+                    limit="1100",
+                    signal="Vc",
+                    source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+                ),
+            ]
+        )
+
+        assert window.high_voltage_proposal_table.rowCount() == 3
+        rows = {
+            window.high_voltage_proposal_table.item(row, 2).text(): row
+            for row in range(window.high_voltage_proposal_table.rowCount())
+        }
+        earlier = rows["Earlier"]
+        additional = rows["Additional"]
+        log_only = rows["LogOnly"]
+        assert (
+            window.high_voltage_proposal_table.item(earlier, 0).checkState()
+            == QtCore.Qt.CheckState.Checked
+        )
+        assert (
+            window.high_voltage_proposal_table.item(additional, 0).checkState()
+            == QtCore.Qt.CheckState.Checked
+        )
+        assert (
+            window.high_voltage_proposal_table.item(log_only, 0).checkState()
+            == QtCore.Qt.CheckState.Checked
+        )
+        assert window.high_voltage_proposal_table.item(earlier, 4).text() == "AG"
+        assert window.high_voltage_proposal_table.item(earlier, 9).text() == "PSCAD log"
+        assert window.high_voltage_proposal_table.item(additional, 6).text() == "1900"
+        assert window.high_voltage_proposal_table.item(additional, 8).text() == "Va, Vb"
+        assert window.high_voltage_proposal_table.item(additional, 9).text() == "Analysis"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_applied_pscad_log_hv_rows_are_left_for_detailed_envelope_scan(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str((tmp_path / "Project").resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    session.high_voltage_exclusions_by_project = {
+        project: [("66", "C1", 1, "MM_66_A")]
+    }
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        window.project_scans = {
+            project: scanner.ProjectScan(
+                path=tmp_path / "Project",
+                exists=True,
+                high_voltage_exclusions=[
+                    scanner.HighVoltageExclusion(
+                        voltage="66",
+                        case="C1",
+                        run=1,
+                        bus="MM_66_A",
+                        file=scanner.PSCAD_LOG_HIGH_VOLTAGE_SOURCE,
+                        source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+                    )
+                ],
+            )
+        }
+
+        assert window._effective_exclusions_by_project() == {}
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_unchecking_high_voltage_row_creates_include_override(monkeypatch, tmp_path) -> None:
+    from PySide6 import QtCore, QtWidgets
+
+    from results_analysis_app import scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str((tmp_path / "Project").resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    proposal = scanner.HighVoltageExclusion(
+        voltage="66",
+        case="C1",
+        run=1,
+        bus="MM_66_A",
+        source=scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
+    )
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        window.project_scans[project] = scanner.ProjectScan(
+            path=tmp_path / "Project",
+            exists=True,
+            high_voltage_exclusions=[proposal],
+        )
+        window._select_project_path(project)
+        window._set_high_voltage_proposal_rows([proposal])
+        apply_item = window.high_voltage_proposal_table.item(0, 0)
+
+        assert apply_item.checkState() == QtCore.Qt.CheckState.Checked
+        apply_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        app.processEvents()
+
+        assert window.session.high_voltage_include_overrides_by_project[project] == [
+            ("66", "C1", 1, "MM_66_A")
+        ]
+        assert project not in window.session.high_voltage_exclusions_by_project
+        assert window._effective_exclusions_by_project().get(project, []) == []
+
+        apply_item.setCheckState(QtCore.Qt.CheckState.Checked)
+        app.processEvents()
+
+        assert project not in window.session.high_voltage_include_overrides_by_project
+        assert window.session.high_voltage_exclusions_by_project[project] == [
+            ("66", "C1", 1, "MM_66_A")
+        ]
     finally:
         window.close()
         app.processEvents()
@@ -439,6 +943,92 @@ def test_background_task_preserves_traceback() -> None:
     assert failures[0][0] == "nested failure"
     assert "ValueError: nested failure" in failures[0][1]
     assert "in fail" in failures[0][1]
+
+
+def test_background_task_reports_cancellation_separately() -> None:
+    from results_analysis_app.background import BackgroundTask, CancelToken
+
+    cancelled = []
+    failures = []
+    token = CancelToken()
+    token.cancel()
+
+    def stop(_log, cancel):
+        cancel.throw_if_cancelled()
+
+    task = BackgroundTask(stop, token)
+    task.cancelled.connect(lambda: cancelled.append(True))
+    task.failed.connect(lambda message, details: failures.append((message, details)))
+    task.run()
+
+    assert cancelled == [True]
+    assert failures == []
+
+
+def test_dashboard_refresh_callback_preserves_failed_project_state() -> None:
+    from types import SimpleNamespace
+
+    from results_analysis_app.main_window import MainWindow
+
+    calls = {}
+    window = SimpleNamespace(
+        _update_dashboard_figures=lambda result: calls.setdefault("figures", result),
+        _refresh_project_status_after_action=lambda paths, **kwargs: calls.update(
+            paths=list(paths), kwargs=kwargs
+        ),
+        _load_dashboard_figure_list=lambda _path: None,
+        _current_project_path=lambda: None,
+    )
+
+    MainWindow._dashboard_refresh_finished(
+        window,
+        {
+            "good": ([], [], True),
+            "failed": ([], ["warning"], False),
+        },
+    )
+
+    assert calls["paths"] == ["good"]
+    assert calls["kwargs"] == {
+        "refresh_dashboards": True,
+        "dashboard_failed_paths": ["failed"],
+    }
+    assert set(calls["figures"]) == {"good", "failed"}
+
+
+def test_invalid_manual_session_load_preserves_active_session(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    active = AppSession.default()
+    active.events = ["SFO"]
+    logs = []
+    warnings = []
+    path = tmp_path / "invalid.analysis_session.json"
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(path), ""),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: warnings.append(True),
+    )
+    monkeypatch.setattr(storage, "load_session", lambda _path: (_ for _ in ()).throw(TypeError("bad shape")))
+    window = SimpleNamespace(session=active, log=logs.append)
+
+    MainWindow.load_session_from_file(window)
+
+    assert window.session is active
+    assert window.session.events == ["SFO"]
+    assert warnings == [True]
+    assert any("could not be loaded" in message for message in logs)
 
 
 def test_close_event_defers_while_worker_is_running() -> None:

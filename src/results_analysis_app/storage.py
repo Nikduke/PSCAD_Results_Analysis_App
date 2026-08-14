@@ -43,7 +43,7 @@ def load_autosave() -> AppSession:
         return AppSession.default()
     try:
         return AppSession.from_dict(read_json(AUTOSAVE_PATH))
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
         return AppSession.default()
 
 

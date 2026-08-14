@@ -92,6 +92,17 @@ def load_project_frequency(project_root: str | Path) -> float | None:
     return load_project_timing(project_root).frequency
 
 
+def automatic_time_major(x_max: float | None) -> float | None:
+    """Return a readable major interval close to one tenth of the time range."""
+    if x_max is None or not math.isfinite(x_max) or x_max <= 0:
+        return None
+    target = x_max / 10.0
+    exponent = math.floor(math.log10(target))
+    scale = 10.0**exponent
+    step = min((1.0, 2.0, 2.5, 5.0, 10.0), key=lambda value: abs(value * scale - target))
+    return float(f"{step * scale:.12g}")
+
+
 def discover_voltage_prefixes(project_root: str | Path) -> dict[str, str]:
     root = Path(project_root).resolve()
     return discover_voltage_prefixes_from_files(sorted((root / "Case_folder").rglob("*.inf")))

@@ -49,19 +49,21 @@ def test_rebuild_analysis_charts_updates_existing_resonance_workbook(tmp_path, m
 
     calls = []
 
-    def fake_create_resonance_check_charts(path, excel, x_max=None):
-        calls.append((path, excel, x_max))
+    def fake_create_resonance_check_charts(path, excel, x_max=None, x_major=None):
+        calls.append((path, excel, x_max, x_major))
         return True
 
     monkeypatch.setattr(actions, "excel_app", DummyExcel)
     monkeypatch.setattr(actions, "create_resonance_check_charts", fake_create_resonance_check_charts)
+    project_key = str(project.resolve())
 
     assert actions.rebuild_analysis_charts(
         [project],
         [ScopeEntry.full()],
-        envelope_chart_x_max=0.5,
+        envelope_chart_x_max_by_project={project_key: 0.5},
+        envelope_chart_x_major_by_project={project_key: 0.05},
     ) == [workbook_path]
-    assert calls == [(workbook_path, excel_obj, 0.5)]
+    assert calls == [(workbook_path, excel_obj, 0.5, 0.05)]
 
 
 def test_resonance_post_event_uses_chronological_envelope() -> None:

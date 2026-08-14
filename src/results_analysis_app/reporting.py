@@ -16,6 +16,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
 from results_analysis_app import resonance_checks
+from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import ScopeEntry
 from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
@@ -27,12 +28,23 @@ REPORT_HEADING_GREEN = RGBColor(112, 155, 50)
 BUS_VOLTAGE_SLICER_SOURCE_TEXT = "Bus voltage [kV]"
 BUS_VOLTAGE_SLICER_VALUE_OVERRIDES = {"22": "23"}
 DASHBOARD_FILTER_SETTLE_S = 0.8
+DASHBOARD_REPORT_TITLE_ORDER = {
+    "initial voltages": 0,
+    "initial reactive power": 1,
+    "initial active power": 2,
+}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SIGNATURE = b"\xff\xd8"
 WORD_2012_NAMESPACE = "http://schemas.microsoft.com/office/word/2012/wordml"
 WORD_2016_CID_NAMESPACE = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
 
 LogFn = Callable[[str], None]
+CancelFn = Callable[[], None]
+
+
+def _cancel(check_cancel: CancelFn | None) -> None:
+    if check_cancel is not None:
+        check_cancel()
 
 
 @dataclass(frozen=True)
@@ -682,22 +694,6 @@ def _as_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _header_map(row: tuple[Any, ...]) -> dict[str, int]:
-    return {
-        str(value).strip().casefold(): index
-        for index, value in enumerate(row)
-        if value is not None and str(value).strip()
-    }
-
-
-def _row_value(row: tuple[Any, ...], headers: dict[str, int], *names: str) -> Any:
-    for name in names:
-        index = headers.get(name.casefold())
-        if index is not None and index < len(row):
-            return row[index]
-    return None
-
-
 def _envelope_summary_rows(
     workbook_path: Path,
     event_times: dict[str, float] | None = None,
@@ -724,7 +720,7 @@ def _envelope_summary_rows(
     ]
     workbook = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
     try:
-        output: list[EnvelopeSummaryRow] = []
+        selected_by_sheet: dict[str, dict[str, float]] = {}
         for event_name, event_time in selected_times:
             sheet_name = (measurement_overrides or {}).get(
                 event_name,
@@ -732,34 +728,24 @@ def _envelope_summary_rows(
             )
             if sheet_name not in workbook.sheetnames:
                 continue
-            worksheet = workbook[sheet_name]
-            rows = worksheet.iter_rows(values_only=True)
-            try:
-                headers = _header_map(tuple(next(rows)))
-            except StopIteration:
-                continue
-            time_col = headers.get("time (s)")
-            if time_col is None:
-                continue
+            selected_by_sheet.setdefault(sheet_name, {})[event_name] = event_time
 
-            best_error = 0.001
-            best_row: tuple[Any, ...] | None = None
-            for row_values in rows:
-                row = tuple(row_values)
-                if time_col >= len(row):
-                    continue
-                actual_time = _as_float(row[time_col])
-                if actual_time is None:
-                    continue
-                error = abs(actual_time - event_time)
-                if error <= best_error:
-                    best_error = error
-                    best_row = row
-            if best_row is None:
-                continue
+        matched: dict[str, tuple[str, dict[str, int], tuple[Any, ...]]] = {}
+        for sheet_name, targets in selected_by_sheet.items():
+            headers, rows = nearest_rows(workbook[sheet_name], targets)
+            for event_name, row in rows.items():
+                if row is not None:
+                    matched[event_name] = (sheet_name, headers, row)
 
-            peak = _as_float(_row_value(best_row, headers, "Max_all", "Max"))
-            time_s = _as_float(_row_value(best_row, headers, "Time (s)"))
+        output: list[EnvelopeSummaryRow] = []
+        for event_name, _event_time in selected_times:
+            match = matched.get(event_name)
+            if match is None:
+                continue
+            sheet_name, headers, best_row = match
+
+            peak = _as_float(row_value(best_row, headers, "Max_all", "Max"))
+            time_s = _as_float(row_value(best_row, headers, "Time (s)"))
             if peak is None or time_s is None:
                 continue
             output.append(
@@ -813,7 +799,7 @@ def _dashboard_figure_caption(title: str, voltage: str) -> str:
     key = normalized.casefold()
     fixed_captions = {
         "initial voltages": "Initial voltage across voltage levels in the OWF",
-        "initial reactive power": "Initial reactive power in the system",
+        "initial reactive power": "Initial reactive power at the POC",
         "initial active power": "Initial active power at the PoC",
     }
     if key in fixed_captions:
@@ -933,7 +919,14 @@ def _export_envelope_chart(
     export_dir: Path,
     log: LogFn | None = None,
     get_excel: Callable[[], object] | None = None,
+    check_cancel: CancelFn | None = None,
 ) -> Path | None:
+    base_workbook_path = (
+        project_root
+        / "Voltage_envelope"
+        / scope.folder
+        / f"MM_{voltage}.xlsx"
+    )
     workbook_path = (
         project_root
         / "Voltage_envelope"
@@ -942,6 +935,17 @@ def _export_envelope_chart(
     )
     if not workbook_path.is_file():
         return None
+    if (
+        base_workbook_path.is_file()
+        and workbook_path.stat().st_mtime_ns < base_workbook_path.stat().st_mtime_ns
+    ):
+        _log(
+            log,
+            f"Envelope chart is older than its data and was skipped: "
+            f"{scope.folder} / {workbook_path.name}. Rebuild envelope charts.",
+        )
+        return None
+    _cancel(check_cancel)
     export_dir.mkdir(parents=True, exist_ok=True)
     output_path = export_dir / f"Envelope_{scope.folder}_{voltage}_kV.png"
     try:
@@ -958,6 +962,7 @@ def _export_envelope_chart(
                 chart_object = worksheet.ChartObjects(1)
                 _log(log, f"Exporting envelope chart: {scope.folder} | {voltage} kV")
                 for _attempt in range(2):
+                    _cancel(check_cancel)
                     try:
                         chart_object.Activate()
                     except EXCEL_AUTOMATION_ERRORS:
@@ -995,6 +1000,7 @@ def _export_dashboard_figures(
     log: LogFn | None = None,
     get_excel: Callable[[], object] | None = None,
     get_dashboard_workbook: Callable[[Path, str], object] | None = None,
+    check_cancel: CancelFn | None = None,
 ) -> list[tuple[str, Path]]:
     selected_ids = [figure_id for figure_id in figure_ids if figure_id]
     if not selected_ids:
@@ -1005,6 +1011,7 @@ def _export_dashboard_figures(
         with _excel_context(get_excel) as excel:
             grouped: dict[str, list[tuple[str, int, str, str]]] = {}
             for figure_id in selected_ids:
+                _cancel(check_cancel)
                 try:
                     workbook_name, sheet_name, chart_index, title = _parse_dashboard_figure_id(figure_id)
                 except ValueError as exc:
@@ -1013,6 +1020,7 @@ def _export_dashboard_figures(
                 grouped.setdefault(workbook_name, []).append((sheet_name, chart_index, title, figure_id))
 
             for workbook_name, figures in grouped.items():
+                _cancel(check_cancel)
                 workbook_path = project_root / "Dashboards" / workbook_name
                 if not workbook_path.is_file():
                     _log(log, f"Dashboard workbook not found, skipping: {workbook_name}")
@@ -1053,6 +1061,7 @@ def _export_dashboard_figures(
                     try:
                         filtered_sheets: set[str] = set()
                         for sheet_name, chart_index, title, figure_id in figures_to_export:
+                            _cancel(check_cancel)
                             try:
                                 sheet_key = sheet_name.strip().casefold()
                                 if apply_voltage_filter and sheet_key not in filtered_sheets:
@@ -1099,6 +1108,7 @@ def build_reports_from_existing_plots(
     resonance_settings: dict[str, object] | None = None,
     event_times: dict[str, float] | None = None,
     log: LogFn | None = None,
+    check_cancel: CancelFn | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -1111,6 +1121,7 @@ def build_reports_from_existing_plots(
     selected_events = list(events)
     selected_voltages = list(voltages)
     parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
+    _cancel(check_cancel)
 
     with ExitStack() as stack:
         excel = None
@@ -1118,11 +1129,13 @@ def build_reports_from_existing_plots(
 
         def get_excel():
             nonlocal excel
+            _cancel(check_cancel)
             if excel is None:
                 excel = stack.enter_context(excel_app())
             return excel
 
         def get_dashboard_workbook(project_root: Path, workbook_name: str):
+            _cancel(check_cancel)
             key = (project_root, workbook_name)
             workbook = dashboard_workbooks.get(key)
             if workbook is None:
@@ -1133,12 +1146,20 @@ def build_reports_from_existing_plots(
             return workbook
 
         for project_root in project_roots:
+            _cancel(check_cancel)
             root = Path(project_root).resolve()
             for scope in selected_scopes:
+                _cancel(check_cancel)
                 report_dir = root / "Reports" / scope.folder
                 report_dir.mkdir(parents=True, exist_ok=True)
+                for temporary_dir in (
+                    report_dir / "_envelope_exports",
+                    report_dir / "_dashboard_exports",
+                ):
+                    stack.callback(shutil.rmtree, temporary_dir, ignore_errors=True)
                 image_cache: dict[Path, list[Path]] = {}
                 for voltage in selected_voltages:
+                    _cancel(check_cancel)
                     _log(log, f"Building report: {root.name} | {scope.folder} | {voltage} kV")
                     doc = Document()
                     section = doc.sections[0]
@@ -1177,28 +1198,15 @@ def build_reports_from_existing_plots(
                         log,
                         get_excel,
                         get_dashboard_workbook,
+                        check_cancel,
                     )
-                    if dashboard_figures:
-                        _add_report_heading(
-                            doc,
-                            f"{voltage} kV - Dashboard Figures - {scope.name}",
-                            level=2,
+                    _cancel(check_cancel)
+                    dashboard_figures.sort(
+                        key=lambda figure: DASHBOARD_REPORT_TITLE_ORDER.get(
+                            figure[0].strip().casefold(),
+                            len(DASHBOARD_REPORT_TITLE_ORDER),
                         )
-                        for figure_title, image_path in dashboard_figures:
-                            reference = figure_registry.allocate()
-                            _add_unumbered_plot_heading(doc, _report_dashboard_title(figure_title))
-                            _add_dashboard_figure_sentence(doc, figure_title, str(voltage), reference)
-                            _add_centered_report_image(doc, image_path)
-                            figure_registry.add_caption(
-                                doc,
-                                reference,
-                                _dashboard_figure_caption(figure_title, str(voltage)),
-                            )
-                    elif dashboard_figure_ids:
-                        doc.add_paragraph(
-                            "Selected dashboard figures could not be exported.",
-                            style="Body Text",
-                        )
+                    )
 
                     envelope_chart = _export_envelope_chart(
                         root,
@@ -1207,7 +1215,9 @@ def build_reports_from_existing_plots(
                         report_dir / "_envelope_exports",
                         log,
                         get_excel,
+                        check_cancel,
                     )
+                    _cancel(check_cancel)
                     if envelope_chart is not None:
                         _add_report_heading(
                             doc,
@@ -1232,9 +1242,33 @@ def build_reports_from_existing_plots(
                             f"Representative overvoltages envelope at {voltage} kV",
                         )
 
+                    if dashboard_figures:
+                        _add_report_heading(
+                            doc,
+                            f"{voltage} kV - Dashboard Figures - {scope.name}",
+                            level=2,
+                        )
+                        for figure_title, image_path in dashboard_figures:
+                            _cancel(check_cancel)
+                            reference = figure_registry.allocate()
+                            _add_unumbered_plot_heading(doc, _report_dashboard_title(figure_title))
+                            _add_dashboard_figure_sentence(doc, figure_title, str(voltage), reference)
+                            _add_centered_report_image(doc, image_path)
+                            figure_registry.add_caption(
+                                doc,
+                                reference,
+                                _dashboard_figure_caption(figure_title, str(voltage)),
+                            )
+                    elif dashboard_figure_ids:
+                        doc.add_paragraph(
+                            "Selected dashboard figures could not be exported.",
+                            style="Body Text",
+                        )
+
                     plot_count = 0
 
                     for event in selected_events:
+                        _cancel(check_cancel)
                         images = _find_event_images(root, scope, event, voltage, image_cache)
                         if not images:
                             continue
@@ -1244,6 +1278,7 @@ def build_reports_from_existing_plots(
                             level=2,
                         )
                         for image_path in images:
+                            _cancel(check_cancel)
                             if not _is_report_image(image_path):
                                 _log(log, f"Skipping invalid plot image: {image_path}")
                                 continue
@@ -1262,7 +1297,9 @@ def build_reports_from_existing_plots(
                             plot_count += 1
 
                     for check in parsed_resonance.effective_enabled_checks:
+                        _cancel(check_cancel)
                         for voltage_type in resonance_checks.VOLTAGE_TYPES:
+                            _cancel(check_cancel)
                             images = _find_resonance_images(root, scope, check, voltage_type, voltage, image_cache)
                             if not images:
                                 continue
@@ -1273,6 +1310,7 @@ def build_reports_from_existing_plots(
                                 level=2,
                             )
                             for image_path in images:
+                                _cancel(check_cancel)
                                 if not _is_report_image(image_path):
                                     _log(log, f"Skipping invalid plot image: {image_path}")
                                     continue
@@ -1300,7 +1338,9 @@ def build_reports_from_existing_plots(
                         )
 
                     output_path = report_dir / f"Voltage_{voltage}_kV.docx"
+                    _cancel(check_cancel)
                     doc.save(output_path)
+                    _cancel(check_cancel)
                     written.append(output_path)
                     _log(log, f"Wrote report: {output_path}")
 

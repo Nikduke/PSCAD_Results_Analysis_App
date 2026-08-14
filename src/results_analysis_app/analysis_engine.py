@@ -3,13 +3,17 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 import math
 from pathlib import Path
+import shutil
 from typing import Any
+import uuid
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from results_analysis_app import resonance_checks
+from results_analysis_app.background import OperationCancelled
+from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.models import ScopeEntry
 from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
 
@@ -55,22 +59,6 @@ def _as_int_if_possible(value: Any) -> Any:
     return number
 
 
-def _header_map_from_values(row: tuple[Any, ...]) -> dict[str, int]:
-    return {
-        str(value).strip().lower(): index
-        for index, value in enumerate(row)
-        if value is not None
-    }
-
-
-def _row_value(row: tuple[Any, ...], headers: dict[str, int], *names: str) -> Any:
-    for name in names:
-        index = headers.get(name.strip().lower())
-        if index is not None and index < len(row):
-            return row[index]
-    return None
-
-
 def _batch_points_from_sheet(
     workbook,
     sheet_name: str,
@@ -79,42 +67,15 @@ def _batch_points_from_sheet(
     output = {event_name: None for event_name in event_times}
     if sheet_name not in workbook.sheetnames:
         return output
-    ws = workbook[sheet_name]
-    rows = ws.iter_rows(values_only=True)
-    try:
-        headers = _header_map_from_values(tuple(next(rows)))
-    except StopIteration:
-        return output
-
-    time_col = headers.get("time (s)")
-    if time_col is None:
-        return output
-
-    best: dict[str, tuple[float, tuple[Any, ...]] | None] = {
-        event_name: None for event_name in event_times
-    }
-    for row_values in rows:
-        row = tuple(row_values)
-        if time_col >= len(row):
+    headers, matches = nearest_rows(workbook[sheet_name], event_times)
+    for event_name, row in matches.items():
+        if row is None:
             continue
-        actual = _as_float(row[time_col])
-        if actual is None:
-            continue
-        for event_name, target_time in event_times.items():
-            error = abs(actual - target_time)
-            current = best[event_name]
-            if current is None or error < current[0]:
-                best[event_name] = (error, row)
-
-    for event_name, match in best.items():
-        if match is None or match[0] > 0.001:
-            continue
-        row = match[1]
         output[event_name] = {
-            "case": _row_value(row, headers, "Case_all", "Case"),
-            "run": _row_value(row, headers, "Run_all", "Run"),
-            "element": _row_value(row, headers, "MM_name_all", "MM_name"),
-            "fault": _row_value(row, headers, "Fault_type_all", "Fault_type"),
+            "case": row_value(row, headers, "Case_all", "Case"),
+            "run": row_value(row, headers, "Run_all", "Run"),
+            "element": row_value(row, headers, "MM_name_all", "MM_name"),
+            "fault": row_value(row, headers, "Fault_type_all", "Fault_type"),
         }
     return output
 
@@ -223,14 +184,33 @@ def create_plot_batches(
             outputs.append(output_path)
             _log(log, f"Wrote batch: {output_path.name} | MM rows={len(mm_rows)}")
 
+        if resonance_settings is None:
+            continue
         parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
+        selected_resonance_events = resonance_checks.selected_plot_events(parsed_resonance)
+        selected_resonance_event_set = set(selected_resonance_events)
+        for check in resonance_checks.CHECK_DEFINITIONS:
+            for voltage_type in resonance_checks.VOLTAGE_TYPES:
+                stale_event = resonance_checks.plot_event_name(check, voltage_type)
+                if stale_event in selected_resonance_event_set:
+                    continue
+                stale_path = (
+                    project_root
+                    / "Plots"
+                    / "Plot_batch"
+                    / f"batch_paste_{scope.folder}_{stale_event}.xlsx"
+                )
+                if stale_path.is_file():
+                    stale_path.unlink()
+                    _log(log, f"Removed obsolete resonance batch: {stale_path.name}")
         resonance_rows = resonance_checks.create_plot_batch_rows(
             project_root,
             scope.folder,
             parsed_resonance.effective_enabled_checks,
         )
-        for event_name, mm_rows in resonance_rows.items():
+        for event_name in selected_resonance_events:
             _cancel(check_cancel)
+            mm_rows = resonance_rows.get(event_name, [])
             output_path = project_root / "Plots" / "Plot_batch" / f"batch_paste_{scope.folder}_{event_name}.xlsx"
             _create_batch_workbook(output_path, mm_rows)
             outputs.append(output_path)
@@ -241,6 +221,7 @@ def create_plot_batches(
 def _load_embedded_plotter_session(
     project_root: Path,
     log: LogFn | None = None,
+    check_cancel: CancelFn | None = None,
 ):
     import pscad_plotter_app_v3
     from pscad_plotter_app_v3.services.exporter import ExcelExporter
@@ -270,7 +251,7 @@ def _load_embedded_plotter_session(
         _log(log, "plotter: Loading MM results...")
         catalog = results_service.build_base_catalog(context, run_index, cache)
         limits = limit_service.load_effective_limits(context)
-        renderer = MatplotlibRenderer(run_index)
+        renderer = MatplotlibRenderer(run_index, check_cancel)
         exporter = ExcelExporter(renderer)
         return catalog, limits, renderer, exporter
     finally:
@@ -287,7 +268,11 @@ def _render_plot_batches_direct(
     _cancel(check_cancel)
     selected_scopes = list(scopes)
     selected_events = list(events)
-    catalog, limits, renderer, exporter = _load_embedded_plotter_session(project_root, log)
+    catalog, limits, renderer, exporter = _load_embedded_plotter_session(
+        project_root,
+        log,
+        check_cancel,
+    )
 
     from pscad_plotter_app_v3.models import PlotMode
     from pscad_plotter_app_v3.services.batch_excel import BatchExcelService
@@ -314,12 +299,17 @@ def _render_plot_batches_direct(
                 raise RuntimeError(f"Batch import failed for {batch_file.name}.")
             if not import_result.requests:
                 _log(log, f"No plot rows to render: {batch_file.name}")
+                _remove_generated_directory(
+                    output_dir,
+                    project_root / "Plots" / "Generated" / scope.folder,
+                )
                 continue
 
+            stage_dir = output_dir.parent / f".{output_dir.name}.render-{uuid.uuid4().hex}"
             jobs = []
             for request in import_result.requests:
                 _cancel(check_cancel)
-                request.output_dir = str(output_dir)
+                request.output_dir = str(stage_dir)
                 if request.mode is not PlotMode.MM:
                     raise RuntimeError(
                         f"Unsupported batch mode in analysis app: {request.mode.value}. "
@@ -335,21 +325,69 @@ def _render_plot_batches_direct(
                     )
                 jobs.extend(build_mm_jobs(request, limit))
 
+            if not jobs:
+                _log(log, f"No plot jobs to render: {batch_file.name}")
+                _remove_generated_directory(
+                    output_dir,
+                    project_root / "Plots" / "Generated" / scope.folder,
+                )
+                continue
+
             _log(log, f"Rendering {len(jobs)} plot(s): {scope.folder} | {event_name}")
-            for job in jobs:
-                _cancel(check_cancel)
-                _log(log, f"plotter: Rendering {job.case_name} | {job.group_label} | run {job.run_number}")
-                try:
+            current_job = None
+            try:
+                for job in jobs:
+                    current_job = job
+                    _cancel(check_cancel)
+                    _log(log, f"plotter: Rendering {job.case_name} | {job.group_label} | run {job.run_number}")
                     output = renderer.render(job)
                     _log(log, f"plotter: Saved {output}")
                     if job.excel_export:
                         excel_output = exporter.export(job)
                         _log(log, f"plotter: Saved {excel_output}")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Plot rendering failed for {batch_file.name}: "
-                        f"{job.case_name} | {job.group_label} | run {job.run_number} | {exc}"
-                    ) from exc
+                _cancel(check_cancel)
+                _replace_generated_directory(stage_dir, output_dir)
+            except OperationCancelled:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                raise
+            except Exception as exc:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                job_context = event_name
+                if current_job is not None:
+                    job_context = (
+                        f"{current_job.case_name} | {current_job.group_label} | "
+                        f"run {current_job.run_number}"
+                    )
+                raise RuntimeError(
+                    f"Plot rendering failed for {batch_file.name}: {job_context} | {exc}"
+                ) from exc
+
+
+def _replace_generated_directory(stage_dir: Path, output_dir: Path) -> None:
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = output_dir.parent / f".{output_dir.name}.previous-{uuid.uuid4().hex}"
+    had_previous = output_dir.exists()
+    if had_previous:
+        output_dir.replace(backup_dir)
+    try:
+        stage_dir.replace(output_dir)
+    except Exception:
+        if had_previous and backup_dir.exists():
+            backup_dir.replace(output_dir)
+        raise
+    shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _remove_generated_directory(output_dir: Path, scope_root: Path) -> None:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    parent = output_dir.parent
+    while parent != scope_root.parent and parent != scope_root:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
 
 def _desired_output_dir(project_root: Path, scope_folder: str, event_name: str) -> Path:
     resonance_dir = resonance_checks.output_dir_for_event(project_root, scope_folder, event_name)

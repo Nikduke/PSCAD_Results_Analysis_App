@@ -4,8 +4,20 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
 
-from results_analysis_app.models import DEFAULT_EVENTS, normalize_chart_y_limits
-from results_analysis_app.project_config import load_project_frequency, load_voltage_configs
+from results_analysis_app.models import (
+    DEFAULT_ENVELOPE_CHART_X_MAJOR,
+    DEFAULT_ENVELOPE_CHART_X_MAX,
+    DEFAULT_ENVELOPE_TIME_END,
+    DEFAULT_EVENTS,
+    MAX_ENVELOPE_WORKERS,
+    automatic_worker_count,
+    normalize_chart_y_limits,
+)
+from results_analysis_app.project_config import (
+    automatic_time_major,
+    load_project_timing,
+    load_voltage_configs,
+)
 from results_analysis_app.styles import make_muted_label, make_section_label
 
 
@@ -18,16 +30,42 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     layout = QtWidgets.QVBoxLayout(dialog)
 
     project_path = self._current_project_path()
-    project_frequency = load_project_frequency(project_path) if project_path else None
+    project_scan = self.project_scans.get(project_path) if project_path else None
+    project_timing = (
+        load_project_timing(project_path)
+        if project_path and project_scan is None
+        else None
+    )
+    project_frequency = (
+        project_scan.project_frequency
+        if project_scan is not None
+        else project_timing.frequency if project_timing is not None else None
+    )
+    project_duration = (
+        project_scan.final_duration
+        if project_scan is not None
+        else project_timing.final_duration if project_timing is not None else None
+    )
 
     tabs = QtWidgets.QTabWidget(dialog)
     build_tab = QtWidgets.QWidget(tabs)
     build_form = QtWidgets.QFormLayout(build_tab)
+    workers_auto_check = QtWidgets.QCheckBox("Automatic", build_tab)
+    workers_auto_check.setChecked(bool(self.session.envelope_workers_auto))
     workers_spin = QtWidgets.QSpinBox(build_tab)
-    workers_spin.setRange(1, 64)
-    workers_spin.setValue(int(self.session.envelope_workers))
-    workers_spin.setToolTip("Parallel workers used while reading envelope waveform files.")
-    build_form.addRow("Envelope workers", workers_spin)
+    workers_spin.setRange(1, MAX_ENVELOPE_WORKERS)
+    workers_spin.setValue(
+        max(1, min(MAX_ENVELOPE_WORKERS, int(self.session.envelope_workers or automatic_worker_count())))
+    )
+    workers_spin.setToolTip("Manual worker count used while reading envelope waveform files.")
+    workers_auto_check.setToolTip("Use detected logical CPUs except one, capped for Windows process pools.")
+    workers_spin.setEnabled(not workers_auto_check.isChecked())
+    workers_auto_check.toggled.connect(workers_spin.setDisabled)
+    workers_row = QtWidgets.QHBoxLayout()
+    workers_row.addWidget(workers_auto_check)
+    workers_row.addWidget(workers_spin)
+    workers_row.addStretch()
+    build_form.addRow("Envelope workers", workers_row)
 
     rebuild_cache_requested = False
     rebuild_cache_button = QtWidgets.QPushButton("Rebuild project cache", build_tab)
@@ -54,8 +92,26 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     time_end_spin.setRange(0.001, 10.0)
     time_end_spin.setSingleStep(0.1)
     time_end_spin.setSuffix(" s")
-    time_end_spin.setValue(float(self.session.envelope_time_end))
-    build_form.addRow("Envelope time end", time_end_spin)
+    time_end_auto_check = QtWidgets.QCheckBox("Use project duration", build_tab)
+    time_end_auto_check.setChecked(bool(self.session.envelope_time_end_auto))
+    time_end_auto_check.setToolTip(
+        "Use the selected project's Final duration; each run remains capped by its available waveform."
+    )
+    time_end_widget = QtWidgets.QWidget(build_tab)
+    time_end_layout = QtWidgets.QHBoxLayout(time_end_widget)
+    time_end_layout.setContentsMargins(0, 0, 0, 0)
+    time_end_layout.addWidget(time_end_spin)
+    time_end_layout.addWidget(time_end_auto_check)
+    time_end_layout.addStretch()
+    build_form.addRow("Envelope time end", time_end_widget)
+
+    def update_time_end_controls() -> None:
+        time_end_spin.setEnabled(not time_end_auto_check.isChecked())
+        if time_end_auto_check.isChecked():
+            time_end_spin.setValue(float(project_duration or DEFAULT_ENVELOPE_TIME_END))
+
+    time_end_auto_check.toggled.connect(update_time_end_controls)
+    update_time_end_controls()
 
     fallback_frequency_spin = QtWidgets.QDoubleSpinBox(build_tab)
     fallback_frequency_spin.setDecimals(2)
@@ -97,21 +153,68 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     chart_tab = QtWidgets.QWidget(tabs)
     chart_layout = QtWidgets.QVBoxLayout(chart_tab)
     chart_form = QtWidgets.QFormLayout()
+    chart_form.addRow(
+        "Project",
+        make_muted_label(Path(project_path).name if project_path else "No project selected", chart_tab),
+    )
+    x_max_override = self.session.envelope_chart_x_max_overrides_by_project.get(project_path or "")
     chart_x_max_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-    chart_x_max_spin.setDecimals(3)
-    chart_x_max_spin.setRange(0.001, 10.0)
+    chart_x_max_spin.setDecimals(6)
+    chart_x_max_spin.setRange(0.000001, 1000000.0)
     chart_x_max_spin.setSingleStep(0.1)
     chart_x_max_spin.setSuffix(" s")
-    chart_x_max_spin.setValue(float(self.session.envelope_chart_x_max))
-    chart_form.addRow("Chart x max", chart_x_max_spin)
+    chart_x_max_spin.setValue(float(x_max_override or project_duration or DEFAULT_ENVELOPE_CHART_X_MAX))
+    chart_x_max_auto = QtWidgets.QCheckBox("Use project duration", chart_tab)
+    chart_x_max_auto.setChecked(x_max_override is None)
+    chart_x_max_widget = QtWidgets.QWidget(chart_tab)
+    chart_x_max_layout = QtWidgets.QHBoxLayout(chart_x_max_widget)
+    chart_x_max_layout.setContentsMargins(0, 0, 0, 0)
+    chart_x_max_layout.addWidget(chart_x_max_spin)
+    chart_x_max_layout.addWidget(chart_x_max_auto)
+    chart_form.addRow("Chart x max", chart_x_max_widget)
 
+    x_major_override = self.session.envelope_chart_x_major_overrides_by_project.get(project_path or "")
     chart_x_major_spin = QtWidgets.QDoubleSpinBox(chart_tab)
-    chart_x_major_spin.setDecimals(3)
-    chart_x_major_spin.setRange(0.001, 10.0)
+    chart_x_major_spin.setDecimals(6)
+    chart_x_major_spin.setRange(0.000001, 1000000.0)
     chart_x_major_spin.setSingleStep(0.01)
     chart_x_major_spin.setSuffix(" s")
-    chart_x_major_spin.setValue(float(self.session.envelope_chart_x_major))
-    chart_form.addRow("Chart x major", chart_x_major_spin)
+    chart_x_major_spin.setValue(
+        float(
+            x_major_override
+            or automatic_time_major(chart_x_max_spin.value())
+            or DEFAULT_ENVELOPE_CHART_X_MAJOR
+        )
+    )
+    chart_x_major_auto = QtWidgets.QCheckBox("Use approximately 10 intervals", chart_tab)
+    chart_x_major_auto.setChecked(x_major_override is None)
+    chart_x_major_widget = QtWidgets.QWidget(chart_tab)
+    chart_x_major_layout = QtWidgets.QHBoxLayout(chart_x_major_widget)
+    chart_x_major_layout.setContentsMargins(0, 0, 0, 0)
+    chart_x_major_layout.addWidget(chart_x_major_spin)
+    chart_x_major_layout.addWidget(chart_x_major_auto)
+    chart_form.addRow("Chart x major", chart_x_major_widget)
+
+    def update_chart_x_controls() -> None:
+        enabled = project_path is not None
+        chart_x_max_auto.setEnabled(enabled)
+        chart_x_major_auto.setEnabled(enabled)
+        chart_x_max_spin.setEnabled(enabled and not chart_x_max_auto.isChecked())
+        chart_x_major_spin.setEnabled(enabled and not chart_x_major_auto.isChecked())
+        if chart_x_max_auto.isChecked():
+            chart_x_max_spin.setValue(float(project_duration or DEFAULT_ENVELOPE_CHART_X_MAX))
+        if chart_x_major_auto.isChecked():
+            chart_x_major_spin.setValue(
+                float(
+                    automatic_time_major(chart_x_max_spin.value())
+                    or DEFAULT_ENVELOPE_CHART_X_MAJOR
+                )
+            )
+
+    chart_x_max_auto.toggled.connect(update_chart_x_controls)
+    chart_x_major_auto.toggled.connect(update_chart_x_controls)
+    chart_x_max_spin.valueChanged.connect(lambda _value: update_chart_x_controls())
+    update_chart_x_controls()
 
     chart_top_left_edit = QtWidgets.QLineEdit(chart_tab)
     chart_top_left_edit.setText(self.session.envelope_chart_top_left_cell)
@@ -358,13 +461,31 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         float(self.session.nonconv_cb_iip_limit),
         float(self.session.nonconv_cb_iir_limit),
     )
+    old_high_voltage_factor = float(self.session.high_voltage_limit_factor)
+    old_um_overrides = dict(
+        self.session.voltage_um_overrides_by_project.get(project_path or "", {})
+    )
     self.session.envelope_workers = int(workers_spin.value())
+    self.session.envelope_workers_auto = workers_auto_check.isChecked()
     self.session.envelope_time_step = float(time_step_spin.value())
-    self.session.envelope_time_end = float(time_end_spin.value())
+    self.session.envelope_time_end_auto = time_end_auto_check.isChecked()
+    if not self.session.envelope_time_end_auto:
+        self.session.envelope_time_end = float(time_end_spin.value())
     if project_frequency is None:
         self.session.envelope_fallback_frequency = float(fallback_frequency_spin.value())
-    self.session.envelope_chart_x_max = float(chart_x_max_spin.value())
-    self.session.envelope_chart_x_major = float(chart_x_major_spin.value())
+    if project_path:
+        if chart_x_max_auto.isChecked():
+            self.session.envelope_chart_x_max_overrides_by_project.pop(project_path, None)
+        else:
+            self.session.envelope_chart_x_max_overrides_by_project[project_path] = float(
+                chart_x_max_spin.value()
+            )
+        if chart_x_major_auto.isChecked():
+            self.session.envelope_chart_x_major_overrides_by_project.pop(project_path, None)
+        else:
+            self.session.envelope_chart_x_major_overrides_by_project[project_path] = float(
+                chart_x_major_spin.value()
+            )
     self.session.envelope_chart_top_left_cell = chart_top_left_edit.text().strip() or "H1"
     self.session.envelope_chart_width = float(chart_width_spin.value())
     self.session.envelope_chart_height = float(chart_height_spin.value())
@@ -430,5 +551,13 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     )
     if rebuild_cache_requested:
         QtCore.QTimer.singleShot(0, lambda: self.refresh_project_scans(force=True))
-    elif new_nonconv_limits != old_nonconv_limits:
+    elif (
+        new_nonconv_limits != old_nonconv_limits
+        or float(self.session.high_voltage_limit_factor) != old_high_voltage_factor
+    ):
         self.refresh_project_scans()
+    elif project_path and (
+        self.session.voltage_um_overrides_by_project.get(project_path, {})
+        != old_um_overrides
+    ):
+        self.refresh_project_scans(project_paths=[project_path])

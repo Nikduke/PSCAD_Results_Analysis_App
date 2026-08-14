@@ -224,6 +224,96 @@ def test_report_dashboard_heading_precedes_cross_reference(tmp_path, monkeypatch
     assert document.paragraphs[heading_index].style.name == "Plot Heading"
 
 
+def test_report_orders_initial_dashboard_figures(tmp_path, monkeypatch) -> None:
+    from docx import Document
+
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    image_path = tmp_path / "dashboard.png"
+    image_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        reporting,
+        "_export_dashboard_figures",
+        lambda *_args, **_kwargs: [
+            ("Initial Active Power", image_path),
+            ("Other dashboard figure", image_path),
+            ("Initial voltages", image_path),
+            ("Initial Reactive Power", image_path),
+        ],
+    )
+    monkeypatch.setattr(reporting, "_add_centered_report_image", lambda *_args: None)
+
+    outputs = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        dashboard_figure_ids=["selected"],
+    )
+
+    texts = [paragraph.text for paragraph in Document(outputs[0]).paragraphs]
+    positions = {
+        title: texts.index(title)
+        for title in (
+            "Initial voltages",
+            "Initial Reactive Power",
+            "Initial Active Power",
+            "Other dashboard figure",
+        )
+    }
+    assert positions["Initial voltages"] < positions["Initial Reactive Power"]
+    assert positions["Initial Reactive Power"] < positions["Initial Active Power"]
+    assert positions["Initial Active Power"] < positions["Other dashboard figure"]
+
+
+def test_report_places_envelope_section_before_dashboard_section(tmp_path, monkeypatch) -> None:
+    from docx import Document
+
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    image_path = tmp_path / "figure.png"
+    image_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(reporting, "_export_envelope_chart", lambda *_args, **_kwargs: image_path)
+    monkeypatch.setattr(
+        reporting,
+        "_export_dashboard_figures",
+        lambda *_args, **_kwargs: [("Initial voltages", image_path)],
+    )
+    monkeypatch.setattr(reporting, "_add_centered_report_image", lambda *_args: None)
+
+    outputs = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        dashboard_figure_ids=["selected"],
+    )
+
+    document = Document(outputs[0])
+    headings = [
+        paragraph.text
+        for paragraph in document.paragraphs
+        if paragraph.style.name == "Heading 2"
+    ]
+    captions = [
+        paragraph.text
+        for paragraph in document.paragraphs
+        if paragraph.style.name == "Caption"
+    ]
+    assert headings == [
+        "161 kV - Envelope - Full",
+        "161 kV - Dashboard Figures - Full",
+    ]
+    assert captions[0].startswith("Figure 1-1")
+    assert captions[1].startswith("Figure 1-2")
+
+
 def test_report_dashboard_wording_uses_voltage_rise_for_rms_overvoltage() -> None:
     from results_analysis_app.reporting import (
         FigureReference,
@@ -236,6 +326,7 @@ def test_report_dashboard_wording_uses_voltage_rise_for_rms_overvoltage() -> Non
     assert _report_dashboard_title("LG RMS voltage drop x switching time") == "LG RMS voltage drop x switching time"
     assert _report_dashboard_title("LG RMS overvoltages x switching time") == "LG RMS voltage rise x switching time"
     assert _dashboard_figure_caption("Initial voltages", "161") == "Initial voltage across voltage levels in the OWF"
+    assert _dashboard_figure_caption("Initial Reactive Power", "161") == "Initial reactive power at the POC"
     assert _dashboard_figure_caption("LG instantaneous overvoltages", "161") == "Overvoltage results at the 161 kV side"
 
     document = Document()
@@ -295,6 +386,87 @@ def test_envelope_summary_rows_read_sfo_tov_from_llp(tmp_path) -> None:
         measurement_overrides={"TOV": "LGp"},
     )
     assert line_ground_tov[0].peak_kv == pytest.approx(888.0)
+
+
+def test_envelope_summary_nearest_row_tie_keeps_earlier_source_row(tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app.reporting import _envelope_summary_rows
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "LLp"
+    sheet.append(["Time (s)", "Max_all"])
+    sheet.append([0.0, 100.0])
+    sheet.append([0.002, 200.0])
+    path = tmp_path / "MM_66.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    rows = _envelope_summary_rows(path, {"SFO": 0.001}, events=["SFO"])
+
+    assert rows[0].peak_kv == 100.0
+
+
+def test_stale_combined_envelope_chart_is_not_exported(tmp_path) -> None:
+    import os
+
+    from results_analysis_app.models import ScopeEntry
+    from results_analysis_app.reporting import _export_envelope_chart
+
+    project = tmp_path / "Project"
+    envelope_dir = project / "Voltage_envelope" / "Full"
+    envelope_dir.mkdir(parents=True)
+    base = envelope_dir / "MM_66.xlsx"
+    combined = envelope_dir / "MM_66_with_combined_plot.xlsx"
+    base.write_bytes(b"new")
+    combined.write_bytes(b"old")
+    old = combined.stat().st_mtime_ns
+    os.utime(base, ns=(old + 1_000_000, old + 1_000_000))
+    logs = []
+
+    result = _export_envelope_chart(
+        project,
+        ScopeEntry.full(),
+        "66",
+        tmp_path / "exports",
+        logs.append,
+        lambda: (_ for _ in ()).throw(AssertionError("Excel must not open")),
+    )
+
+    assert result is None
+    assert any("older than its data" in message for message in logs)
+
+
+def test_report_cancellation_cleans_temporary_exports(tmp_path) -> None:
+    import pytest
+
+    from results_analysis_app.background import OperationCancelled
+    from results_analysis_app.models import ScopeEntry
+    from results_analysis_app.reporting import build_reports_from_existing_plots
+
+    report_dir = tmp_path / "Reports" / "Full"
+    temporary = report_dir / "_envelope_exports"
+    temporary.mkdir(parents=True)
+    (temporary / "stale.png").write_bytes(b"old")
+    calls = 0
+
+    def cancel() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise OperationCancelled()
+
+    with pytest.raises(OperationCancelled):
+        build_reports_from_existing_plots(
+            [tmp_path],
+            [ScopeEntry.full()],
+            ["66"],
+            [],
+            check_cancel=cancel,
+        )
+
+    assert not temporary.exists()
 
 
 def test_sa_report_text_uses_line_ground_tov_rms_value() -> None:

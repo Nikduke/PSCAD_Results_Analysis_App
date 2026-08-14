@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import multiprocessing
 import sys
 from importlib import resources
 
@@ -56,4 +57,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())

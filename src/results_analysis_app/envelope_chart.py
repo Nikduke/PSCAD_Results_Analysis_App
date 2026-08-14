@@ -16,7 +16,7 @@ from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_X_MAX,
     DEFAULT_ENVELOPE_CHART_Y_LIMITS,
 )
-from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
+from results_analysis_app.project_config import DEFAULT_EVENT_TIMES, automatic_time_major
 
 
 LG_SHEET_NAME = "LGp"
@@ -117,36 +117,41 @@ def create_combined_envelope_plot(
 ) -> Path:
     input_path = Path(input_path).resolve()
     output_path = Path(output_path or input_path.with_name(f"{input_path.stem}_with_combined_plot{input_path.suffix}")).resolve()
-    if output_path != input_path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(input_path, output_path)
-
-    series_definitions = _series_definitions(event_times, show_sa_label)
-    if excel is None:
-        with excel_app() as app:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path = output_path.with_name(
+        f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix}"
+    )
+    try:
+        shutil.copy2(input_path, staged_path)
+        series_definitions = _series_definitions(event_times, show_sa_label)
+        if excel is None:
+            with excel_app() as app:
+                _create_combined_envelope_plot_with_excel(
+                    app,
+                    input_path,
+                    staged_path,
+                    axis_limits_override,
+                    axis_limits_by_voltage,
+                    series_definitions,
+                    chart_top_left_cell,
+                    chart_size,
+                )
+        else:
             _create_combined_envelope_plot_with_excel(
-                app,
+                excel,
                 input_path,
-                output_path,
+                staged_path,
                 axis_limits_override,
                 axis_limits_by_voltage,
                 series_definitions,
                 chart_top_left_cell,
                 chart_size,
             )
-    else:
-        _create_combined_envelope_plot_with_excel(
-            excel,
-            input_path,
-            output_path,
-            axis_limits_override,
-            axis_limits_by_voltage,
-            series_definitions,
-            chart_top_left_cell,
-            chart_size,
-        )
-
-    _patch_workbook_native_data_labels(output_path, series_definitions)
+        _patch_workbook_native_data_labels(staged_path, series_definitions)
+        staged_path.replace(output_path)
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
     return output_path
 
 
@@ -154,14 +159,15 @@ def create_resonance_check_charts(
     workbook_path: Path,
     excel=None,
     x_max: float | None = None,
+    x_major: float | None = None,
 ) -> bool:
     workbook_path = Path(workbook_path).resolve()
     if not workbook_path.is_file():
         return False
     if excel is None:
         with excel_app() as app:
-            return _create_resonance_check_charts_with_excel(app, workbook_path, x_max)
-    return _create_resonance_check_charts_with_excel(excel, workbook_path, x_max)
+            return _create_resonance_check_charts_with_excel(app, workbook_path, x_max, x_major)
+    return _create_resonance_check_charts_with_excel(excel, workbook_path, x_max, x_major)
 
 
 def _create_combined_envelope_plot_with_excel(
@@ -187,7 +193,7 @@ def _create_combined_envelope_plot_with_excel(
         wb.Save()
     finally:
         try:
-            wb.Close(SaveChanges=True)
+            wb.Close(SaveChanges=False)
         except EXCEL_AUTOMATION_ERRORS:
             pass
 
@@ -245,7 +251,9 @@ def _get_axis_limits(
             {key: value for key, value in axis_limits_by_voltage[voltage].items() if value is not None}
         )
     if axis_limits_override:
-        limits.update({key: value for key, value in axis_limits_override.items() if value is not None})
+        for key, value in axis_limits_override.items():
+            if value is not None or key in {"x_max", "x_major"}:
+                limits[key] = value
     return limits
 
 
@@ -538,6 +546,7 @@ def _create_resonance_check_charts_with_excel(
     excel,
     workbook_path: Path,
     x_max: float | None,
+    x_major: float | None,
 ) -> bool:
     wb = excel.Workbooks.Open(str(workbook_path), UpdateLinks=0, ReadOnly=False)
     changed = False
@@ -546,7 +555,7 @@ def _create_resonance_check_charts_with_excel(
             if not _is_resonance_chart_data_sheet(ws):
                 continue
             _delete_existing_charts(ws)
-            if _create_resonance_check_chart(ws, x_max):
+            if _create_resonance_check_chart(ws, x_max, x_major):
                 changed = True
         if changed:
             wb.Save()
@@ -565,7 +574,11 @@ def _is_resonance_chart_data_sheet(ws) -> bool:
         return False
 
 
-def _create_resonance_check_chart(ws, x_max: float | None = None) -> bool:
+def _create_resonance_check_chart(
+    ws,
+    x_max: float | None = None,
+    x_major: float | None = None,
+) -> bool:
     last_row = int(ws.Cells(ws.Rows.Count, 1).End(xlUp).Row)
     if last_row < 3:
         return False
@@ -629,7 +642,13 @@ def _create_resonance_check_chart(ws, x_max: float | None = None) -> bool:
     _format_chart(
         chart,
         _bounded_x_axis(
-            {"x_min": 0.0, "x_max": x_max, "y_min": 0.0, "y_max": y_max},
+            {
+                "x_min": 0.0,
+                "x_max": x_max,
+                "x_major": x_major,
+                "y_min": 0.0,
+                "y_max": y_max,
+            },
             t_end,
         ),
         title=_resonance_chart_title(ws),
@@ -663,6 +682,8 @@ def _bounded_x_axis(axis_limits: dict, data_end: float) -> dict:
     requested = _as_float(bounded.get("x_max"))
     if data_end > 0:
         bounded["x_max"] = min(requested, data_end) if requested is not None else data_end
+    if _as_float(bounded.get("x_major")) is None:
+        bounded["x_major"] = automatic_time_major(_as_float(bounded.get("x_max")))
     return bounded
 
 

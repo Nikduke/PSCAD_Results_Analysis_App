@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 import re
 from typing import Any
 
@@ -20,8 +21,12 @@ DEFAULT_EVENTS = ("SFO", "TOV", "SA")
 DEFAULT_RESONANCE_CHECKS = ("Post_Event_Stress", "Late_Growth", "No_Settle_Growth")
 DEFAULT_ENVELOPE_TIME_STEP = 0.002
 DEFAULT_ENVELOPE_TIME_END = 1.0
+DEFAULT_ENVELOPE_TIME_END_AUTO = True
 DEFAULT_ENVELOPE_FALLBACK_FREQUENCY = 50.0
-DEFAULT_ENVELOPE_WORKERS = 4
+# Zero means automatic worker selection. Positive values remain available as a
+# manual override; 60 stays below Windows' ProcessPoolExecutor limit.
+DEFAULT_ENVELOPE_WORKERS = 0
+MAX_ENVELOPE_WORKERS = 60
 DEFAULT_ENVELOPE_CHART_X_MAX = 0.5
 DEFAULT_ENVELOPE_CHART_X_MAJOR = 0.05
 DEFAULT_ENVELOPE_CHART_TOP_LEFT_CELL = "H1"
@@ -56,11 +61,21 @@ DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM = 0.50
 DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR = 0.01
 
 
-def normalize_tokens(text: str | list[str] | tuple[str, ...]) -> list[str]:
+def _json_list(value: Any, default: tuple[Any, ...] = ()) -> list[Any]:
+    return value if isinstance(value, list) else list(default)
+
+
+def _json_dict(value: Any) -> dict[Any, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_tokens(text: str | list[str] | tuple[str, ...] | Any) -> list[str]:
     if isinstance(text, str):
         raw_tokens = re.split(r"[,;\s]+", text)
-    else:
+    elif isinstance(text, (list, tuple)):
         raw_tokens = [str(value) for value in text]
+    else:
+        raw_tokens = []
 
     tokens: list[str] = []
     seen: set[str] = set()
@@ -84,9 +99,18 @@ def safe_token(token: str) -> str:
 
 def normalize_worker_count(value: Any) -> int:
     try:
-        return max(1, int(value))
+        return min(MAX_ENVELOPE_WORKERS, max(0, int(value)))
     except (TypeError, ValueError):
         return DEFAULT_ENVELOPE_WORKERS
+
+
+def automatic_worker_count() -> int:
+    cpu_counter = getattr(os, "process_cpu_count", None)
+    cpu_count = cpu_counter() if callable(cpu_counter) else None
+    if cpu_count is None:
+        cpu_count = os.cpu_count()
+    detected_cpus = max(1, int(cpu_count or 1))
+    return max(1, min(MAX_ENVELOPE_WORKERS, detected_cpus - 1))
 
 
 def normalize_positive_int(value: Any, default: int) -> int:
@@ -161,6 +185,17 @@ def normalize_project_voltage_um_overrides(value: Any) -> dict[str, dict[str, fl
                 normalized[voltage] = um
         if normalized:
             output[str(project)] = normalized
+    return output
+
+
+def normalize_project_positive_floats(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, float] = {}
+    for project, raw_number in value.items():
+        number = normalize_positive_float(raw_number, 0.0)
+        if str(project).strip() and number > 0:
+            output[str(project)] = number
     return output
 
 
@@ -260,11 +295,13 @@ class AppSession:
     events: list[str] = field(default_factory=lambda: list(DEFAULT_EVENTS))
     event_times: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_EVENT_TIMES))
     envelope_workers: int = DEFAULT_ENVELOPE_WORKERS
+    envelope_workers_auto: bool = True
     envelope_time_step: float = DEFAULT_ENVELOPE_TIME_STEP
     envelope_time_end: float = DEFAULT_ENVELOPE_TIME_END
+    envelope_time_end_auto: bool = DEFAULT_ENVELOPE_TIME_END_AUTO
     envelope_fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY
-    envelope_chart_x_max: float = DEFAULT_ENVELOPE_CHART_X_MAX
-    envelope_chart_x_major: float = DEFAULT_ENVELOPE_CHART_X_MAJOR
+    envelope_chart_x_max_overrides_by_project: dict[str, float] = field(default_factory=dict)
+    envelope_chart_x_major_overrides_by_project: dict[str, float] = field(default_factory=dict)
     envelope_chart_top_left_cell: str = DEFAULT_ENVELOPE_CHART_TOP_LEFT_CELL
     envelope_chart_width: float = DEFAULT_ENVELOPE_CHART_WIDTH
     envelope_chart_height: float = DEFAULT_ENVELOPE_CHART_HEIGHT
@@ -295,6 +332,7 @@ class AppSession:
     manual_exclusions_by_project: dict[str, list[ExclusionRule]] = field(default_factory=dict)
     disabled_nonconv_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     high_voltage_exclusions_by_project: dict[str, list[tuple[str, str, int, str]]] = field(default_factory=dict)
+    high_voltage_include_overrides_by_project: dict[str, list[tuple[str, str, int, str]]] = field(default_factory=dict)
     dashboard_figure_selection: list[str] = field(default_factory=list)
     dashboard_figure_selection_initialized: bool = False
     status_cache: dict[str, list[str]] = field(default_factory=dict)
@@ -317,6 +355,19 @@ class AppSession:
     def remove_projects(self, paths: set[str]) -> None:
         keys = {path.casefold() for path in paths}
         self.projects = [project for project in self.projects if project.path.casefold() not in keys]
+        for mapping in (
+            self.envelope_chart_x_max_overrides_by_project,
+            self.envelope_chart_x_major_overrides_by_project,
+            self.voltage_um_overrides_by_project,
+            self.manual_exclusions_by_project,
+            self.disabled_nonconv_by_project,
+            self.high_voltage_exclusions_by_project,
+            self.high_voltage_include_overrides_by_project,
+            self.status_cache,
+        ):
+            for project in list(mapping):
+                if project.casefold() in keys:
+                    mapping.pop(project, None)
 
     def add_scope(self, mode: str, token_text: str) -> ScopeEntry:
         tokens = normalize_tokens(token_text)
@@ -339,11 +390,13 @@ class AppSession:
             "events": self.events,
             "event_times": self.event_times,
             "envelope_workers": self.envelope_workers,
+            "envelope_workers_auto": self.envelope_workers_auto,
             "envelope_time_step": self.envelope_time_step,
             "envelope_time_end": self.envelope_time_end,
+            "envelope_time_end_auto": self.envelope_time_end_auto,
             "envelope_fallback_frequency": self.envelope_fallback_frequency,
-            "envelope_chart_x_max": self.envelope_chart_x_max,
-            "envelope_chart_x_major": self.envelope_chart_x_major,
+            "envelope_chart_x_max_overrides_by_project": self.envelope_chart_x_max_overrides_by_project,
+            "envelope_chart_x_major_overrides_by_project": self.envelope_chart_x_major_overrides_by_project,
             "envelope_chart_top_left_cell": self.envelope_chart_top_left_cell,
             "envelope_chart_width": self.envelope_chart_width,
             "envelope_chart_height": self.envelope_chart_height,
@@ -386,6 +439,13 @@ class AppSession:
                 ]
                 for project, exclusions in self.high_voltage_exclusions_by_project.items()
             },
+            "high_voltage_include_overrides_by_project": {
+                project: [
+                    {"voltage": voltage, "case": case, "run": run, "bus": bus}
+                    for voltage, case, run, bus in inclusions
+                ]
+                for project, inclusions in self.high_voltage_include_overrides_by_project.items()
+            },
             "dashboard_figure_selection": self.dashboard_figure_selection,
             "dashboard_figure_selection_initialized": self.dashboard_figure_selection_initialized,
             "status_cache": self.status_cache,
@@ -393,19 +453,20 @@ class AppSession:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppSession":
+        data = _json_dict(data)
         manual_exclusions = normalize_project_exclusion_rules(
-            data.get("manual_exclusions_by_project", {})
+            _json_dict(data.get("manual_exclusions_by_project"))
         )
         legacy_exclusions = migrate_legacy_project_exclusions(
-            data.get("bus_exclusions_by_project", {}),
-            data.get("manual_case_run_exclusions_by_project", {}),
+            _json_dict(data.get("bus_exclusions_by_project")),
+            _json_dict(data.get("manual_case_run_exclusions_by_project")),
         )
         for project, rules in legacy_exclusions.items():
             manual_exclusions[project] = normalize_exclusion_rules(
                 [*manual_exclusions.get(project, []), *rules]
             )
         dashboard_selection = [
-            str(item) for item in data.get("dashboard_figure_selection", []) if str(item)
+            str(item) for item in _json_list(data.get("dashboard_figure_selection")) if str(item)
         ]
         raw_event_times = data.get("event_times", {})
         if not isinstance(raw_event_times, dict):
@@ -419,29 +480,34 @@ class AppSession:
 
         raw_events = {
             str(value)
-            for value in data.get("events", DEFAULT_EVENTS)
+            for value in _json_list(data.get("events"), DEFAULT_EVENTS)
             if str(value) in DEFAULT_EVENTS
         }
+        worker_count = normalize_worker_count(
+            data.get("envelope_workers", DEFAULT_ENVELOPE_WORKERS)
+        )
+        worker_auto = bool(data.get("envelope_workers_auto", worker_count == 0))
 
         session = cls(
             projects=[
                 ProjectEntry.from_dict(value)
-                for value in data.get("projects", [])
+                for value in _json_list(data.get("projects"))
                 if isinstance(value, dict)
             ],
             scopes=[
                 ScopeEntry.from_dict(value)
-                for value in data.get("scopes", [])
+                for value in _json_list(data.get("scopes"))
                 if isinstance(value, dict)
             ],
             voltages=[
                 str(value)
-                for value in data.get("voltages", DEFAULT_VOLTAGES)
+                for value in _json_list(data.get("voltages"), DEFAULT_VOLTAGES)
                 if str(value).strip()
             ],
             events=[event for event in DEFAULT_EVENTS if event in raw_events],
             event_times=event_times,
-            envelope_workers=normalize_worker_count(data.get("envelope_workers", DEFAULT_ENVELOPE_WORKERS)),
+            envelope_workers=worker_count,
+            envelope_workers_auto=worker_auto,
             envelope_time_step=normalize_positive_float(
                 data.get("envelope_time_step", DEFAULT_ENVELOPE_TIME_STEP),
                 DEFAULT_ENVELOPE_TIME_STEP,
@@ -450,17 +516,18 @@ class AppSession:
                 data.get("envelope_time_end", DEFAULT_ENVELOPE_TIME_END),
                 DEFAULT_ENVELOPE_TIME_END,
             ),
+            envelope_time_end_auto=bool(
+                data.get("envelope_time_end_auto", DEFAULT_ENVELOPE_TIME_END_AUTO)
+            ),
             envelope_fallback_frequency=normalize_positive_float(
                 data.get("envelope_fallback_frequency", DEFAULT_ENVELOPE_FALLBACK_FREQUENCY),
                 DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
             ),
-            envelope_chart_x_max=normalize_positive_float(
-                data.get("envelope_chart_x_max", DEFAULT_ENVELOPE_CHART_X_MAX),
-                DEFAULT_ENVELOPE_CHART_X_MAX,
+            envelope_chart_x_max_overrides_by_project=normalize_project_positive_floats(
+                data.get("envelope_chart_x_max_overrides_by_project", {})
             ),
-            envelope_chart_x_major=normalize_positive_float(
-                data.get("envelope_chart_x_major", DEFAULT_ENVELOPE_CHART_X_MAJOR),
-                DEFAULT_ENVELOPE_CHART_X_MAJOR,
+            envelope_chart_x_major_overrides_by_project=normalize_project_positive_floats(
+                data.get("envelope_chart_x_major_overrides_by_project", {})
             ),
             envelope_chart_top_left_cell=(
                 str(data.get("envelope_chart_top_left_cell", DEFAULT_ENVELOPE_CHART_TOP_LEFT_CELL)).strip()
@@ -494,7 +561,7 @@ class AppSession:
             ),
             resonance_enabled_checks=[
                 str(value)
-                for value in data.get("resonance_enabled_checks", [])
+                for value in _json_list(data.get("resonance_enabled_checks"))
                 if str(value) in DEFAULT_RESONANCE_CHECKS
             ],
             resonance_top_n=normalize_positive_int(
@@ -574,13 +641,16 @@ class AppSession:
             high_voltage_exclusions_by_project=normalize_project_high_voltage_exclusions(
                 data.get("high_voltage_exclusions_by_project", {})
             ),
+            high_voltage_include_overrides_by_project=normalize_project_high_voltage_exclusions(
+                data.get("high_voltage_include_overrides_by_project", {})
+            ),
             dashboard_figure_selection=dashboard_selection,
             dashboard_figure_selection_initialized=bool(
                 data.get("dashboard_figure_selection_initialized", bool(dashboard_selection))
             ),
             status_cache={
                 str(key): [str(item) for item in value]
-                for key, value in data.get("status_cache", {}).items()
+                for key, value in _json_dict(data.get("status_cache")).items()
                 if isinstance(value, list)
             },
         )
