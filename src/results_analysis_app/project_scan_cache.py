@@ -4,10 +4,12 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from results_analysis_app import scanner, storage
+from results_analysis_app import scanner, storage, sustained_sdpf
+from results_analysis_app.common import as_float
+from results_analysis_app.project_config import VoltageConfig
 
 
-CACHE_VERSION = 4
+CACHE_VERSION = 6
 
 
 def _empty_cache() -> dict[str, Any]:
@@ -91,7 +93,24 @@ def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
             }
             for item in scan.high_voltage_log_measurements
         ],
+        "fault_types_by_run": {
+            str(run): fault_type
+            for run, fault_type in scan.fault_types_by_run.items()
+        },
         "available_voltages": list(scan.available_voltages),
+        "voltage_configs": {
+            voltage: {
+                "voltage": config.voltage,
+                "bus_prefix": config.bus_prefix,
+                "um": config.um,
+            }
+            for voltage, config in scan.voltage_configs.items()
+        },
+        "sustained_sdpf_limits": {
+            voltage: limit.to_dict()
+            for voltage, limit in scan.sustained_sdpf_limits.items()
+        },
+        "sustained_sdpf_limit_warnings": list(scan.sustained_sdpf_limit_warnings),
         "project_frequency": scan.project_frequency,
         "final_duration": scan.final_duration,
         "has_dashboards": scan.has_dashboards,
@@ -105,13 +124,6 @@ def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
 def _as_int(value: Any) -> int | None:
     try:
         return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_float(value: Any) -> float | None:
-    try:
-        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -211,6 +223,52 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
             )
         )
 
+    fault_types_by_run: dict[int, str] = {}
+    raw_fault_types = payload.get("fault_types_by_run")
+    if isinstance(raw_fault_types, dict):
+        for raw_run, raw_fault_type in raw_fault_types.items():
+            try:
+                run = int(raw_run)
+            except (TypeError, ValueError):
+                continue
+            fault_types_by_run[run] = str(raw_fault_type)
+
+    voltage_configs: dict[str, VoltageConfig] = {}
+    raw_voltage_configs = payload.get("voltage_configs")
+    if isinstance(raw_voltage_configs, dict):
+        for raw_voltage, item in raw_voltage_configs.items():
+            if not isinstance(item, dict):
+                continue
+            voltage = str(item.get("voltage", raw_voltage)).strip()
+            bus_prefix = str(item.get("bus_prefix", "")).strip()
+            um = as_float(item.get("um"))
+            if voltage and bus_prefix and um is not None and um > 0:
+                voltage_configs[str(raw_voltage)] = VoltageConfig(voltage, bus_prefix, um)
+
+    sustained_sdpf_limits: dict[str, sustained_sdpf.SDPFVoltageLimits] = {}
+    raw_sustained_limits = payload.get("sustained_sdpf_limits")
+    if isinstance(raw_sustained_limits, dict):
+        for raw_voltage, item in raw_sustained_limits.items():
+            if not isinstance(item, dict):
+                continue
+            voltage = as_float(item.get("voltage_kv"))
+            sdpf_lg = as_float(item.get("sdpf_lg_rms"))
+            sdpf_ll = as_float(item.get("sdpf_ll_rms"))
+            if (
+                voltage is not None
+                and sdpf_lg is not None
+                and sdpf_ll is not None
+                and voltage > 0
+                and sdpf_lg > 0
+                and sdpf_ll > 0
+            ):
+                sustained_sdpf_limits[str(raw_voltage)] = sustained_sdpf.SDPFVoltageLimits(
+                    voltage,
+                    sdpf_lg,
+                    sdpf_ll,
+                    str(item.get("source", "workbook")),
+                )
+
     chips = [str(value) for value in _payload_list(payload, "chips")]
     return scanner.ProjectScan(
         path=root,
@@ -221,9 +279,16 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
         nonconv_cases=nonconv_cases,
         high_voltage_exclusions=high_voltage_exclusions,
         high_voltage_log_measurements=high_voltage_log_measurements,
+        fault_types_by_run=fault_types_by_run,
         available_voltages=[str(value) for value in _payload_list(payload, "available_voltages")],
-        project_frequency=_as_float(payload.get("project_frequency")),
-        final_duration=_as_float(payload.get("final_duration")),
+        voltage_configs=voltage_configs,
+        sustained_sdpf_limits=sustained_sdpf_limits,
+        sustained_sdpf_limit_warnings=[
+            str(value)
+            for value in _payload_list(payload, "sustained_sdpf_limit_warnings")
+        ],
+        project_frequency=as_float(payload.get("project_frequency")),
+        final_duration=as_float(payload.get("final_duration")),
         has_dashboards=bool(payload.get("has_dashboards", False)),
         dashboard_changed=bool(
             payload.get("dashboard_changed", "Dashboards changed" in chips)
@@ -395,7 +460,9 @@ def update_project_scans(
             (voltage_um_overrides_by_project or {}).get(key, {}),
             manifest,
         )
-    storage.write_json(path, data)
+    # This machine-generated cache can contain thousands of file entries.  It
+    # does not need session-style pretty-printing, so keep writes compact.
+    storage.write_json(path, data, indent=None)
 
 
 def remove_projects(project_paths: Iterable[str], path: Path = storage.PROJECT_SCAN_CACHE_PATH) -> None:
@@ -405,7 +472,7 @@ def remove_projects(project_paths: Iterable[str], path: Path = storage.PROJECT_S
     for project_path in project_paths:
         changed = projects.pop(str(Path(project_path).resolve()), None) is not None or changed
     if changed:
-        storage.write_json(path, data)
+        storage.write_json(path, data, indent=None)
 
 
 def clear(path: Path = storage.PROJECT_SCAN_CACHE_PATH) -> None:

@@ -3,30 +3,34 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 import math
 import os
 import posixpath
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
+from results_analysis_app import sustained_sdpf
 from results_analysis_app.models import DashboardFigure, ScopeEntry
 from results_analysis_app.project_config import (
-    available_voltage_keys,
+    VoltageConfig,
+    discover_voltage_data,
+    input_data_workbook,
     load_project_timing,
     load_voltage_configs,
     normalize_voltage,
 )
 from pscad_plotter_app_v3.services.waveform_io import (
-    case_run_from_inf_path,
     load_out_columns,
     out_file_for_pgb,
     parse_inf_descriptors,
 )
+from pscad_plotter_app_v3.services.project_conventions import case_run_from_inf_path
 
 
 LEGACY_PSCAD_LOG_HIGH_VOLTAGE_SOURCE = "PSCAD_log.txt + MM results.csv"
@@ -111,7 +115,11 @@ class ProjectScan:
     nonconv_cases: list[NonConvergentCase] = field(default_factory=list)
     high_voltage_exclusions: list[HighVoltageExclusion] = field(default_factory=list)
     high_voltage_log_measurements: list[HighVoltageMeasurement] = field(default_factory=list)
+    fault_types_by_run: dict[int, str] = field(default_factory=dict)
     available_voltages: list[str] = field(default_factory=list)
+    voltage_configs: dict[str, VoltageConfig] = field(default_factory=dict)
+    sustained_sdpf_limits: dict[str, sustained_sdpf.SDPFVoltageLimits] = field(default_factory=dict)
+    sustained_sdpf_limit_warnings: list[str] = field(default_factory=list)
     project_frequency: float | None = None
     final_duration: float | None = None
     has_dashboards: bool = False
@@ -142,18 +150,26 @@ def _has_non_temp_file(root: Path, pattern: str) -> bool:
     return any(path.is_file() and not path.name.startswith("~$") for path in root.rglob(pattern))
 
 
+def _has_non_temp_files(root: Path, patterns: tuple[str, ...]) -> bool:
+    """Check several extensions with one directory walk."""
+    if not root.is_dir():
+        return False
+    folded = tuple(pattern.casefold() for pattern in patterns)
+    for directory, _subdirs, names in os.walk(root):
+        for name in names:
+            if name.startswith("~$"):
+                continue
+            if any(fnmatchcase(name.casefold(), pattern) for pattern in folded):
+                return True
+    return False
+
+
 def _has_dashboard_files(root: Path) -> bool:
-    return any(
-        _has_non_temp_file(root, pattern)
-        for pattern in ("*.xlsx", "*.xlsm", "*.xlsb")
-    )
+    return _has_non_temp_files(root, ("*.xlsx", "*.xlsm", "*.xlsb"))
 
 
 def _has_plot_files(root: Path) -> bool:
-    return any(
-        _has_non_temp_file(root, pattern)
-        for pattern in ("*.png", "*.jpg", "*.jpeg", "*.emf")
-    )
+    return _has_non_temp_files(root, ("*.png", "*.jpg", "*.jpeg", "*.emf"))
 
 
 def _file_metadata(path: Path, root: Path) -> dict[str, int | str] | None:
@@ -277,6 +293,7 @@ def project_scan_manifest(project_root: str | Path) -> dict[str, Any]:
     for path in root.glob("Input_Data_PSCAD*.xlsx"):
         if not path.name.startswith("~$"):
             add_file(path)
+    add_file(root / "Plots" / ".plottool_v3" / "limits.json")
 
     manifest["files"] = sorted(files, key=lambda item: str(item["path"]))
     manifest["high_voltage_files"] = sorted(
@@ -316,14 +333,6 @@ def _as_int(value: Any) -> int | None:
         return int(float(str(value).strip()))
     except (TypeError, ValueError):
         return None
-
-
-def _as_float(value: Any) -> float | None:
-    try:
-        number = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
 
 
 def _pscad_log_path(project_root: Path) -> Path | None:
@@ -437,14 +446,20 @@ def _collect_nonconv_cases(
     project_root: Path,
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
+    fault_types_future=None,
 ) -> tuple[list[NonConvergentCase], list[str]]:
     from results_analysis_app.voltage_envelope import find_non_convergent_cases_for_project
 
+    try:
+        fault_types_by_run = fault_types_future.result() if fault_types_future is not None else None
+    except Exception:
+        fault_types_by_run = None
     rows = []
     records, warnings = find_non_convergent_cases_for_project(
         project_root,
         nonconv_cb_iip_limit,
         nonconv_cb_iir_limit,
+        fault_types_by_run=fault_types_by_run,
     )
     for record in records:
         run = _as_int(record.get("Run"))
@@ -464,6 +479,12 @@ def _collect_nonconv_cases(
             )
         )
     return rows, warnings
+
+
+def _collect_fault_types_by_run(project_root: Path) -> dict[int, str]:
+    from results_analysis_app.voltage_envelope import read_project_fault_types
+
+    return read_project_fault_types(project_root)
 
 
 def _read_xlsx_sheet_rows(path: Path, sheet_name: str) -> list[dict[str, Any]]:
@@ -562,6 +583,7 @@ def _collect_high_voltage_exclusions(project_root: Path) -> tuple[list[HighVolta
 def _scan_high_voltage_measurements_from_pscad_log(
     project_root: str | Path,
     *,
+    inf_paths: Iterable[Path] | None = None,
     check_cancel: Callable[[], None] | None = None,
 ) -> tuple[list[HighVoltageMeasurement], list[str]]:
     if check_cancel is not None:
@@ -592,7 +614,8 @@ def _scan_high_voltage_measurements_from_pscad_log(
 
     matched_cases: set[str] = set()
     matched_inf_paths: list[tuple[Path, set[str]]] = []
-    for inf_path in sorted(case_root.rglob("*.inf")):
+    inventory = sorted(inf_paths) if inf_paths is not None else sorted(case_root.rglob("*.inf"))
+    for inf_path in inventory:
         if check_cancel is not None:
             check_cancel()
         try:
@@ -790,8 +813,23 @@ def scan_high_voltage_from_pscad_log(
     return rows, warnings
 
 
-def _collect_voltages(project_root: Path, inf_paths: list[Path]) -> list[str]:
-    return available_voltage_keys(project_root, inf_paths=inf_paths)
+def _collect_voltage_data(
+    project_root: Path,
+    inf_paths: list[Path],
+) -> tuple[list[str], dict[str, VoltageConfig]]:
+    return discover_voltage_data(project_root, inf_paths=inf_paths)
+
+
+def _collect_sustained_sdpf_limits(
+    project_root: Path,
+) -> tuple[dict[str, sustained_sdpf.SDPFVoltageLimits], list[str]]:
+    workbook_path = input_data_workbook(project_root)
+    overrides_path = project_root / "Plots" / ".plottool_v3" / "limits.json"
+    return sustained_sdpf.resolve_project_limits(
+        project_root,
+        workbook_path=workbook_path,
+        overrides_path=overrides_path,
+    )
 
 
 def _refresh_scan_chips(scan: ProjectScan, has_result_files: bool | None = None) -> None:
@@ -906,6 +944,10 @@ def scan_project(
     results_dir = project_root / "Results"
 
     with ThreadPoolExecutor(max_workers=8) as executor:
+        fault_types_future = executor.submit(
+            _collect_fault_types_by_run,
+            project_root,
+        )
         futures = {
             "has_result_files": executor.submit(_has_non_temp_file, results_dir, "*.csv"),
             "nonconv_cases": executor.submit(
@@ -913,12 +955,15 @@ def scan_project(
                 project_root,
                 nonconv_cb_iip_limit,
                 nonconv_cb_iir_limit,
+                fault_types_future,
             ),
+            "fault_types_by_run": fault_types_future,
             "has_dashboards": executor.submit(_has_dashboard_files, dashboard_root),
             "has_envelopes": executor.submit(_has_non_temp_file, envelope_root, "*.xlsx"),
             "has_plots": executor.submit(_has_plot_files, generated_root),
             "has_reports": executor.submit(_has_non_temp_file, reports_root, "*.docx"),
-            "available_voltages": executor.submit(_collect_voltages, project_root, inf_paths),
+            "voltage_data": executor.submit(_collect_voltage_data, project_root, inf_paths),
+            "sustained_sdpf_limits": executor.submit(_collect_sustained_sdpf_limits, project_root),
             "high_voltage_exclusions": executor.submit(_collect_high_voltage_exclusions, project_root),
             "project_timing": executor.submit(load_project_timing, project_root),
         }
@@ -926,6 +971,7 @@ def scan_project(
             futures["high_voltage_log"] = executor.submit(
                 _scan_high_voltage_measurements_from_pscad_log,
                 project_root,
+                inf_paths=inf_paths,
                 check_cancel=check_cancel,
             )
         has_result_files = bool(futures["has_result_files"].result())
@@ -934,11 +980,26 @@ def scan_project(
             scan.messages.extend(warnings)
         except Exception as exc:
             scan.messages.append(f"Could not scan NonConv proposals: {exc}")
+        try:
+            scan.fault_types_by_run = futures["fault_types_by_run"].result()
+        except Exception as exc:
+            scan.messages.append(f"Could not scan fault types: {exc}")
         scan.has_dashboards = futures["has_dashboards"].result()
         scan.has_envelopes = futures["has_envelopes"].result()
         scan.has_plots = futures["has_plots"].result()
         scan.has_reports = futures["has_reports"].result()
-        scan.available_voltages = futures["available_voltages"].result()
+        scan.available_voltages, scan.voltage_configs = futures["voltage_data"].result()
+        try:
+            (
+                scan.sustained_sdpf_limits,
+                scan.sustained_sdpf_limit_warnings,
+            ) = futures["sustained_sdpf_limits"].result()
+            scan.messages.extend(
+                f"Sustained SDPF: {warning}"
+                for warning in scan.sustained_sdpf_limit_warnings
+            )
+        except Exception as exc:
+            scan.messages.append(f"Could not scan Sustained SDPF limits: {exc}")
         scan.high_voltage_exclusions, warnings = futures["high_voltage_exclusions"].result()
         scan.messages.extend(warnings)
         timing = futures["project_timing"].result()

@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .tmp/
+.pytest_tmp*/
 
 # Local environment and application state
 .conda/

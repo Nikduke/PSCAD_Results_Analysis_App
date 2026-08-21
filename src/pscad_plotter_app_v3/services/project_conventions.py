@@ -1,3 +1,5 @@
+"""PSCAD filename and statistic-file conventions shared by plot workflows."""
+
 from __future__ import annotations
 
 import re
@@ -18,8 +20,23 @@ KNOWN_FAULT_LABELS = set(FAULT_CODE_LABELS.values()) | {"No fault"}
 ALL_FAULTS_LABEL = "All faults"
 PREFERRED_STATISTIC_FILE_NAMES = ("statistic_01.out", "statistic_0001.out")
 
+__all__ = [
+    "ALL_FAULTS_LABEL",
+    "FAULT_CODE_LABELS",
+    "KNOWN_FAULT_LABELS",
+    "case_run_from_inf_path",
+    "find_stat_file",
+    "normalize_fault_label",
+    "normalize_fault_raw",
+    "parse_case_run_from_stem",
+    "parse_manual_run_from_stem",
+    "parse_stat_rows",
+    "safe_float",
+]
+
 
 def find_stat_file(directory: Path) -> Path | None:
+    """Choose the deterministic statistic file used for run fault labels."""
     if not directory.exists():
         return None
     for name in PREFERRED_STATISTIC_FILE_NAMES:
@@ -46,6 +63,7 @@ def _stat_file_sort_key(path: Path) -> tuple[int, str]:
 
 
 def parse_case_run_from_stem(stem: str) -> tuple[str, int] | None:
+    """Parse a standard PSCAD ``<case>_r<run>`` filename stem."""
     match = RUN_PATTERN.match(stem)
     if not match:
         return None
@@ -53,6 +71,7 @@ def parse_case_run_from_stem(stem: str) -> tuple[str, int] | None:
 
 
 def case_run_from_inf_path(inf_path: Path) -> tuple[str, int]:
+    """Return the case and run encoded in one standard ``.inf`` filename."""
     parsed = parse_case_run_from_stem(inf_path.stem)
     if parsed is None:
         raise ValueError(f"Cannot read case/run from {inf_path.name}")
@@ -60,6 +79,7 @@ def case_run_from_inf_path(inf_path: Path) -> tuple[str, int]:
 
 
 def parse_manual_run_from_stem(stem: str, project_stem: str) -> tuple[str, int] | None:
+    """Parse a manual-project run stem using its project filename convention."""
     parsed = _parse_manual_single_run_stem(stem, project_stem)
     if parsed is not None:
         return parsed
@@ -83,6 +103,7 @@ def _parse_manual_multi_run_stem(stem: str, project_stem: str) -> tuple[str, int
 
 
 def safe_float(value) -> float | None:
+    """Parse a statistic/catalog number, rejecting blank and NaN values."""
     if value is None:
         return None
     if isinstance(value, str) and not value.strip():
@@ -103,6 +124,7 @@ def safe_float(value) -> float | None:
 
 
 def normalize_fault_raw(value) -> str:
+    """Normalize a raw numeric or textual fault code for cache/report use."""
     if value is None:
         return "0"
     if isinstance(value, str):
@@ -128,11 +150,13 @@ def normalize_fault_raw(value) -> str:
 
 
 def normalize_fault_label(value) -> str:
+    """Map a normalized raw fault code to its human-readable PSCAD label."""
     raw = normalize_fault_raw(value)
     return FAULT_CODE_LABELS.get(raw, raw)
 
 
 def parse_stat_rows(stat_path: Path) -> list[dict[str, object]]:
+    """Parse run/fault/event rows from a PSCAD statistic output file."""
     rows: list[dict[str, object]] = []
     header_tokens: list[str] | None = None
     with stat_path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -159,11 +183,15 @@ def parse_stat_rows(stat_path: Path) -> list[dict[str, object]]:
 
             header_lookup = {token.lower(): token for token in header_tokens}
 
-            def row_value(*candidates: str) -> str | None:
+            def row_value(
+                *candidates: str,
+                _header_lookup: dict[str, str] = header_lookup,
+                _row_map: dict[str, str] = row_map,
+            ) -> str | None:
                 for candidate in candidates:
-                    key = header_lookup.get(candidate.lower())
+                    key = _header_lookup.get(candidate.lower())
                     if key:
-                        return row_map.get(key)
+                        return _row_map.get(key)
                 return None
 
             event_times = {
@@ -198,10 +226,3 @@ def parse_stat_rows(stat_path: Path) -> list[dict[str, object]]:
                 }
             )
     return rows
-
-
-def load_run_event_info(stat_path: Path, run_number: int) -> dict[str, object] | None:
-    for row in parse_stat_rows(stat_path):
-        if int(row["run_number"]) == int(run_number):
-            return row
-    return None

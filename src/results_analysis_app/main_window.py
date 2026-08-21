@@ -17,7 +17,7 @@ from results_analysis_app import (
     scanner,
     storage,
     sustained_sdpf,
-    voltage_envelope,
+    sustained_sdpf_heatmap,
 )
 from results_analysis_app.background import BackgroundTask, CancelToken, OperationCancelled
 from results_analysis_app.exclusions import (
@@ -35,7 +35,7 @@ from results_analysis_app.models import (
     ProjectEntry,
     ScopeEntry,
 )
-from results_analysis_app.project_config import load_voltage_configs
+from results_analysis_app.project_config import is_number, load_voltage_configs
 from results_analysis_app.styles import (
     apply_choice_button_style,
     apply_run_button_style,
@@ -136,24 +136,16 @@ def _group_high_voltage_proposals(
     return grouped
 
 
-def _fault_types_by_case_run(project_path: str) -> dict[tuple[str, int], str]:
-    try:
-        frame = voltage_envelope._read_stat_files(Path(project_path).resolve())
-    except (OSError, UnicodeError, ValueError):
+def _fault_types_by_case_run_for_scan(
+    scan: scanner.ProjectScan,
+) -> dict[tuple[str, int], str]:
+    if not scan.fault_types_by_run:
         return {}
-    if frame.empty or "Case" not in frame.columns or "Run#" not in frame.columns:
-        return {}
-    result: dict[tuple[str, int], str] = {}
-    for record in frame.to_dict("records"):
-        try:
-            run = int(record.get("Run#"))
-        except (TypeError, ValueError):
-            continue
-        case = str(record.get("Case", "")).strip().casefold()
-        fault_type = str(record.get("Fault_type", "")).strip()
-        if case and fault_type and fault_type.casefold() != "nan":
-            result[(case, run)] = fault_type
-    return result
+    return {
+        (case.name.casefold(), run): fault_type
+        for case in scan.case_infos
+        for run, fault_type in scan.fault_types_by_run.items()
+    }
 
 
 def _select_project_directories(
@@ -397,9 +389,16 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(controls)
 
         self.project_tree = QtWidgets.QTreeWidget(panel)
+        self.project_tree.setObjectName("projectTree")
         self.project_tree.setHeaderLabels(["Project", "Status"])
         self.project_tree.setRootIsDecorated(False)
         self.project_tree.setAlternatingRowColors(True)
+        self.project_tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.project_tree.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
         self.project_tree.setMinimumWidth(340)
         self.project_tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         project_header = self.project_tree.header()
@@ -410,6 +409,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_tree.setColumnWidth(1, 170)
         self.project_tree.itemChanged.connect(self._on_project_item_changed)
         self.project_tree.currentItemChanged.connect(self._on_project_selection_changed)
+        self.project_tree.itemDoubleClicked.connect(self._handle_project_tree_double_click)
 
         layout.addWidget(self.project_tree, 1)
 
@@ -615,35 +615,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_list = QtWidgets.QListWidget(panel)
         self.scope_list.itemChanged.connect(self._on_scope_item_changed)
         self.scope_list.currentItemChanged.connect(lambda _new, _old: self.update_preview())
+        self.scope_list.itemDoubleClicked.connect(self.rename_selected_scope)
+        self.scope_list.setToolTip("Double-click a scope to rename it.")
         layout.addWidget(self.scope_list, 1)
 
         self.scope_tokens_edit = QtWidgets.QLineEdit(panel)
         self.scope_tokens_edit.setPlaceholderText("Tokens, for example: C25, C23")
         layout.addWidget(self.scope_tokens_edit)
 
-        scope_controls = QtWidgets.QGridLayout()
+        scope_controls = QtWidgets.QHBoxLayout()
         self.add_exclude_scope_button = QtWidgets.QPushButton("Add Exclude", panel)
         self.add_include_scope_button = QtWidgets.QPushButton("Add Include", panel)
-        self.rename_scope_button = QtWidgets.QPushButton("Rename", panel)
         self.delete_scope_button = QtWidgets.QPushButton("Delete", panel)
         for button in (
             self.add_exclude_scope_button,
             self.add_include_scope_button,
-            self.rename_scope_button,
             self.delete_scope_button,
         ):
             apply_secondary_button_style(button)
-        scope_controls.addWidget(self.add_exclude_scope_button, 0, 0)
-        scope_controls.addWidget(self.add_include_scope_button, 0, 1)
-        scope_controls.addWidget(self.rename_scope_button, 1, 0)
-        scope_controls.addWidget(self.delete_scope_button, 1, 1)
+            scope_controls.addWidget(button, 1)
         layout.addLayout(scope_controls)
 
         advanced = QtWidgets.QGroupBox("Analysis Steps", panel)
         advanced_layout = QtWidgets.QVBoxLayout(advanced)
+        top_step_row = QtWidgets.QHBoxLayout()
         self.build_envelopes_button = QtWidgets.QPushButton("Build envelope data/checks", advanced)
+        self.rebuild_heatmaps_button = QtWidgets.QPushButton("Rebuild heatmaps", advanced)
         apply_secondary_button_style(self.build_envelopes_button)
-        advanced_layout.addWidget(self.build_envelopes_button)
+        apply_secondary_button_style(self.rebuild_heatmaps_button)
+        top_step_row.addWidget(self.build_envelopes_button, 1)
+        top_step_row.addWidget(self.rebuild_heatmaps_button, 1)
+        advanced_layout.addLayout(top_step_row)
         step_columns = QtWidgets.QHBoxLayout()
         event_steps = QtWidgets.QGroupBox("TOV/SFO/SA", advanced)
         event_layout = QtWidgets.QVBoxLayout(event_steps)
@@ -667,6 +669,7 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced_layout.addLayout(step_columns)
 
         self.build_envelopes_button.setToolTip("Build voltage envelope data workbooks and selected analysis checks. Existing chart workbooks are not rebuilt.")
+        self.rebuild_heatmaps_button.setToolTip("Regenerate Sustained SDPF heatmaps from saved analysis results without rereading waveform files or rebuilding other plots.")
         self.rebuild_envelope_charts_button.setToolTip("Recreate combined envelope chart workbooks from existing envelope workbooks.")
         self.create_event_batches_button.setToolTip("Create SFO/TOV/SA plot batch workbooks from existing envelopes.")
         self.render_event_plots_button.setToolTip("Render SFO/TOV/SA plots from existing event batch workbooks.")
@@ -677,9 +680,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.add_exclude_scope_button.clicked.connect(lambda: self.add_scope("exclude"))
         self.add_include_scope_button.clicked.connect(lambda: self.add_scope("include"))
-        self.rename_scope_button.clicked.connect(self.rename_selected_scope)
         self.delete_scope_button.clicked.connect(self.delete_selected_scope)
         self.build_envelopes_button.clicked.connect(self.build_envelopes_only)
+        self.rebuild_heatmaps_button.clicked.connect(self.rebuild_heatmaps_only)
         self.rebuild_envelope_charts_button.clicked.connect(self.rebuild_envelope_charts_only)
         self.create_event_batches_button.clicked.connect(self.create_event_batches_only)
         self.render_event_plots_button.clicked.connect(self.render_event_plots_only)
@@ -796,13 +799,6 @@ class MainWindow(QtWidgets.QMainWindow):
         unique = {str(voltage).strip() for voltage in voltages if str(voltage).strip()}
         return sorted(unique, key=self._voltage_sort_key)
 
-    def _is_number(self, value: str) -> bool:
-        try:
-            float(value)
-        except ValueError:
-            return False
-        return True
-
     def _reload_project_tree(self) -> None:
         self.project_tree.clear()
         for project in self.session.projects:
@@ -856,7 +852,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_current_project_exclusions()
 
     def _voltage_sort_key(self, value: str) -> tuple[int, float | str]:
-        return (0, float(value)) if self._is_number(value) else (1, value)
+        return (0, float(value)) if is_number(value) else (1, value)
 
     def _selected_scan(self) -> scanner.ProjectScan | None:
         project_path = self._current_project_path()
@@ -999,7 +995,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if needs_fault_types:
             fault_types = self._fault_types_by_project.get(project_path)
             if fault_types is None:
-                fault_types = _fault_types_by_case_run(project_path)
+                scan = self.project_scans.get(project_path)
+                fault_types = _fault_types_by_case_run_for_scan(scan) if scan is not None else {}
                 self._fault_types_by_project[project_path] = fault_types
 
         prepared_rows = []
@@ -1508,6 +1505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         current: QtWidgets.QTreeWidgetItem | None,
         _previous: QtWidgets.QTreeWidgetItem | None,
     ) -> None:
+        self._update_project_selection_visual(current)
         if current is None:
             self._load_dashboard_figure_list(None)
             self._reload_project_exclusions()
@@ -1515,6 +1513,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_dashboard_figure_list(str(current.data(0, USER_ROLE_PATH)))
         self._reload_project_exclusions()
         self.update_preview()
+
+    def _update_project_selection_visual(
+        self,
+        current: QtWidgets.QTreeWidgetItem | None,
+    ) -> None:
+        """Keep the active project obvious even when the tree loses focus."""
+        for row in range(self.project_tree.topLevelItemCount()):
+            item = self.project_tree.topLevelItem(row)
+            font = item.font(0)
+            is_current = item is current
+            if font.bold() != is_current:
+                font.setBold(is_current)
+                item.setFont(0, font)
+
+    def _handle_project_tree_double_click(
+        self,
+        item: QtWidgets.QTreeWidgetItem | None,
+        column: int,
+    ) -> None:
+        if item is None:
+            return
+        if self.project_tree.currentItem() is not item:
+            self.project_tree.setCurrentItem(item)
+        if column == 0:
+            self.open_settings_dialog()
+        elif column == 1:
+            project_path = item.data(0, USER_ROLE_PATH)
+            if project_path:
+                QtGui.QDesktopServices.openUrl(
+                    QtCore.QUrl.fromLocalFile(str(project_path))
+                )
 
     def _on_scope_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         if self._loading:
@@ -1537,9 +1566,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _current_project_path(self) -> str | None:
         item = self.project_tree.currentItem()
-        if item is None:
-            return None
-        return str(item.data(0, USER_ROLE_PATH))
+        if item is not None:
+            return str(item.data(0, USER_ROLE_PATH))
+        # The tree can temporarily have no current row after a background
+        # refresh.  Project-specific dialogs still need a deterministic
+        # project in that state.
+        for project in self.session.projects:
+            if project.selected:
+                return project.path
+        return self.session.projects[0].path if self.session.projects else None
 
     def _checked_dashboard_figure_ids(self) -> list[str]:
         checked: list[str] = []
@@ -1669,13 +1704,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave()
         self.update_preview()
 
-    def rename_selected_scope(self) -> None:
-        item = self.scope_list.currentItem()
+    def rename_selected_scope(self, item: QtWidgets.QListWidgetItem | None = None) -> None:
+        if item is None:
+            item = self.scope_list.currentItem()
         if item is None:
             return
         folder = item.data(USER_ROLE_SCOPE_FOLDER)
         scope = self._scope_by_folder(str(folder))
-        if scope is None or scope.mode == "full":
+        if scope is None:
             return
         name, ok = QtWidgets.QInputDialog.getText(
             self,
@@ -1799,11 +1835,38 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return projects, scopes
 
+    def _start_selected_action(
+        self,
+        action: str,
+        title: str,
+        work_factory,
+        on_success_factory=None,
+    ) -> None:
+        """Run a selected-project action without repeating its task plumbing."""
+        selected = self._selected_work(action)
+        if selected is None:
+            return
+        projects, scopes = selected
+
+        def work(log, cancel):
+            return work_factory(projects, scopes, log, cancel)
+
+        on_success = (
+            on_success_factory(projects)
+            if on_success_factory is not None
+            else None
+        )
+        self._start_background_task(title, work, on_success)
+
     def _ensure_voltage_um(self, projects: list[str], voltages: list[str]) -> bool:
         for project_path in projects:
             overrides = self.session.voltage_um_overrides_by_project.get(project_path, {})
-            configs = load_voltage_configs(project_path, um_overrides=overrides)
-            missing = [voltage for voltage in voltages if voltage not in configs]
+            scan = self.project_scans.get(project_path)
+            available = set(scan.voltage_configs) if scan is not None else set(
+                load_voltage_configs(project_path, um_overrides={})
+            )
+            available.update(overrides)
+            missing = [voltage for voltage in voltages if voltage not in available]
             if not missing:
                 continue
             self._select_project_path(project_path)
@@ -1821,8 +1884,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             self.open_settings_dialog("Voltage Um")
             overrides = self.session.voltage_um_overrides_by_project.get(project_path, {})
-            configs = load_voltage_configs(project_path, um_overrides=overrides)
-            still_missing = [voltage for voltage in voltages if voltage not in configs]
+            available = set(scan.voltage_configs) if scan is not None else set(
+                load_voltage_configs(project_path, um_overrides={})
+            )
+            available.update(overrides)
+            still_missing = [voltage for voltage in voltages if voltage not in available]
             if still_missing:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -1932,6 +1998,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 if project_path in known_paths
             }
         )
+        for project_path, scan in scans.items():
+            if project_path not in known_paths:
+                continue
+            self._fault_types_by_project[project_path] = _fault_types_by_case_run_for_scan(scan)
+            metadata = sustained_sdpf_heatmap.metadata_from_cases(
+                [case.name for case in scan.case_infos],
+                self._fault_types_by_project[project_path],
+                scan.fault_types_by_run,
+            )
+            if project_path not in self.session.sustained_sdpf_heatmap_settings_by_project:
+                default_set = sustained_sdpf_heatmap.HeatmapSet(
+                    sustained_sdpf_heatmap.default_heatmap_set_name(metadata),
+                    sustained_sdpf_heatmap.HeatmapSettings().normalized(metadata),
+                )
+                self.session.sustained_sdpf_heatmap_settings_by_project[project_path] = (
+                    sustained_sdpf_heatmap.heatmap_sets_to_mapping((default_set,))
+                )
+            else:
+                existing_sets = list(
+                    sustained_sdpf_heatmap.heatmap_sets_from_mapping(
+                        self.session.sustained_sdpf_heatmap_settings_by_project[project_path]
+                    )
+                )
+                migrated_sets = [
+                    sustained_sdpf_heatmap.migrate_legacy_default_heatmap_set(
+                        heatmap_set,
+                        metadata,
+                    )
+                    if index == 0
+                    else heatmap_set
+                    for index, heatmap_set in enumerate(existing_sets)
+                ]
+                if migrated_sets != existing_sets:
+                    self.session.sustained_sdpf_heatmap_settings_by_project[project_path] = (
+                        sustained_sdpf_heatmap.heatmap_sets_to_mapping(migrated_sets)
+                    )
         self.project_scans = {
             project_path: scan
             for project_path, scan in self.project_scans.items()
@@ -2204,6 +2306,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         dashboard_figure_ids = list(self.session.dashboard_figure_selection)
         envelope_kwargs = self._envelope_build_kwargs(projects)
+        envelope_kwargs["sustained_sdpf_heatmap_settings_by_project"] = dict(
+            self.session.sustained_sdpf_heatmap_settings_by_project
+        )
+        envelope_kwargs["sustained_sdpf_ranking_settings_by_project"] = (
+            self._sustained_sdpf_ranking_settings_by_project()
+        )
 
         def work(log, cancel):
             log("Analysis started.")
@@ -2215,6 +2323,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 voltages,
                 events,
                 dashboard_figure_ids=dashboard_figure_ids,
+                excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 **envelope_kwargs,
                 log=prompt_log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2251,7 +2360,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 projects,
                 scopes,
                 voltages,
-                self.session.events,
                 **envelope_kwargs,
                 build_charts=False,
                 log=prompt_log,
@@ -2267,6 +2375,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 projects,
                 refresh_envelopes=True,
                 refresh_high_voltage_exclusions=True,
+            ),
+        )
+
+    def rebuild_heatmaps_only(self) -> None:
+        selected = self._selected_work("Rebuild heatmaps")
+        if selected is None:
+            return
+        projects, scopes = selected
+        sustained_sdpf_settings = self._sustained_sdpf_settings()
+        heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
+
+        def work(log, cancel):
+            log("Sustained SDPF heatmap rebuild started.")
+            actions.rebuild_heatmaps(
+                projects,
+                scopes,
+                sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
+                event_times=dict(self.session.event_times),
+                log=log,
+                check_cancel=cancel.throw_if_cancelled,
+            )
+            log("Sustained SDPF heatmap rebuild complete.")
+
+        self._start_background_task(
+            "Rebuilding heatmaps",
+            work,
+            lambda _result: self._refresh_project_status_after_action(
+                projects,
+                refresh_plots=True,
             ),
         )
 
@@ -2300,12 +2438,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def create_event_batches_only(self) -> None:
-        selected = self._selected_work("Create event batches")
-        if selected is None:
-            return
-        projects, scopes = selected
-
-        def work(log, cancel):
+        def work(projects, scopes, log, cancel):
             log("Event plot batch creation started.")
             written = actions.create_plot_batches(
                 projects,
@@ -2313,21 +2446,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session.voltages,
                 self.session.events,
                 dict(self.session.event_times),
+                excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
             log(f"Event plot batch creation complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task("Creating event plot batches", work)
+        self._start_selected_action("Create event batches", "Creating event plot batches", work)
 
     def render_event_plots_only(self) -> None:
-        selected = self._selected_work("Render event plots")
-        if selected is None:
-            return
-        projects, scopes = selected
-
-        def work(log, cancel):
+        def work(projects, scopes, log, cancel):
             log("Event plot rendering started.")
             actions.render_plot_batches(
                 projects,
@@ -2338,22 +2467,18 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             log("Event plot rendering complete.")
 
-        self._start_background_task(
+        self._start_selected_action(
+            "Render event plots",
             "Rendering event plots",
             work,
-            lambda _result: self._refresh_project_status_after_action(
+            lambda projects: lambda _result: self._refresh_project_status_after_action(
                 projects,
                 refresh_plots=True,
             ),
         )
 
     def rebuild_analysis_charts_only(self) -> None:
-        selected = self._selected_work("Rebuild analysis charts")
-        if selected is None:
-            return
-        projects, scopes = selected
-
-        def work(log, cancel):
+        def work(projects, scopes, log, cancel):
             log("Analysis chart rebuild started.")
             written = actions.rebuild_analysis_charts(
                 projects,
@@ -2365,10 +2490,11 @@ class MainWindow(QtWidgets.QMainWindow):
             log(f"Analysis chart rebuild complete: {len(written)} workbooks.")
             return written
 
-        self._start_background_task(
+        self._start_selected_action(
+            "Rebuild analysis charts",
             "Rebuilding analysis charts",
             work,
-            lambda _result: self._refresh_project_status_after_action(
+            lambda projects: lambda _result: self._refresh_project_status_after_action(
                 projects,
                 refresh_envelopes=True,
             ),
@@ -2381,6 +2507,8 @@ class MainWindow(QtWidgets.QMainWindow):
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
+        ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
 
         def work(log, cancel):
             log("Analysis plot batch creation started.")
@@ -2392,6 +2520,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 dict(self.session.event_times),
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
+                sustained_sdpf_ranking_settings_by_project=ranking_settings,
+                excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -2407,6 +2538,9 @@ class MainWindow(QtWidgets.QMainWindow):
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
+        ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
+        limit_overrides = dict(self.session.sustained_sdpf_limit_overrides_by_project)
 
         def work(log, cancel):
             log("Analysis plot rendering started.")
@@ -2416,6 +2550,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 (),
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
+                sustained_sdpf_ranking_settings_by_project=ranking_settings,
+                event_times=dict(self.session.event_times),
+                sustained_sdpf_limit_overrides_by_project=limit_overrides,
+                sustained_voltage_keys=self.session.voltages,
+                excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
             )
@@ -2439,6 +2579,8 @@ class MainWindow(QtWidgets.QMainWindow):
         events = list(self.session.events)
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
+        ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
 
         def work(log, cancel):
             log("Report rebuild started.")
@@ -2453,6 +2595,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session.dashboard_figure_selection,
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
+                sustained_sdpf_ranking_settings_by_project=ranking_settings,
                 event_times=dict(self.session.event_times),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2519,6 +2663,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sustained_sdpf_settings(self) -> dict[str, object]:
         return sustained_sdpf.SustainedSDPFSettings.from_session(self.session).to_mapping()
 
+    def _sustained_sdpf_ranking_settings_by_project(self) -> dict[str, dict[str, bool]]:
+        return {
+            str(project): sustained_sdpf.SustainedSDPFRankingSettings.from_mapping(settings).to_mapping()
+            for project, settings in self.session.sustained_sdpf_ranking_settings_by_project.items()
+        }
+
+    def _sustained_sdpf_heatmap_metadata(self, project_path: str):
+        scan = self.project_scans.get(project_path)
+        case_names = [case.name for case in scan.case_infos] if scan is not None else []
+        fault_types = self._fault_types_by_project.get(project_path)
+        if fault_types is None:
+            fault_types = _fault_types_by_case_run_for_scan(scan) if scan is not None else {}
+            self._fault_types_by_project[project_path] = fault_types
+        return sustained_sdpf_heatmap.metadata_from_cases(
+            case_names,
+            fault_types,
+            scan.fault_types_by_run if scan is not None else None,
+        )
+
     def _project_chart_axis_kwargs(self, project_paths: Iterable[str]) -> dict[str, object]:
         x_max_by_project: dict[str, float | None] = {}
         x_major_by_project: dict[str, float | None] = {}
@@ -2572,6 +2735,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 for path in paths
                 if (scan := self.project_scans.get(path)) is not None
             },
+            "voltage_configs_by_project": {
+                path: scan.voltage_configs
+                for path in paths
+                if (scan := self.project_scans.get(path)) is not None
+            },
+            "sustained_sdpf_limits_by_project": {
+                path: scan.sustained_sdpf_limits
+                for path in paths
+                if (scan := self.project_scans.get(path)) is not None
+            },
+            "nonconv_cases_by_project": {
+                path: scan.nonconv_cases
+                for path in paths
+                if (scan := self.project_scans.get(path)) is not None
+            },
             "high_voltage_limit_factor": float(self.session.high_voltage_limit_factor),
             "nonconv_cb_iip_limit": float(self.session.nonconv_cb_iip_limit),
             "nonconv_cb_iir_limit": float(self.session.nonconv_cb_iir_limit),
@@ -2587,6 +2765,9 @@ class MainWindow(QtWidgets.QMainWindow):
             },
             "resonance_settings": self._resonance_settings(),
             "sustained_sdpf_settings": self._sustained_sdpf_settings(),
+            "sustained_sdpf_limit_overrides_by_project": dict(
+                self.session.sustained_sdpf_limit_overrides_by_project
+            ),
         }
 
     def _start_background_task(self, title: str, work, on_success=None) -> None:
@@ -2679,7 +2860,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Continue with {frequency} Hz",
             QtWidgets.QMessageBox.ButtonRole.AcceptRole,
         )
-        stop_button = message_box.addButton("Stop run", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        message_box.addButton("Stop run", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         settings_button = message_box.addButton(
             "Stop and open Settings",
             QtWidgets.QMessageBox.ButtonRole.ActionRole,
@@ -2739,6 +2920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.build_reports_button.setEnabled(not busy)
         self.settings_button.setEnabled(not busy)
         self.build_envelopes_button.setEnabled(not busy)
+        self.rebuild_heatmaps_button.setEnabled(not busy)
         self.rebuild_envelope_charts_button.setEnabled(not busy)
         self.create_event_batches_button.setEnabled(not busy)
         self.render_event_plots_button.setEnabled(not busy)

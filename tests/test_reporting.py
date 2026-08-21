@@ -63,6 +63,28 @@ def test_plot_report_heading_parses_generated_mm_filename() -> None:
     assert no_fault_heading == "Case: O1_V3_S3 | Run: 2 | Element: MM_161_TPC1 | Trace: LGp & LLp"
 
 
+def test_heatmap_report_heading_uses_set_dimensions_not_filename() -> None:
+    from pathlib import Path
+
+    from results_analysis_app.reporting import _heatmap_plot_heading_from_image_path
+    from results_analysis_app.sustained_sdpf_heatmap import HeatmapSettings
+
+    assert _heatmap_plot_heading_from_image_path(
+        Path("MM_230_1_heatmap.png"),
+        HeatmapSettings(split_by="S"),
+    ) == "Split S: S1"
+    assert _heatmap_plot_heading_from_image_path(
+        Path("MM_230_1_02_heatmap.png"),
+        HeatmapSettings(split_by="S"),
+    ) == "Split S: S1 · Panel 2"
+    assert _heatmap_plot_heading_from_image_path(
+        Path("MM_230_faceted_01_heatmap.png"),
+    ) == "Combined panels"
+    assert _heatmap_plot_heading_from_image_path(
+        Path("MM_230_All_heatmap.png"),
+    ) == ""
+
+
 def test_report_figure_fields_and_heading_numbering() -> None:
     from docx import Document
     from docx.oxml.ns import qn
@@ -132,6 +154,63 @@ def test_report_figure_fields_and_heading_numbering() -> None:
     assert "PAGE \\* MERGEFORMAT" in document.sections[0].footer._element.xml
 
 
+def test_report_table_fields_and_caption() -> None:
+    from docx import Document
+
+    from results_analysis_app.reporting import (
+        _TableRegistry,
+        _add_table_reference_sentence,
+        _configure_report_styles,
+        _create_heading_numbering,
+    )
+
+    document = Document()
+    _configure_report_styles(document)
+    _create_heading_numbering(document)
+    registry = _TableRegistry()
+    reference = registry.allocate()
+    _add_table_reference_sentence(document, "", reference, " summarizes selected cases.")
+    registry.add_caption(document, reference, "Selected Sustained SDPF cases at 66 kV")
+
+    assert "SEQ Table \\* ARABIC \\s 1" in document._element.xml
+    assert "REF ReportTable1 \\h" in document._element.xml
+    assert document.paragraphs[-1].text == (
+        "Table 1-1 – Selected Sustained SDPF cases at 66 kV"
+    )
+
+
+def test_sustained_report_layout_version_invalidates_report_signature(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import resonance_checks, reporting, sustained_sdpf
+    from results_analysis_app.models import ScopeEntry
+
+    arguments = (
+        tmp_path,
+        ScopeEntry.full(),
+        "66",
+        [],
+        [],
+        resonance_checks.ResonanceSettings(),
+        None,
+        sustained_sdpf.SustainedSDPFSettings(enabled=True),
+        sustained_sdpf.SustainedSDPFRankingSettings(),
+        {},
+        False,
+        {},
+        True,
+    )
+    first = reporting._report_manifest_payload(*arguments)
+    assert first["sustained_sdpf_report_layout_version"] == reporting.SUSTAINED_REPORT_LAYOUT_VERSION
+    first_signature = reporting._report_signature(first)
+
+    monkeypatch.setattr(
+        reporting,
+        "SUSTAINED_REPORT_LAYOUT_VERSION",
+        reporting.SUSTAINED_REPORT_LAYOUT_VERSION + 1,
+    )
+    second = reporting._report_manifest_payload(*arguments)
+    assert reporting._report_signature(second) != first_signature
+
+
 def test_report_builder_embeds_styles_without_template(tmp_path) -> None:
     from docx import Document
 
@@ -155,8 +234,158 @@ def test_report_builder_embeds_styles_without_template(tmp_path) -> None:
     )
     assert document.sections[0].footer.paragraphs[0].text == "Page 1"
     assert document.paragraphs[0].style.name == "Heading 1"
-    assert document.paragraphs[0].text.endswith(" - Full")
+    assert document.paragraphs[0].text == "161 kV Voltage Assessment"
     assert document.paragraphs[1].style.name == "Body Text"
+
+
+def test_report_logs_unavailable_sustained_cache(tmp_path) -> None:
+    from docx import Document
+
+    from results_analysis_app.models import ScopeEntry
+    from results_analysis_app.reporting import build_reports_from_existing_plots
+
+    logs = []
+    outputs = build_reports_from_existing_plots(
+        [tmp_path],
+        [ScopeEntry.full()],
+        ["66"],
+        [],
+        sustained_sdpf_settings={"enabled": True, "duration_ms": 30.0},
+        log=logs.append,
+    )
+
+    assert len(outputs) == 1
+    assert any("Sustained SDPF report data unavailable" in message for message in logs)
+    document = Document(outputs[0])
+    assert "Sustained SDPF" not in "\n".join(
+        paragraph.text for paragraph in document.paragraphs
+    )
+
+
+def test_sustained_report_maps_images_by_population(tmp_path, monkeypatch) -> None:
+    from docx import Document
+
+    from results_analysis_app import reporting, sustained_sdpf
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    image_path = tmp_path / "sustained.png"
+    image_path.write_bytes(b"placeholder")
+    phase = sustained_sdpf.PhaseStressResult(
+        measurement="LGp",
+        phase="A-G",
+        sdpf_rms_kv=1.0,
+        sdpf_peak_kv=2.0,
+        margin_rms_kv=1.0 / 1.15,
+        margin_peak_kv=2.0 / 1.15,
+        longest_margin_s=0.03,
+        longest_sdpf_s=0.03,
+        sustained_peak_kv=2.0,
+        sustained_rms_kv=1.2,
+        sustained_ratio=1.0,
+        classification="SDPF limit",
+        margin_exceeded=True,
+        sdpf_exceeded=True,
+        sdpf_excess_area_norm_ms=0.5,
+        sdpf_longest_continuous_s=0.04,
+        sdpf_sustained_t_peak_kv=2.0,
+        sdpf_sustained_t_rms_kv=1.2,
+        sdpf_sustained_t_ratio=1.0,
+    )
+    result = sustained_sdpf.SustainedSDPFResult(
+        scope_folder="Full",
+        voltage="66",
+        case="C1",
+        run=1,
+        mm_name="MM_66_A",
+        fault_type="AG",
+        duration_s=0.03,
+        governing=phase,
+        phases=(phase,),
+    )
+    validation = sustained_sdpf.SustainedSDPFCacheValidation(
+        valid=True,
+        shared_manifest_current=True,
+    )
+    captured = {"image_paths": []}
+    monkeypatch.setattr(
+        reporting,
+        "_load_sustained_sdpf_report_results",
+        lambda *_args, **_kwargs: (
+            {
+                sustained_sdpf.ACTUAL_SDPF_POPULATION: {
+                    sustained_sdpf.CUMULATIVE_STRESS_SELECTION: result,
+                }
+            },
+            validation,
+        ),
+    )
+    monkeypatch.setattr(reporting, "_find_event_images", lambda *_args: [image_path])
+    monkeypatch.setattr(
+        reporting,
+        "_sustained_image_for_result",
+        lambda *_args: image_path,
+    )
+    monkeypatch.setattr(
+        reporting,
+        "_add_centered_report_image",
+        lambda _doc, path: captured["image_paths"].append(path),
+    )
+
+    outputs = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["66"],
+        [],
+        sustained_sdpf_settings={"enabled": True, "duration_ms": 30.0},
+        sustained_sdpf_heatmap_settings_by_project={
+            str(project.resolve()): {"enabled": False},
+        },
+        render_heatmaps=False,
+    )
+
+    assert len(outputs) == 1
+    assert captured["image_paths"] == [image_path]
+    document = Document(outputs[0])
+    assert "Sustained SDPF" in "\n".join(
+        paragraph.text for paragraph in document.paragraphs
+    )
+    assert len(document.tables) == 1
+    report_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert "Selected Sustained SDPF case" in report_text
+    assert "Figure 1-1" in report_text
+    assert "Table 1-1" in report_text
+
+
+def test_report_builder_skips_unchanged_report(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    first = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+    )
+
+    def should_not_build(*_args, **_kwargs):
+        raise AssertionError("unchanged report was rebuilt")
+
+    monkeypatch.setattr(reporting, "_configure_report_styles", should_not_build)
+    logs = []
+    second = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        log=logs.append,
+    )
+
+    assert second == first
+    assert "Skipping unchanged report" in "\n".join(logs)
 
 
 def test_report_plot_heading_precedes_cross_reference(tmp_path, monkeypatch) -> None:
@@ -307,8 +536,8 @@ def test_report_places_envelope_section_before_dashboard_section(tmp_path, monke
         if paragraph.style.name == "Caption"
     ]
     assert headings == [
-        "161 kV - Envelope - Full",
-        "161 kV - Dashboard Figures - Full",
+        "Voltage Envelope",
+        "Dashboard Figures",
     ]
     assert captions[0].startswith("Figure 1-1")
     assert captions[1].startswith("Figure 1-2")

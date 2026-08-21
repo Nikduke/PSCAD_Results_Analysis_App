@@ -37,6 +37,16 @@ def test_project_frequency_reads_input_data_b16(tmp_path) -> None:
     assert load_project_frequency(tmp_path) == 60.0
 
 
+def test_shared_float_parser_rejects_nonfinite_values() -> None:
+    from results_analysis_app.common import as_float
+
+    assert as_float(" 12.5 ") == 12.5
+    assert as_float("") is None
+    assert as_float("nan") is None
+    assert as_float("inf") is None
+    assert as_float("inf", finite=False) == float("inf")
+
+
 def test_voltage_configs_missing_workbook_has_no_legacy_fallback(tmp_path) -> None:
     from results_analysis_app.project_config import load_voltage_configs
 
@@ -93,6 +103,28 @@ def test_project_scan_voltage_sources_ignore_results_csv_and_outputs(tmp_path) -
     scan = scanner.scan_project(project)
 
     assert scan.available_voltages == ["66", "161"]
+
+
+def test_project_scan_caches_existing_um_and_sdpf_limits(tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app import scanner
+
+    project = tmp_path / "Project"
+    (project / "Case_folder").mkdir(parents=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "MM_blocks"
+    sheet.append(["Group", "Un", "Um", "SDPF_LG", "SDPF_LL"])
+    sheet.append(["MM_161_A", 161, 170.0, 325.0, 325.0])
+    workbook.save(project / "Input_Data_PSCAD_Python_v11.xlsx")
+    workbook.close()
+
+    scan = scanner.scan_project(project)
+
+    assert scan.voltage_configs["161"].um == 170.0
+    assert scan.sustained_sdpf_limits["161"].rms("LGp") == 325.0
+    assert scan.sustained_sdpf_limits["161"].peak("LLp") == 325.0 * 2**0.5
 
 
 def test_project_scan_ignores_corrupt_envelope_workbook(tmp_path) -> None:
@@ -217,8 +249,39 @@ def test_scan_cache_deserializer_tolerates_null_collections(tmp_path) -> None:
     assert scan.messages == []
 
 
+def test_project_fault_types_read_one_statistic_file(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import voltage_envelope
+
+    project = tmp_path / "Project"
+    case_root = project / "Case_folder" / "C1.if18"
+    case_root.mkdir(parents=True)
+    statistic = case_root / "Statistic_0001.out"
+    statistic.write_text(
+        " Multiple Run Output File\n"
+        "  Run #               T_sw         FLT_type          Tswitch       Fault_type       Fault_time\n"
+        "    1          10.20000000         1             10.20000000         1             10.10000000\n"
+        "    2          10.20083300         4             10.20083300         4             10.10083300\n",
+        encoding="utf-8",
+    )
+    calls = []
+    original_read = voltage_envelope._read_stat_file
+
+    def counted_read(path):
+        calls.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(voltage_envelope, "_read_stat_file", counted_read)
+
+    assert voltage_envelope.read_project_fault_types(project) == {1: "AG", 2: "ABG"}
+    assert calls == [statistic]
+
+
 def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs(tmp_path) -> None:
+    import json
+
     from results_analysis_app import project_scan_cache, scanner
+    from results_analysis_app.project_config import VoltageConfig
+    from results_analysis_app.sustained_sdpf import SDPFVoltageLimits
 
     project = tmp_path / "Project"
     case_root = project / "Case_folder"
@@ -231,6 +294,7 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
         exists=True,
         chips=["Ready"],
         case_infos=[scanner.CaseInfo(name="C1", inf_path=inf_path)],
+        fault_types_by_run={1: "AG"},
         high_voltage_exclusions=[
             scanner.HighVoltageExclusion(
                 voltage="66",
@@ -242,6 +306,13 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
             )
         ],
         available_voltages=["66"],
+        voltage_configs={
+            "66": VoltageConfig("66", "MM_66", 72.0),
+        },
+        sustained_sdpf_limits={
+            "66": SDPFVoltageLimits(66.0, 140.0, 140.0),
+        },
+        sustained_sdpf_limit_warnings=["example warning"],
     )
     cache_path = tmp_path / "project_scan_cache.json"
 
@@ -251,6 +322,11 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
         (450.0, 250.0),
         cache_path,
     )
+    cache_text = cache_path.read_text(encoding="utf-8")
+    assert cache_text == json.dumps(
+        json.loads(cache_text),
+        separators=(",", ":"),
+    ) + "\n"
     cached = project_scan_cache.cached_scan(
         project_scan_cache.load(cache_path),
         project_path,
@@ -259,6 +335,10 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
 
     assert cached is not None
     assert cached.available_voltages == ["66"]
+    assert cached.fault_types_by_run == {1: "AG"}
+    assert cached.voltage_configs["66"].um == 72.0
+    assert cached.sustained_sdpf_limits["66"].rms("LGp") == 140.0
+    assert cached.sustained_sdpf_limit_warnings == ["example warning"]
     assert cached.high_voltage_exclusions[0].source == "Both"
     assert cached.high_voltage_exclusions[0].excluded is True
     inf_path.write_text(inf_path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
@@ -736,7 +816,7 @@ def test_project_open_scans_and_caches_hv_log_maxima_for_factor_changes(
 ) -> None:
     import pytest
 
-    from results_analysis_app import project_scan_runner, scanner
+    from results_analysis_app import project_scan_runner
 
     project = tmp_path / "Project"
     case_dir = project / "Case_folder" / "C1.if18"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 import math
 import re
 from pathlib import Path
@@ -14,15 +15,27 @@ import numpy as np
 from matplotlib.gridspec import GridSpec
 
 from pscad_plotter_app_v3.models import DEFAULT_TOV_WINDOW_S, PlotJob, PlotMode
+from pscad_plotter_app_v3.services.plot_naming import time_range_filename_token
 from pscad_plotter_app_v3.services.project_conventions import find_stat_file, parse_stat_rows
 from pscad_plotter_app_v3.services.waveform_io import (
     InfDescriptor,
     WaveformFrame,
+    load_out_columns,
     load_out_frame,
     parse_inf_descriptors,
     pgb_to_out_location,
     standard_out_file_path,
 )
+
+
+@dataclass(slots=True)
+class _OutFileColumns:
+    time: np.ndarray
+    values: dict[int, np.ndarray]
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.time.nbytes + sum(value.nbytes for value in self.values.values()))
 
 
 class MatplotlibRenderer:
@@ -54,6 +67,9 @@ class MatplotlibRenderer:
     MAX_STAT_FILE_CACHE = 256
     MAX_EVENT_INFO_CACHE = 128
     MAX_OUT_FILE_CACHE = 256
+    MAX_OUT_CACHE_BYTES = 1024 * 1024 * 1024
+    MAX_GROUP_FRAME_CACHE = 256
+    MAX_GROUP_FRAME_CACHE_BYTES = 512 * 1024 * 1024
 
     def __init__(
         self,
@@ -65,7 +81,10 @@ class MatplotlibRenderer:
         self._inf_cache: OrderedDict[Path, list[InfDescriptor]] = OrderedDict()
         self._stat_file_cache: OrderedDict[Path, Path | None] = OrderedDict()
         self._event_info_cache: OrderedDict[Path, dict[int, dict[str, object]]] = OrderedDict()
-        self._out_file_cache: OrderedDict[Path, WaveformFrame] = OrderedDict()
+        self._out_file_cache: OrderedDict[Path, _OutFileColumns] = OrderedDict()
+        self._out_cache_bytes = 0
+        self._group_frame_cache: OrderedDict[tuple[Path, str, str], WaveformFrame] = OrderedDict()
+        self._group_cache_bytes = 0
 
     def render(self, job: PlotJob) -> Path:
         if job.mode is not PlotMode.MM:
@@ -107,9 +126,12 @@ class MatplotlibRenderer:
         idx_map = self._filter_signals(desc_df, group_label)
         if finder not in idx_map:
             raise ValueError(f"Signal '{finder}' not available for {group_label}")
-        policy = self._get_group_policy()
-        frame = self._load_out_files(inf_path, idx_map[finder], {})
-        return self._standardize_phase_labels(frame, finder)
+        return self._load_standardized_group_frame(
+            inf_path,
+            group_label,
+            finder,
+            idx_df=idx_map[finder],
+        )
 
     def _resolve_inf_path(self, case_name: str, run_number: int) -> Path:
         try:
@@ -123,7 +145,14 @@ class MatplotlibRenderer:
             raise ValueError(f"Combined MM plot requires LGp and LLp for {job.group_label}")
 
         policy = self._get_group_policy()
-        out_cache: dict[int, WaveformFrame] = {}
+        out_cache: dict[int, _OutFileColumns] = {}
+        # Both traces are normally backed by the same .out files. Load their
+        # union once so the second trace does not reparse the text file.
+        self._load_out_files(
+            inf_path,
+            [*idx_map["LGp"], *idx_map["LLp"]],
+            out_cache,
+        )
         bundle_lg = self._process_finder(job, inf_path, idx_map["LGp"], "LGp", "LGp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s)
         bundle_ll = self._process_finder(job, inf_path, idx_map["LLp"], "LLp", "LLp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s)
         basename, title = self._make_labels(job.case_name, job.group_label, job.run_number, "LGp", event_info, combine=True)
@@ -233,13 +262,18 @@ class MatplotlibRenderer:
         type_tag: str,
         event_info: dict[str, object] | None,
         policy: dict[str, Any],
-        out_cache: dict[int, WaveformFrame],
+        out_cache: dict[int, _OutFileColumns],
         show_limits: bool,
         tov_window_s: float,
     ) -> dict[str, Any]:
-        data = self._load_out_files(inf_path, idx_df, out_cache)
+        data = self._load_standardized_group_frame(
+            inf_path,
+            job.group_label,
+            finder,
+            idx_df=idx_df,
+            out_cache=out_cache,
+        )
         group_label = job.group_label
-        data = self._standardize_phase_labels(data, finder)
         data = self._crop_to_job_time_range(job, data)
         analysis = self._analyze_data(data, type_tag, policy, job.limits, show_limits, tov_window_s, job.tov_window_count)
         basename, title = self._make_labels(job.case_name, group_label, job.run_number, finder, event_info)
@@ -297,13 +331,111 @@ class MatplotlibRenderer:
         )
         return stat_path
 
-    def _load_out_frame(self, out_file: Path) -> WaveformFrame:
-        if out_file in self._out_file_cache:
-            self._out_file_cache.move_to_end(out_file)
-            return self._out_file_cache[out_file]
-        frame = load_out_frame(out_file, self._check_cancel)
-        self._remember_cache_item(self._out_file_cache, out_file, frame, self.MAX_OUT_FILE_CACHE)
+    def _load_standardized_group_frame(
+        self,
+        inf_path: Path,
+        group_label: str,
+        finder: str,
+        *,
+        idx_df: list[InfDescriptor],
+        out_cache: dict[int, _OutFileColumns] | None = None,
+    ) -> WaveformFrame:
+        key = (inf_path, str(group_label), str(finder))
+        cached = self._group_frame_cache.get(key)
+        if cached is not None:
+            self._group_frame_cache.move_to_end(key)
+            return cached
+
+        frame = self._load_out_files(
+            inf_path,
+            idx_df,
+            out_cache if out_cache is not None else {},
+        )
+        frame = self._standardize_phase_labels(frame, finder)
+        self._remember_group_frame(key, frame)
         return frame
+
+    def _load_out_file_columns(
+        self,
+        out_file: Path,
+        columns: list[int],
+    ) -> _OutFileColumns:
+        required = sorted({0, *(int(column) for column in columns)})
+        cached = self._out_file_cache.get(out_file)
+        if cached is None:
+            missing = [column for column in required if column != 0]
+        else:
+            missing = [column for column in required if column != 0 and column not in cached.values]
+            if not missing:
+                self._out_file_cache.move_to_end(out_file)
+                return cached
+
+        read_columns = [0, *missing] if cached is not None else required
+        try:
+            loaded = load_out_columns(out_file, read_columns, self._check_cancel)
+            time_values = cached.time if cached is not None else loaded.pop(0)
+            values = dict(cached.values) if cached is not None else {}
+            values.update({column: loaded[column] for column in missing})
+        except (OSError, ValueError, IndexError):
+            # Preserve the waveform reader's tolerant fallback for files
+            # whose spacing or header makes loadtxt reject the fast path.
+            frame = load_out_frame(out_file, self._check_cancel)
+            time_values = cached.time if cached is not None else frame.column_values(0).copy()
+            values = dict(cached.values) if cached is not None else {}
+            for column in missing:
+                values[column] = frame.column_values(column).copy()
+
+        data = _OutFileColumns(time_values, values)
+        self._remember_out_file_columns(out_file, data)
+        return data
+
+    def _remember_out_frame(self, out_file: Path, frame: WaveformFrame) -> None:
+        """Keep compatibility for callers/tests that seed a complete frame."""
+        self._remember_out_file_columns(
+            out_file,
+            _OutFileColumns(
+                frame.column_values(0).copy(),
+                {
+                    column: frame.column_values(column).copy()
+                    for column in range(1, frame.values.shape[1])
+                },
+            ),
+        )
+
+    def _remember_out_file_columns(self, out_file: Path, data: _OutFileColumns) -> None:
+        previous = self._out_file_cache.pop(out_file, None)
+        if previous is not None:
+            self._out_cache_bytes -= previous.nbytes
+        if data.nbytes > self.MAX_OUT_CACHE_BYTES:
+            return
+        self._out_file_cache[out_file] = data
+        self._out_cache_bytes += data.nbytes
+        while self._out_file_cache and (
+            len(self._out_file_cache) > self.MAX_OUT_FILE_CACHE
+            or self._out_cache_bytes > self.MAX_OUT_CACHE_BYTES
+        ):
+            _evicted_path, evicted = self._out_file_cache.popitem(last=False)
+            self._out_cache_bytes -= evicted.nbytes
+
+    def _remember_group_frame(
+        self,
+        key: tuple[Path, str, str],
+        frame: WaveformFrame,
+    ) -> None:
+        previous = self._group_frame_cache.pop(key, None)
+        if previous is not None:
+            self._group_cache_bytes -= int(previous.values.nbytes)
+        frame_bytes = int(frame.values.nbytes)
+        if frame_bytes > self.MAX_GROUP_FRAME_CACHE_BYTES:
+            return
+        self._group_frame_cache[key] = frame
+        self._group_cache_bytes += frame_bytes
+        while self._group_frame_cache and (
+            len(self._group_frame_cache) > self.MAX_GROUP_FRAME_CACHE
+            or self._group_cache_bytes > self.MAX_GROUP_FRAME_CACHE_BYTES
+        ):
+            _evicted_key, evicted = self._group_frame_cache.popitem(last=False)
+            self._group_cache_bytes -= int(evicted.values.nbytes)
 
     def _remember_cache_item(self, cache: OrderedDict, key: Any, value: Any, max_size: int) -> None:
         cache[key] = value
@@ -323,21 +455,39 @@ class MatplotlibRenderer:
             raise ValueError(f"No matching instantaneous signals for {group_label}")
         return idx_map
 
-    def _load_out_files(self, inf_file: Path, idx_df: list[InfDescriptor], out_cache: dict[int, WaveformFrame]) -> WaveformFrame:
+    def _load_out_files(
+        self,
+        inf_file: Path,
+        idx_df: list[InfDescriptor],
+        out_cache: dict[int, _OutFileColumns],
+    ) -> WaveformFrame:
+        rows_by_file: dict[int, list[InfDescriptor]] = {}
+        for row in idx_df:
+            file_number, _column_number = pgb_to_out_location(int(row.PGB))
+            rows_by_file.setdefault(file_number, []).append(row)
+
+        for file_number, rows in rows_by_file.items():
+            requested_columns = [
+                pgb_to_out_location(int(row.PGB))[1]
+                for row in rows
+            ]
+            data = out_cache.get(file_number)
+            if data is None or any(column not in data.values for column in requested_columns):
+                out_file = standard_out_file_path(inf_file, file_number)
+                data = self._load_out_file_columns(out_file, requested_columns)
+                out_cache[file_number] = data
+
         arrays: list[np.ndarray] = []
         columns: list[str] = []
         for row in idx_df:
             pgb = int(row.PGB)
             name = str(row.Description)
             file_number, col_number = pgb_to_out_location(pgb)
-            if file_number not in out_cache:
-                out_file = standard_out_file_path(inf_file, file_number)
-                out_cache[file_number] = self._load_out_frame(out_file)
             data = out_cache[file_number]
             if not arrays:
-                arrays.append(data.column_values(0))
+                arrays.append(data.time)
                 columns.append("Time (s)")
-            arrays.append(data.column_values(col_number))
+            arrays.append(data.values[col_number])
             columns.append(name)
         if len(arrays) < 2:
             raise ValueError(f"Expected at least 2 columns (time + signal), got {len(arrays)}")
@@ -414,18 +564,8 @@ class MatplotlibRenderer:
         return frame.time_window(job.time_start_s, job.time_end_s)
 
     def _basename_with_time_range(self, job: PlotJob, basename: str) -> str:
-        token = self._time_range_filename_token(job.time_start_s, job.time_end_s)
+        token = time_range_filename_token(job.time_start_s, job.time_end_s)
         return f"{basename}_{token}" if token else basename
-
-    @staticmethod
-    def _time_range_filename_token(start_s: float | None, end_s: float | None) -> str:
-        if start_s is None and end_s is None:
-            return ""
-        if start_s is None:
-            return f"Tto{float(end_s):g}s"
-        if end_s is None:
-            return f"Tfrom{float(start_s):g}s"
-        return f"T{float(start_s):g}-{float(end_s):g}s"
 
     def _window_peak_centered(self, t_peak: float, tov_window_s: float, tov_window_count: int) -> tuple[float, float]:
         width = float(tov_window_s) * max(1, int(tov_window_count)) * self.WINDOW_MULTIPLIER

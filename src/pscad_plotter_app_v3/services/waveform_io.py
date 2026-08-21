@@ -1,3 +1,9 @@
+"""Read PSCAD ``.inf`` descriptors and numeric ``.out`` waveform data.
+
+Filename and statistic conventions are owned by ``project_conventions``;
+this module intentionally does not re-export those parsers.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
@@ -8,7 +14,18 @@ import re
 
 import numpy as np
 
-from pscad_plotter_app_v3.services.project_conventions import case_run_from_inf_path
+
+__all__ = [
+    "InfDescriptor",
+    "WaveformFrame",
+    "hash_inf_file",
+    "load_out_columns",
+    "load_out_frame",
+    "out_file_for_pgb",
+    "parse_inf_descriptors",
+    "pgb_to_out_location",
+    "standard_out_file_path",
+]
 
 
 OUT_CANCEL_CHECK_INTERVAL = 4096
@@ -51,6 +68,7 @@ def _load_out_values(
 
 
 def hash_inf_file(inf_path: Path) -> str:
+    """Return the content hash used to share identical descriptor layouts."""
     digest = blake2b(digest_size=16)
     with inf_path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -130,6 +148,7 @@ class WaveformFrame:
 
 
 def parse_inf_descriptors(inf_path: Path) -> list[InfDescriptor]:
+    """Parse the valid PGB descriptors declared by one PSCAD ``.inf`` file."""
     records: list[InfDescriptor] = []
     with inf_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
@@ -147,14 +166,17 @@ def parse_inf_descriptors(inf_path: Path) -> list[InfDescriptor]:
 
 
 def pgb_to_out_location(pgb: int) -> tuple[int, int]:
+    """Map a one-based PGB number to its numbered ``.out`` file and column."""
     return ((pgb - 1) // 10) + 1, ((pgb - 1) % 10) + 1
 
 
 def standard_out_file_path(inf_file: Path, file_number: int) -> Path:
+    """Return PSCAD's numbered ``.out`` sibling for an ``.inf`` file."""
     return inf_file.with_suffix("").with_name(f"{inf_file.stem}_{file_number:02d}.out")
 
 
 def out_file_for_pgb(inf_file: Path, pgb: int) -> tuple[Path, int]:
+    """Resolve one PGB to its raw ``.out`` path and one-based column index."""
     file_number, column_number = pgb_to_out_location(pgb)
     return standard_out_file_path(inf_file, file_number), column_number
 
@@ -175,6 +197,7 @@ def load_out_frame(
     out_file: Path,
     check_cancel: Callable[[], None] | None = None,
 ) -> WaveformFrame:
+    """Load all columns from one raw PSCAD ``.out`` file."""
     if not out_file.exists():
         raise _missing_out_file_error(out_file)
     try:
@@ -195,6 +218,7 @@ def load_out_columns(
     columns: Iterable[int],
     check_cancel: Callable[[], None] | None = None,
 ) -> dict[int, np.ndarray]:
+    """Load only the requested one-based columns from a raw ``.out`` file."""
     if not out_file.exists():
         raise _missing_out_file_error(out_file)
     ordered = list(dict.fromkeys(int(column) for column in columns))

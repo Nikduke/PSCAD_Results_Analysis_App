@@ -5,7 +5,7 @@ You are working in this folder as the active PSCAD Results Analysis app root.
 Rules:
 
 - Work silently by default and provide a final report only, unless clarification or approval is required.
-- First read `AGENTS.md`, `README.md`, `docs/CURRENT_CONTEXT.md`, `pyproject.toml`, and `environment.yml`.
+- First read `AGENTS.md`, `docs/HANDOFF.md`, `README.md`, `docs/CURRENT_CONTEXT.md`, `docs/ANALYSIS_METHODS.md`, `pyproject.toml`, and `environment.yml`.
 - Inspect the actual codebase before making claims or edits; documentation may be stale.
 - Git is configured for this app. Inspect the worktree, preserve unrelated changes, and do not rely on history as a substitute for reading current code.
 - Use Anaconda Python with the dedicated `../.conda/pscad-results-analysis` environment, never `base`.

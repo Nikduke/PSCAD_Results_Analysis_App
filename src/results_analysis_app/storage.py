@@ -19,6 +19,8 @@ STATE_DIR = APP_ROOT / ".state"
 SESSION_DIR = APP_ROOT / "sessions"
 AUTOSAVE_PATH = STATE_DIR / "last_session.json"
 PROJECT_SCAN_CACHE_PATH = STATE_DIR / "project_scan_cache.json"
+PROJECT_ANALYSIS_CACHE_FILENAME = "analysis_cache.json"
+PROJECT_ANALYSIS_CACHE_VERSION = 1
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -29,13 +31,40 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def write_json(path: Path, data: dict[str, Any]) -> None:
+def write_json(path: Path, data: dict[str, Any], *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     with temp_path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
+        if indent is None:
+            json.dump(data, handle, separators=(",", ":"))
+        else:
+            json.dump(data, handle, indent=indent)
         handle.write("\n")
     temp_path.replace(path)
+
+
+def project_analysis_cache_path(project_root: str | Path) -> Path:
+    """Return the single compact cache file kept with one PSCAD project."""
+    return Path(project_root) / ".state" / PROJECT_ANALYSIS_CACHE_FILENAME
+
+
+def load_project_analysis_cache(project_root: str | Path) -> dict[str, Any]:
+    """Load stage fingerprints without treating them as source data."""
+    path = project_analysis_cache_path(project_root)
+    try:
+        payload = read_json(path)
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return {"version": PROJECT_ANALYSIS_CACHE_VERSION}
+    if payload.get("version") != PROJECT_ANALYSIS_CACHE_VERSION:
+        return {"version": PROJECT_ANALYSIS_CACHE_VERSION}
+    return payload
+
+
+def save_project_analysis_cache(project_root: str | Path, payload: dict[str, Any]) -> None:
+    """Persist only compact stage metadata in one project-local file."""
+    value = dict(payload)
+    value["version"] = PROJECT_ANALYSIS_CACHE_VERSION
+    write_json(project_analysis_cache_path(project_root), value, indent=None)
 
 
 def load_autosave() -> AppSession:

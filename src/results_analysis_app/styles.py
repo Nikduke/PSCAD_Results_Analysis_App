@@ -319,6 +319,11 @@ QTableView, QTreeView, QListView {{
     selection-background-color: {theme.selection};
     selection-color: {theme.selected_text};
 }}
+QTreeWidget#projectTree::item:selected {{
+    background-color: {theme.selection};
+    color: {theme.selected_text};
+    font-weight: 600;
+}}
 QTableView:disabled, QTreeView:disabled, QListView:disabled {{
     background-color: {theme.disabled_background};
     color: {theme.disabled_text};

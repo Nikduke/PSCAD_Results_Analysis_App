@@ -11,7 +11,7 @@ Work silently by default. Do not send progress messages, implementation plans, o
 
 ## Grounding and inspection
 
-- Read `README.md`, `docs/CURRENT_CONTEXT.md`, `pyproject.toml`, `environment.yml`, and the relevant source and test files before editing.
+- Read `README.md`, `docs/HANDOFF.md`, `docs/CURRENT_CONTEXT.md`, `docs/ANALYSIS_METHODS.md`, `pyproject.toml`, `environment.yml`, and the relevant source and test files before editing.
 - Verify documentation against the current source; do not treat the handover document as authoritative when code differs.
 - Git is configured for this app. Inspect the current worktree before editing, preserve unrelated changes, and do not depend on history to understand current behavior.
 - Use evidence from the current files, tests, logs, or explicit user requirements. Do not invent project facts.
@@ -37,7 +37,7 @@ Work silently by default. Do not send progress messages, implementation plans, o
 - `src/pscad_plotter_app_v3/` contains the MM-only embedded waveform plotting and Excel-export engine used by report batches.
 - `src/pscad_plotter_app_v3/services/waveform_io.py` owns shared `.inf`/`.out` parsing. Keep raw waveform reads cancellation-aware by passing the current cancellation callback through scanner, envelope, renderer, and exporter call paths.
 - `tests/` contains focused plotting, reporting, scanning, envelope, UI-model, and resonance contract tests.
-- `docs/CURRENT_CONTEXT.md` is the current-state handover and must stay aligned with the implementation.
+- `docs/HANDOFF.md` is the concise new-chat handoff; `docs/CURRENT_CONTEXT.md` is the detailed current-state record. Both must stay aligned with the implementation.
 - `../Original_examples/` is outside this app folder and contains reference scripts and sample PSCAD data.
 
 The main workflow is: add one or more cached PSCAD projects, select scopes and analysis options, review exclusions, scan or refresh inputs, build envelope data and checks, create and render plot batches, and rebuild DOCX reports.

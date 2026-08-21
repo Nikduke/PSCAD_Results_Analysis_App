@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -132,7 +133,16 @@ class ProjectDiscoveryService:
     @staticmethod
     def _iter_inf_paths(path: Path) -> list[Path]:
         try:
-            return sorted(child for child in path.rglob("*") if child.is_file() and child.suffix.lower() == ".inf")
+            inf_paths: list[Path] = []
+            for directory, _subdirs, names in os.walk(path):
+                inf_paths.extend(
+                    candidate
+                    for name in names
+                    if name.casefold().endswith(".inf")
+                    for candidate in (Path(directory) / name,)
+                    if candidate.is_file()
+                )
+            return sorted(inf_paths)
         except OSError:
             return []
 

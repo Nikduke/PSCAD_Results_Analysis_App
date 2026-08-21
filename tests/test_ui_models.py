@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 
+def test_positive_setting_normalization_rejects_nonfinite_values() -> None:
+    from results_analysis_app.models import normalize_positive_float
+
+    assert normalize_positive_float("2.5", 1.0) == 2.5
+    assert normalize_positive_float("inf", 1.0) == 1.0
+    assert normalize_positive_float("nan", 1.0) == 1.0
+
+
 def test_session_event_times_round_trip() -> None:
     from results_analysis_app.exclusions import ExclusionRule
     from results_analysis_app.models import AppSession
@@ -13,6 +21,7 @@ def test_session_event_times_round_trip() -> None:
     session.envelope_time_end = 0.5
     session.envelope_time_end_auto = False
     session.envelope_fallback_frequency = 60.0
+    session.excel_waveform_exports_enabled = False
     session.envelope_chart_top_left_cell = "J2"
     session.envelope_chart_width = 800.0
     session.envelope_chart_height = 400.0
@@ -40,9 +49,30 @@ def test_session_event_times_round_trip() -> None:
     session.resonance_min_level_over_vlim = 0.6
     session.resonance_min_growth_delta_factor = 0.02
     session.sustained_sdpf_enabled = True
-    session.sustained_sdpf_use_tov = False
-    session.sustained_sdpf_duration = 0.02
+    session.sustained_sdpf_duration_ms = 37.5
     project = r"C:\Project"
+    session.sustained_sdpf_ranking_settings_by_project = {
+        project: {
+            "highest_voltage_sustained": False,
+            "cumulative_stress": True,
+            "continuous_duration": False,
+        }
+    }
+    session.sustained_sdpf_heatmap_settings_by_project = {
+        project: [{
+            "name": "Faults",
+            "enabled": False,
+            "y_grouping": "P",
+            "x_grouping": "S",
+            "split_by": None,
+            "max_cases_per_heatmap": 12,
+            "layout": "separate",
+            "max_panels_per_heatmap": 4,
+        }]
+    }
+    session.sustained_sdpf_limit_overrides_by_project = {
+        project: {"66": {"LGp": 141.0, "LLp": 142.0}}
+    }
     session.envelope_chart_x_max_overrides_by_project = {project: 1.0}
     session.envelope_chart_x_major_overrides_by_project = {project: 0.1}
     session.manual_exclusions_by_project = {
@@ -70,6 +100,7 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.envelope_time_end == 0.5
     assert loaded.envelope_time_end_auto is False
     assert loaded.envelope_fallback_frequency == 60.0
+    assert loaded.excel_waveform_exports_enabled is False
     assert loaded.envelope_chart_x_max_overrides_by_project == {project: 1.0}
     assert loaded.envelope_chart_x_major_overrides_by_project == {project: 0.1}
     assert loaded.envelope_chart_top_left_cell == "J2"
@@ -99,8 +130,10 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.resonance_min_level_over_vlim == 0.6
     assert loaded.resonance_min_growth_delta_factor == 0.02
     assert loaded.sustained_sdpf_enabled is True
-    assert loaded.sustained_sdpf_use_tov is False
-    assert loaded.sustained_sdpf_duration == 0.02
+    assert loaded.sustained_sdpf_duration_ms == 37.5
+    assert loaded.sustained_sdpf_ranking_settings_by_project == session.sustained_sdpf_ranking_settings_by_project
+    assert loaded.sustained_sdpf_heatmap_settings_by_project == session.sustained_sdpf_heatmap_settings_by_project
+    assert loaded.sustained_sdpf_limit_overrides_by_project == session.sustained_sdpf_limit_overrides_by_project
     assert loaded.events == ["SFO", "TOV", "SA"]
     assert loaded.manual_exclusions_by_project == session.manual_exclusions_by_project
     assert loaded.disabled_nonconv_by_project == {project: [("C7_S1_66OFT2", 8)]}
@@ -171,6 +204,7 @@ def test_removing_project_purges_all_project_specific_session_state() -> None:
     session.high_voltage_include_overrides_by_project = {
         project: [("230", "C2", 2, "MM_230_B")]
     }
+    session.sustained_sdpf_heatmap_settings_by_project = {project: {"enabled": True}}
     session.status_cache = {project: ["Ready"]}
 
     session.remove_projects({project.lower()})
@@ -184,6 +218,7 @@ def test_removing_project_purges_all_project_specific_session_state() -> None:
         session.disabled_nonconv_by_project,
         session.high_voltage_exclusions_by_project,
         session.high_voltage_include_overrides_by_project,
+        session.sustained_sdpf_heatmap_settings_by_project,
         session.status_cache,
     ):
         assert mapping == {}
@@ -195,6 +230,7 @@ def test_session_default_envelope_workers_use_automatic_selection() -> None:
     assert AppSession.default().envelope_workers == 0
     assert AppSession.default().envelope_workers_auto is True
     assert AppSession.default().envelope_time_end_auto is True
+    assert AppSession.default().excel_waveform_exports_enabled is True
 
 
 def test_chart_axis_settings_use_project_duration_and_per_project_overrides() -> None:
@@ -241,6 +277,98 @@ def test_chart_axis_settings_use_project_duration_and_per_project_overrides() ->
     }
 
 
+def test_heatmap_settings_dialog_restores_saved_dimensions(monkeypatch, tmp_path) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import settings_dialog, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+    from results_analysis_app.scanner import CaseInfo, ProjectScan
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str(tmp_path.resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    session.sustained_sdpf_heatmap_settings_by_project[project] = [{
+        "name": "Faults",
+        "enabled": True,
+        "y_grouping": "S",
+        "x_grouping": "P",
+        "split_by": "RA",
+        "max_cases_per_heatmap": 12,
+    }]
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        names = [
+            "O2_P1_S1_RA0",
+            "O2_P2_S1_RA0",
+            "O2_P1_S2_RA1",
+            "O2_P2_S2_RA1",
+        ]
+        window.project_scans[project] = ProjectScan(
+            path=tmp_path,
+            exists=True,
+            case_infos=[CaseInfo(name, tmp_path / f"{name}.inf") for name in names],
+        )
+        window._select_project_path(project)
+        captured: list[list[object]] = []
+        dialog_calls = 0
+
+        def dialog_exec(dialog) -> int:
+            nonlocal dialog_calls
+            dialog_calls += 1
+            if dialog_calls == 1:
+                combos_by_value = {
+                    combo.currentData(): combo
+                    for combo in dialog.findChildren(QtWidgets.QComboBox)
+                    if combo.currentData() is not None
+                }
+                combos_by_value["S"].setCurrentIndex(combos_by_value["S"].findData("P"))
+                combos_by_value["P"].setCurrentIndex(combos_by_value["P"].findData("S"))
+                return QtWidgets.QDialog.DialogCode.Accepted
+            current_values = [
+                combo.currentData()
+                for combo in dialog.findChildren(QtWidgets.QComboBox)
+                if combo.currentData() is not None
+            ]
+            captured.append(current_values)
+            if dialog_calls == 2:
+                combos_by_value = {
+                    combo.currentData(): combo
+                    for combo in dialog.findChildren(QtWidgets.QComboBox)
+                    if combo.currentData() is not None
+                }
+                y_combo = combos_by_value["P"]
+                y_combo.setCurrentIndex(y_combo.findData("None"))
+                return QtWidgets.QDialog.DialogCode.Accepted
+            return QtWidgets.QDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(QtWidgets.QDialog, "exec", dialog_exec)
+        settings_dialog.edit_settings(window)
+        settings_dialog.edit_settings(window)
+        settings_dialog.edit_settings(window)
+
+        assert captured == [
+            ["P", "S", "RA", "separate"],
+            ["None", "S", "RA", "separate"],
+        ]
+        assert session.sustained_sdpf_heatmap_settings_by_project[project] == [{
+            "name": "Faults",
+            "enabled": True,
+            "y_grouping": "None",
+            "x_grouping": "S",
+            "split_by": "RA",
+            "max_cases_per_heatmap": 12,
+            "layout": "separate",
+            "max_panels_per_heatmap": 4,
+        }]
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_add_project_accepts_multiple_folders_without_rescanning_duplicates(
     monkeypatch,
     tmp_path,
@@ -278,6 +406,64 @@ def test_add_project_accepts_multiple_folders_without_rescanning_duplicates(
             str(second.resolve()),
         ]
         assert scan_requests == [[str(second.resolve())]]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_project_selection_is_visible_and_double_click_opens_settings(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from pathlib import Path
+
+    from PySide6 import QtGui, QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    first = tmp_path / "First"
+    second = tmp_path / "Second"
+    session = AppSession.default()
+    session.add_project(str(first))
+    session.add_project(str(second))
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        first_item = window.project_tree.topLevelItem(0)
+        second_item = window.project_tree.topLevelItem(1)
+        window._select_project_path(str(second.resolve()))
+
+        assert second_item.font(0).bold()
+        assert not first_item.font(0).bold()
+
+        opened_for: list[str | None] = []
+        monkeypatch.setattr(
+            window,
+            "open_settings_dialog",
+            lambda: opened_for.append(window._current_project_path()),
+        )
+        window.project_tree.itemDoubleClicked.emit(first_item, 0)
+
+        assert opened_for == [str(first.resolve())]
+        assert window.project_tree.currentItem() is first_item
+        assert first_item.font(0).bold()
+        assert not second_item.font(0).bold()
+
+        opened_folders: list[str] = []
+        monkeypatch.setattr(
+            QtGui.QDesktopServices,
+            "openUrl",
+            lambda url: opened_folders.append(url.toLocalFile()) or True,
+        )
+        window.project_tree.itemDoubleClicked.emit(first_item, 1)
+
+        assert len(opened_folders) == 1
+        assert Path(opened_folders[0]) == first.resolve()
+        assert opened_for == [str(first.resolve())]
     finally:
         window.close()
         app.processEvents()
@@ -463,25 +649,18 @@ def test_exclusion_table_is_universal_and_supports_tsv_paste(monkeypatch) -> Non
         app.processEvents()
 
 
-def test_high_voltage_fault_column_uses_statistic_run_mapping(monkeypatch) -> None:
-    import pandas as pd
+def test_high_voltage_fault_column_uses_cached_statistic_run_mapping(tmp_path) -> None:
+    from results_analysis_app.main_window import _fault_types_by_case_run_for_scan
+    from results_analysis_app.scanner import CaseInfo, ProjectScan
 
-    from results_analysis_app import voltage_envelope
-    from results_analysis_app.main_window import _fault_types_by_case_run
-
-    monkeypatch.setattr(
-        voltage_envelope,
-        "_read_stat_files",
-        lambda _project: pd.DataFrame(
-            {
-                "Case": ["C1", "C1"],
-                "Run#": [1, 2],
-                "Fault_type": ["AG", "None"],
-            }
-        ),
+    scan = ProjectScan(
+        path=tmp_path,
+        exists=True,
+        case_infos=[CaseInfo(name="C1", inf_path=tmp_path / "C1_r00001.inf")],
+        fault_types_by_run={1: "AG", 2: "None"},
     )
 
-    assert _fault_types_by_case_run(r"C:\Project") == {
+    assert _fault_types_by_case_run_for_scan(scan) == {
         ("c1", 1): "AG",
         ("c1", 2): "None",
     }
@@ -504,19 +683,13 @@ def test_high_voltage_project_switch_reuses_cached_rows_and_fault_types(
     monkeypatch.setattr(storage, "load_autosave", lambda: session)
     monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
 
-    calls = {"fault_types": 0, "groups": 0}
-    original_fault_types = main_window_module._fault_types_by_case_run
+    calls = {"groups": 0}
     original_group = main_window_module._group_high_voltage_proposals
-
-    def counted_fault_types(path: str):
-        calls["fault_types"] += 1
-        return original_fault_types(path)
 
     def counted_group(rows):
         calls["groups"] += 1
         return original_group(rows)
 
-    monkeypatch.setattr(main_window_module, "_fault_types_by_case_run", counted_fault_types)
     monkeypatch.setattr(main_window_module, "_group_high_voltage_proposals", counted_group)
     rows = [
         scanner.HighVoltageExclusion(
@@ -529,54 +702,17 @@ def test_high_voltage_project_switch_reuses_cached_rows_and_fault_types(
     ]
     window = MainWindow()
     try:
-        window._select_project_path(project)
-        window._set_high_voltage_proposal_rows(rows)
-        window._set_high_voltage_proposal_rows(rows)
-        assert calls == {"fault_types": 1, "groups": 1}
-    finally:
-        window.close()
-        app.processEvents()
-
-
-def test_high_voltage_rows_with_fault_types_skip_statistic_read(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    from PySide6 import QtWidgets
-
-    from results_analysis_app import main_window as main_window_module, scanner, storage
-    from results_analysis_app.main_window import MainWindow
-    from results_analysis_app.models import AppSession
-
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    project = str((tmp_path / "Project").resolve())
-    session = AppSession.default()
-    session.add_project(project)
-    monkeypatch.setattr(storage, "load_autosave", lambda: session)
-    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
-
-    calls = {"fault_types": 0}
-
-    def counted_fault_types(_path: str):
-        calls["fault_types"] += 1
-        return {}
-
-    monkeypatch.setattr(main_window_module, "_fault_types_by_case_run", counted_fault_types)
-    rows = [
-        scanner.HighVoltageExclusion(
-            voltage="66",
-            case="C1",
-            run=1,
-            bus="MM_66_A",
-            fault_type="AG",
-            source=scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS,
+        window.project_scans[project] = scanner.ProjectScan(
+            path=tmp_path / "Project",
+            exists=True,
+            case_infos=[scanner.CaseInfo("C1", tmp_path / "C1_r00001.inf")],
+            fault_types_by_run={1: "AG"},
         )
-    ]
-    window = MainWindow()
-    try:
         window._select_project_path(project)
         window._set_high_voltage_proposal_rows(rows)
-        assert calls == {"fault_types": 0}
+        window._set_high_voltage_proposal_rows(rows)
+        assert calls == {"groups": 1}
+        assert window.high_voltage_proposal_table.item(0, 4).text() == "AG"
     finally:
         window.close()
         app.processEvents()

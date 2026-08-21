@@ -35,6 +35,14 @@ def normalize_voltage(value: Any) -> str:
     return str(int(number)) if number.is_integer() else f"{number:g}"
 
 
+def is_number(value: Any) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def input_data_workbook(project_root: str | Path) -> Path | None:
     root = Path(project_root).resolve()
     matches = sorted(root.glob("Input_Data_PSCAD*.xlsx"))
@@ -190,22 +198,15 @@ def load_voltage_configs(
     return configs
 
 
-def available_voltage_keys(
+def discover_voltage_data(
     project_root: str | Path,
     inf_paths: Iterable[str | Path] | None = None,
     um_overrides: dict[str, float] | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, VoltageConfig]]:
+    """Discover voltage keys and their existing workbook/override settings together."""
     root = Path(project_root).resolve()
     paths = sorted(Path(path) for path in inf_paths) if inf_paths is not None else sorted((root / "Case_folder").rglob("*.inf"))
     prefixes = discover_voltage_prefixes_from_files(paths)
     configs = load_voltage_configs(root, um_overrides=um_overrides, discovered_prefixes=prefixes)
     found = set(prefixes) | set(configs)
-    return sorted(found, key=lambda value: float(value) if _is_number(value) else value)
-
-
-def _is_number(value: str) -> bool:
-    try:
-        float(value)
-    except ValueError:
-        return False
-    return True
+    return sorted(found, key=lambda value: float(value) if is_number(value) else value), configs

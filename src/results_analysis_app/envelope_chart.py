@@ -8,6 +8,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import re
 
+from results_analysis_app.common import as_float
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_HEIGHT,
@@ -206,15 +207,6 @@ def _rgb_tuple(color_tuple) -> int:
     return _rgb(color_tuple[0], color_tuple[1], color_tuple[2])
 
 
-def _as_float(value):
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _format_time(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".")
 
@@ -303,8 +295,8 @@ def _find_time_row(ws, time_col: int, value_col: int, last_row: int, target_time
     best_value = None
     best_error = None
     for row in range(2, last_row + 1):
-        t = _as_float(ws.Cells(row, time_col).Value)
-        v = _as_float(ws.Cells(row, value_col).Value)
+        t = as_float(ws.Cells(row, time_col).Value)
+        v = as_float(ws.Cells(row, value_col).Value)
         if t is None or v is None:
             continue
         error = abs(t - target_time)
@@ -583,10 +575,10 @@ def _create_resonance_check_chart(
     if last_row < 3:
         return False
 
-    t_start = _as_float(ws.Range("G4").Value) or 0.0
-    vlim = _as_float(ws.Range("G6").Value)
+    t_start = as_float(ws.Range("G4").Value) or 0.0
+    vlim = as_float(ws.Range("G6").Value)
     if vlim is None:
-        vlim = _as_float(ws.Cells(2, 4).Value) or 0.0
+        vlim = as_float(ws.Cells(2, 4).Value) or 0.0
     t_end = _worksheet_time_end(ws, 1, last_row)
     y_max = max(
         _excel_range_max(ws, 2, last_row, 0.0),
@@ -670,8 +662,8 @@ def _excel_range_max(ws, col: int, last_row: int, default: float) -> float:
 
 
 def _worksheet_time_end(ws, time_col: int, last_row: int) -> float:
-    last_time = _as_float(ws.Cells(last_row, time_col).Value) or 0.0
-    previous_time = _as_float(ws.Cells(last_row - 1, time_col).Value) if last_row > 2 else None
+    last_time = as_float(ws.Cells(last_row, time_col).Value) or 0.0
+    previous_time = as_float(ws.Cells(last_row - 1, time_col).Value) if last_row > 2 else None
     if previous_time is None or previous_time >= last_time:
         return last_time
     return last_time + (last_time - previous_time)
@@ -679,11 +671,11 @@ def _worksheet_time_end(ws, time_col: int, last_row: int) -> float:
 
 def _bounded_x_axis(axis_limits: dict, data_end: float) -> dict:
     bounded = dict(axis_limits)
-    requested = _as_float(bounded.get("x_max"))
+    requested = as_float(bounded.get("x_max"))
     if data_end > 0:
         bounded["x_max"] = min(requested, data_end) if requested is not None else data_end
-    if _as_float(bounded.get("x_major")) is None:
-        bounded["x_major"] = automatic_time_major(_as_float(bounded.get("x_max")))
+    if as_float(bounded.get("x_major")) is None:
+        bounded["x_major"] = automatic_time_major(as_float(bounded.get("x_max")))
     return bounded
 
 

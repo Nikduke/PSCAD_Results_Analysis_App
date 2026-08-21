@@ -529,7 +529,7 @@ def test_frequency_detection_tries_later_phases_before_fallback() -> None:
     assert fallback_events == ["case run bus"]
 
 
-def test_voltage_run_cache_cancels_queued_reads(tmp_path, monkeypatch) -> None:
+def test_voltage_run_reads_cancel_queued_reads(tmp_path, monkeypatch) -> None:
     import pytest
 
     from results_analysis_app import voltage_envelope
@@ -551,7 +551,7 @@ def test_voltage_run_cache_cancels_queued_reads(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(voltage_envelope, "_read_run_entries", fake_read_run_entries)
 
     with pytest.raises(RuntimeError, match="Operation stopped by user"):
-        voltage_envelope._read_voltage_run_cache(
+        voltage_envelope._read_voltage_runs(
             paths,
             "66",
             "MM_66",
@@ -565,7 +565,7 @@ def test_voltage_run_cache_cancels_queued_reads(tmp_path, monkeypatch) -> None:
     assert state["calls"] == 1
 
 
-def test_voltage_run_cache_process_worker_returns_envelope_data(tmp_path) -> None:
+def test_voltage_run_process_worker_returns_envelope_data(tmp_path) -> None:
     from concurrent.futures import ProcessPoolExecutor
 
     import numpy as np
@@ -594,7 +594,7 @@ def test_voltage_run_cache_process_worker_returns_envelope_data(tmp_path) -> Non
     descriptors = parse_inf_descriptors(inf_path)
 
     with ProcessPoolExecutor(max_workers=1) as executor:
-        cache = voltage_envelope._read_voltage_run_cache(
+        cache = voltage_envelope._read_voltage_runs(
             [inf_path],
             "66",
             "MM_66",
@@ -612,6 +612,47 @@ def test_voltage_run_cache_process_worker_returns_envelope_data(tmp_path) -> Non
     entries, exclusions = cache[inf_path]
     assert [measurement for measurement, _df in entries] == ["LGp", "LLp"]
     assert exclusions == []
+
+
+def test_envelope_manifest_validates_artifacts_and_return_outputs(tmp_path) -> None:
+    from results_analysis_app import voltage_envelope
+
+    project_root = tmp_path / "Project"
+    output_dir = project_root / "Voltage_envelope" / "Full"
+    output_dir.mkdir(parents=True)
+    returned = output_dir / "MM_66_with_combined_plot.xlsx"
+    auxiliary = output_dir / "MM_66.xlsx"
+    returned.write_bytes(b"chart")
+    auxiliary.write_bytes(b"base")
+
+    voltage_envelope._write_envelope_manifest(
+        project_root,
+        "signature",
+        [returned, auxiliary],
+        return_outputs=[returned],
+    )
+
+    assert voltage_envelope._envelope_manifest_matches(project_root, "signature") == [returned]
+    auxiliary.unlink()
+    assert voltage_envelope._envelope_manifest_matches(project_root, "signature") is None
+
+
+def test_sustained_cache_signature_tracks_summary_workbook_version() -> None:
+    from results_analysis_app import sustained_sdpf, voltage_envelope
+
+    settings = sustained_sdpf.SustainedSDPFSettings(enabled=True)
+    versions = voltage_envelope._sustained_cache_versions(settings)
+
+    assert versions == {
+        "sustained_sdpf_result_version": sustained_sdpf.RESULT_VERSION,
+        "sustained_sdpf_summary_version": sustained_sdpf.SUMMARY_WORKBOOK_VERSION,
+    }
+    original_signature = voltage_envelope._cache_signature({"settings": versions})
+    versions["sustained_sdpf_summary_version"] += 1
+    assert voltage_envelope._cache_signature({"settings": versions}) != original_signature
+    assert voltage_envelope._sustained_cache_versions(
+        sustained_sdpf.SustainedSDPFSettings(enabled=False)
+    ) == {}
 
 
 def test_nonconvergent_scan_process_workers_preserve_results(tmp_path) -> None:
@@ -640,18 +681,21 @@ def test_nonconvergent_scan_process_workers_preserve_results(tmp_path) -> None:
     ]
 
 
-def test_automatic_envelope_workers_use_available_cpus_with_safe_cap(monkeypatch) -> None:
+def test_automatic_envelope_workers_use_nearest_quarter_with_safe_cap(monkeypatch) -> None:
     from results_analysis_app import voltage_envelope
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 32, raising=False)
-    assert voltage_envelope._configured_worker_count(0) == 31
+    assert voltage_envelope._configured_worker_count(0) == 8
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 128, raising=False)
-    assert voltage_envelope._configured_worker_count(0) == 60
+    assert voltage_envelope._configured_worker_count(0) == 32
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: None, raising=False)
     monkeypatch.setattr(voltage_envelope.os, "cpu_count", lambda: 8)
-    assert voltage_envelope._configured_worker_count(0) == 7
+    assert voltage_envelope._configured_worker_count(0) == 2
+
+    monkeypatch.setattr(voltage_envelope.os, "cpu_count", lambda: 6)
+    assert voltage_envelope._configured_worker_count(0) == 2
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 1, raising=False)
     assert voltage_envelope._configured_worker_count(0) == 1

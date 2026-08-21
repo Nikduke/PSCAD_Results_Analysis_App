@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 import time
+from typing import Any
 
 from results_analysis_app import analysis_engine
 from results_analysis_app import resonance_checks
 from results_analysis_app import sustained_sdpf
 from results_analysis_app import voltage_envelope
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
+from results_analysis_app.common import LogFn, log_message as _log
 from results_analysis_app.exclusions import ExclusionRule
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import (
@@ -18,14 +20,6 @@ from results_analysis_app.models import (
 )
 from results_analysis_app.project_config import ProjectTiming
 from results_analysis_app.reporting import build_reports_from_existing_plots
-
-
-LogFn = Callable[[str], None]
-
-
-def _log(log: LogFn | None, message: str) -> None:
-    if log is not None:
-        log(message)
 
 
 def _project_value(values: dict[str, object] | None, root: Path):
@@ -89,7 +83,6 @@ def build_voltage_envelopes(
     project_roots: Iterable[str | Path],
     scopes: Iterable[ScopeEntry],
     voltages: Iterable[str],
-    events: Iterable[str],
     envelope_workers: int | None = None,
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
@@ -117,6 +110,10 @@ def build_voltage_envelopes(
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
     sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_limit_overrides_by_project: dict[str, dict[str, dict[str, float]]] | None = None,
+    voltage_configs_by_project: dict[str, dict[str, Any]] | None = None,
+    sustained_sdpf_limits_by_project: dict[str, dict[str, Any]] | None = None,
+    nonconv_cases_by_project: dict[str, list[Any]] | None = None,
 ) -> list[Path]:
     """Build scope-aware voltage envelope workbooks for selected projects."""
     selected_scopes = list(scopes)
@@ -167,6 +164,12 @@ def build_voltage_envelopes(
                 voltage_um_overrides=(voltage_um_overrides_by_project or {}).get(project_key, {}),
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_limit_overrides=(
+                    sustained_sdpf_limit_overrides_by_project or {}
+                ).get(project_key, {}),
+                voltage_configs=(voltage_configs_by_project or {}).get(project_key),
+                sustained_sdpf_limits_by_voltage=(sustained_sdpf_limits_by_project or {}).get(project_key),
+                nonconv_cases=(nonconv_cases_by_project or {}).get(project_key),
                 build_charts=build_charts,
             )
         )
@@ -282,6 +285,10 @@ def create_plot_batches(
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
     sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_heatmap_settings_by_project: dict[str, object] | None = None,
+    sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
+    sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
+    excel_waveform_exports_enabled: bool = True,
 ) -> list[Path]:
     """Create scope/event plot batch workbooks from existing envelope workbooks."""
     selected_scopes = list(scopes)
@@ -303,6 +310,12 @@ def create_plot_batches(
                 log,
                 check_cancel,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=sustained_sdpf_heatmap_settings_by_project,
+                sustained_sdpf_ranking_settings=(
+                    sustained_sdpf_ranking_settings_by_project or {}
+                ).get(str(root)),
+                sustained_payloads_by_scope=sustained_payloads_by_scope,
+                excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             )
         )
     return outputs
@@ -316,6 +329,13 @@ def render_plot_batches(
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
     sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_heatmap_settings_by_project: dict[str, object] | None = None,
+    sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
+    event_times: dict[str, float] | None = None,
+    sustained_sdpf_limit_overrides_by_project: dict[str, dict[str, dict[str, float]]] | None = None,
+    sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
+    sustained_voltage_keys: Iterable[str] | None = None,
+    excel_waveform_exports_enabled: bool = True,
 ) -> None:
     """Render existing scope/event plot batches into generated plot folders."""
     selected_scopes = list(scopes)
@@ -335,6 +355,41 @@ def render_plot_batches(
             selected_events,
             log,
             check_cancel,
+            sustained_sdpf_settings=sustained_sdpf_settings,
+            sustained_sdpf_heatmap_settings=(sustained_sdpf_heatmap_settings_by_project or {}).get(str(root)),
+            sustained_sdpf_ranking_settings=(
+                sustained_sdpf_ranking_settings_by_project or {}
+            ).get(str(root)),
+            event_times=event_times,
+            sustained_sdpf_limit_overrides=(sustained_sdpf_limit_overrides_by_project or {}).get(str(root)),
+            sustained_payloads_by_scope=sustained_payloads_by_scope,
+            sustained_voltage_keys=sustained_voltage_keys,
+            excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+        )
+
+
+def rebuild_heatmaps(
+    project_roots: Iterable[str | Path],
+    scopes: Iterable[ScopeEntry],
+    sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_heatmap_settings_by_project: dict[str, object] | None = None,
+    event_times: dict[str, float] | None = None,
+    log: LogFn | None = None,
+    check_cancel: Callable[[], None] | None = None,
+) -> None:
+    """Regenerate Sustained SDPF heatmaps without rendering other plots."""
+    selected_scopes = list(scopes)
+    for project_root in project_roots:
+        root = Path(project_root).resolve()
+        _log(log, f"Rebuilding Sustained SDPF heatmaps: {root.name}")
+        analysis_engine.render_sustained_heatmaps(
+            root,
+            selected_scopes,
+            log=log,
+            check_cancel=check_cancel,
+            sustained_sdpf_settings=sustained_sdpf_settings,
+            sustained_sdpf_heatmap_settings=(sustained_sdpf_heatmap_settings_by_project or {}).get(str(root)),
+            event_times=event_times,
         )
 
 
@@ -370,6 +425,13 @@ def run_analysis_pipeline(
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
     sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_limit_overrides_by_project: dict[str, dict[str, dict[str, float]]] | None = None,
+    sustained_sdpf_heatmap_settings_by_project: dict[str, object] | None = None,
+    sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
+    voltage_configs_by_project: dict[str, dict[str, Any]] | None = None,
+    sustained_sdpf_limits_by_project: dict[str, dict[str, Any]] | None = None,
+    nonconv_cases_by_project: dict[str, list[Any]] | None = None,
+    excel_waveform_exports_enabled: bool = True,
 ) -> list[Path]:
     """Run the connected analysis path end to end for selected projects/scopes."""
     selected_scopes = list(scopes)
@@ -386,7 +448,6 @@ def run_analysis_pipeline(
             [root],
             selected_scopes,
             selected_voltages,
-            selected_events,
             envelope_workers=envelope_workers,
             envelope_time_step=envelope_time_step,
             envelope_time_end=envelope_time_end,
@@ -411,9 +472,22 @@ def run_analysis_pipeline(
             ),
             resonance_settings=resonance_settings,
             sustained_sdpf_settings=sustained_sdpf_settings,
+            sustained_sdpf_limit_overrides_by_project=sustained_sdpf_limit_overrides_by_project,
+            voltage_configs_by_project=voltage_configs_by_project,
+            sustained_sdpf_limits_by_project=sustained_sdpf_limits_by_project,
+            nonconv_cases_by_project=nonconv_cases_by_project,
             log=log,
             check_cancel=check_cancel,
         )
+
+        sustained_payloads_by_scope: dict[str, Mapping[str, Any]] = {}
+        if sustained_sdpf.SustainedSDPFSettings.from_mapping(
+            sustained_sdpf_settings
+        ).enabled:
+            sustained_payloads_by_scope = {
+                scope.folder: sustained_sdpf.load_results(root, scope.folder)
+                for scope in selected_scopes
+            }
 
         _log(log, "Creating plot batch workbooks.")
         create_plot_batches(
@@ -424,6 +498,10 @@ def run_analysis_pipeline(
             event_times=event_times,
             resonance_settings=resonance_settings,
             sustained_sdpf_settings=sustained_sdpf_settings,
+            sustained_sdpf_heatmap_settings_by_project=sustained_sdpf_heatmap_settings_by_project,
+            sustained_sdpf_ranking_settings_by_project=sustained_sdpf_ranking_settings_by_project,
+            excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+            sustained_payloads_by_scope=sustained_payloads_by_scope,
             log=log,
             check_cancel=check_cancel,
         )
@@ -435,6 +513,13 @@ def run_analysis_pipeline(
             selected_events,
             resonance_settings=resonance_settings,
             sustained_sdpf_settings=sustained_sdpf_settings,
+            sustained_sdpf_heatmap_settings_by_project=sustained_sdpf_heatmap_settings_by_project,
+            sustained_sdpf_ranking_settings_by_project=sustained_sdpf_ranking_settings_by_project,
+            event_times=event_times,
+            sustained_sdpf_limit_overrides_by_project=sustained_sdpf_limit_overrides_by_project,
+            sustained_payloads_by_scope=sustained_payloads_by_scope,
+            sustained_voltage_keys=selected_voltages,
+            excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             log=log,
             check_cancel=check_cancel,
         )
@@ -449,6 +534,12 @@ def run_analysis_pipeline(
                 dashboard_figure_ids,
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_heatmap_settings_by_project=sustained_sdpf_heatmap_settings_by_project,
+                sustained_sdpf_ranking_settings_by_project=sustained_sdpf_ranking_settings_by_project,
+                render_heatmaps=False,
+                sustained_payloads_by_project_scope={
+                    str(root): sustained_payloads_by_scope,
+                },
                 event_times=event_times,
                 log=log,
                 check_cancel=check_cancel,

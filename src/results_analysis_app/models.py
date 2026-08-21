@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import os
 import re
 from typing import Any
@@ -23,6 +24,10 @@ DEFAULT_ENVELOPE_TIME_STEP = 0.002
 DEFAULT_ENVELOPE_TIME_END = 1.0
 DEFAULT_ENVELOPE_TIME_END_AUTO = True
 DEFAULT_ENVELOPE_FALLBACK_FREQUENCY = 50.0
+# Automatic plot batches include waveform Excel exports by default.  The
+# setting only controls those generated batch rows; manually edited batches
+# can still request an export explicitly.
+DEFAULT_EXCEL_WAVEFORM_EXPORTS = True
 # Zero means automatic worker selection. Positive values remain available as a
 # manual override; 60 stays below Windows' ProcessPoolExecutor limit.
 DEFAULT_ENVELOPE_WORKERS = 0
@@ -59,8 +64,7 @@ DEFAULT_RESONANCE_MIN_POSITIVE_FRACTION = 0.60
 DEFAULT_RESONANCE_MIN_GROWTH_RATIO = 1.05
 DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM = 0.50
 DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR = 0.01
-DEFAULT_SUSTAINED_SDPF_USE_TOV = True
-DEFAULT_SUSTAINED_SDPF_DURATION = 0.03
+DEFAULT_SUSTAINED_SDPF_DURATION_MS = 30.0
 
 
 def _json_list(value: Any, default: tuple[Any, ...] = ()) -> list[Any]:
@@ -69,6 +73,69 @@ def _json_list(value: Any, default: tuple[Any, ...] = ()) -> list[Any]:
 
 def _json_dict(value: Any) -> dict[Any, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def normalize_project_sustained_sdpf_heatmap_settings(value: Any) -> dict[str, list[dict[str, Any]]]:
+    """Normalize old single mappings and new ordered heatmap-set lists."""
+    if not isinstance(value, dict):
+        return {}
+    # Keep session persistence and rendering on one normalization path.  The
+    # local import avoids making the model layer depend on the renderer during
+    # module initialization.
+    from results_analysis_app.sustained_sdpf_heatmap import (
+        heatmap_sets_from_mapping,
+        heatmap_sets_to_mapping,
+    )
+
+    output: dict[str, list[dict[str, Any]]] = {}
+    for project, raw_settings in value.items():
+        output[str(project)] = heatmap_sets_to_mapping(
+            heatmap_sets_from_mapping(raw_settings)
+        )
+    return output
+
+
+def normalize_project_sustained_sdpf_ranking_settings(
+    value: Any,
+) -> dict[str, dict[str, bool]]:
+    """Normalize project-specific representative-selection controls."""
+    if not isinstance(value, dict):
+        return {}
+    from results_analysis_app.sustained_sdpf import SustainedSDPFRankingSettings
+
+    return {
+        str(project): SustainedSDPFRankingSettings.from_mapping(raw).to_mapping()
+        for project, raw in value.items()
+        if isinstance(raw, dict)
+    }
+
+
+def normalize_project_sustained_sdpf_limit_overrides(
+    value: Any,
+) -> dict[str, dict[str, dict[str, float]]]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    for project, raw_limits in value.items():
+        if not isinstance(raw_limits, dict):
+            continue
+        project_limits: dict[str, dict[str, float]] = {}
+        for voltage, raw_values in raw_limits.items():
+            if not isinstance(raw_values, dict):
+                continue
+            voltage_key = normalize_voltage(voltage)
+            if not voltage_key:
+                continue
+            values: dict[str, float] = {}
+            for measurement in ("LGp", "LLp"):
+                number = normalize_positive_float(raw_values.get(measurement), 0.0)
+                if number > 0:
+                    values[measurement] = number
+            if values:
+                project_limits[voltage_key] = values
+        if project_limits:
+            output[str(project)] = project_limits
+    return output
 
 
 def normalize_tokens(text: str | list[str] | tuple[str, ...] | Any) -> list[str]:
@@ -107,12 +174,20 @@ def normalize_worker_count(value: Any) -> int:
 
 
 def automatic_worker_count() -> int:
+    """Choose a conservative SSD-oriented pool from the detected CPU count.
+
+    Raw waveform parsing is both CPU and storage intensive.  Using every
+    logical CPU makes the parent and storage queue contend on smaller or
+    otherwise busy machines, so automatic mode uses the nearest quarter of
+    the detected logical CPUs, with the existing safety cap.
+    """
     cpu_counter = getattr(os, "process_cpu_count", None)
     cpu_count = cpu_counter() if callable(cpu_counter) else None
     if cpu_count is None:
         cpu_count = os.cpu_count()
     detected_cpus = max(1, int(cpu_count or 1))
-    return max(1, min(MAX_ENVELOPE_WORKERS, detected_cpus - 1))
+    quarter_cores = (detected_cpus + 2) // 4
+    return max(1, min(MAX_ENVELOPE_WORKERS, quarter_cores))
 
 
 def normalize_positive_int(value: Any, default: int) -> int:
@@ -124,11 +199,12 @@ def normalize_positive_int(value: Any, default: int) -> int:
 
 
 def normalize_positive_float(value: Any, default: float) -> float:
+    """Return a finite positive float or the supplied default."""
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
-    return number if number > 0 else default
+    return number if math.isfinite(number) and number > 0 else default
 
 
 def normalize_nonnegative_float(value: Any, default: float) -> float:
@@ -302,6 +378,7 @@ class AppSession:
     envelope_time_end: float = DEFAULT_ENVELOPE_TIME_END
     envelope_time_end_auto: bool = DEFAULT_ENVELOPE_TIME_END_AUTO
     envelope_fallback_frequency: float = DEFAULT_ENVELOPE_FALLBACK_FREQUENCY
+    excel_waveform_exports_enabled: bool = DEFAULT_EXCEL_WAVEFORM_EXPORTS
     envelope_chart_x_max_overrides_by_project: dict[str, float] = field(default_factory=dict)
     envelope_chart_x_major_overrides_by_project: dict[str, float] = field(default_factory=dict)
     envelope_chart_top_left_cell: str = DEFAULT_ENVELOPE_CHART_TOP_LEFT_CELL
@@ -331,8 +408,10 @@ class AppSession:
     resonance_min_level_over_vlim: float = DEFAULT_RESONANCE_MIN_LEVEL_OVER_VLIM
     resonance_min_growth_delta_factor: float = DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR
     sustained_sdpf_enabled: bool = False
-    sustained_sdpf_use_tov: bool = DEFAULT_SUSTAINED_SDPF_USE_TOV
-    sustained_sdpf_duration: float = DEFAULT_SUSTAINED_SDPF_DURATION
+    sustained_sdpf_duration_ms: float = DEFAULT_SUSTAINED_SDPF_DURATION_MS
+    sustained_sdpf_ranking_settings_by_project: dict[str, dict[str, bool]] = field(default_factory=dict)
+    sustained_sdpf_heatmap_settings_by_project: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    sustained_sdpf_limit_overrides_by_project: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     voltage_um_overrides_by_project: dict[str, dict[str, float]] = field(default_factory=dict)
     manual_exclusions_by_project: dict[str, list[ExclusionRule]] = field(default_factory=dict)
     disabled_nonconv_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
@@ -368,6 +447,9 @@ class AppSession:
             self.disabled_nonconv_by_project,
             self.high_voltage_exclusions_by_project,
             self.high_voltage_include_overrides_by_project,
+            self.sustained_sdpf_heatmap_settings_by_project,
+            self.sustained_sdpf_ranking_settings_by_project,
+            self.sustained_sdpf_limit_overrides_by_project,
             self.status_cache,
         ):
             for project in list(mapping):
@@ -400,6 +482,7 @@ class AppSession:
             "envelope_time_end": self.envelope_time_end,
             "envelope_time_end_auto": self.envelope_time_end_auto,
             "envelope_fallback_frequency": self.envelope_fallback_frequency,
+            "excel_waveform_exports_enabled": self.excel_waveform_exports_enabled,
             "envelope_chart_x_max_overrides_by_project": self.envelope_chart_x_max_overrides_by_project,
             "envelope_chart_x_major_overrides_by_project": self.envelope_chart_x_major_overrides_by_project,
             "envelope_chart_top_left_cell": self.envelope_chart_top_left_cell,
@@ -429,8 +512,10 @@ class AppSession:
             "resonance_min_level_over_vlim": self.resonance_min_level_over_vlim,
             "resonance_min_growth_delta_factor": self.resonance_min_growth_delta_factor,
             "sustained_sdpf_enabled": self.sustained_sdpf_enabled,
-            "sustained_sdpf_use_tov": self.sustained_sdpf_use_tov,
-            "sustained_sdpf_duration": self.sustained_sdpf_duration,
+            "sustained_sdpf_duration_ms": self.sustained_sdpf_duration_ms,
+            "sustained_sdpf_ranking_settings_by_project": self.sustained_sdpf_ranking_settings_by_project,
+            "sustained_sdpf_heatmap_settings_by_project": self.sustained_sdpf_heatmap_settings_by_project,
+            "sustained_sdpf_limit_overrides_by_project": self.sustained_sdpf_limit_overrides_by_project,
             "voltage_um_overrides_by_project": self.voltage_um_overrides_by_project,
             "manual_exclusions_by_project": {
                 project: [rule.to_dict() for rule in exclusions]
@@ -530,6 +615,9 @@ class AppSession:
             envelope_fallback_frequency=normalize_positive_float(
                 data.get("envelope_fallback_frequency", DEFAULT_ENVELOPE_FALLBACK_FREQUENCY),
                 DEFAULT_ENVELOPE_FALLBACK_FREQUENCY,
+            ),
+            excel_waveform_exports_enabled=bool(
+                data.get("excel_waveform_exports_enabled", DEFAULT_EXCEL_WAVEFORM_EXPORTS)
             ),
             envelope_chart_x_max_overrides_by_project=normalize_project_positive_floats(
                 data.get("envelope_chart_x_max_overrides_by_project", {})
@@ -640,12 +728,18 @@ class AppSession:
                 DEFAULT_RESONANCE_MIN_GROWTH_DELTA_FACTOR,
             ),
             sustained_sdpf_enabled=bool(data.get("sustained_sdpf_enabled", False)),
-            sustained_sdpf_use_tov=bool(
-                data.get("sustained_sdpf_use_tov", DEFAULT_SUSTAINED_SDPF_USE_TOV)
+            sustained_sdpf_duration_ms=normalize_positive_float(
+                data.get("sustained_sdpf_duration_ms", DEFAULT_SUSTAINED_SDPF_DURATION_MS),
+                DEFAULT_SUSTAINED_SDPF_DURATION_MS,
             ),
-            sustained_sdpf_duration=normalize_positive_float(
-                data.get("sustained_sdpf_duration", DEFAULT_SUSTAINED_SDPF_DURATION),
-                DEFAULT_SUSTAINED_SDPF_DURATION,
+            sustained_sdpf_ranking_settings_by_project=normalize_project_sustained_sdpf_ranking_settings(
+                data.get("sustained_sdpf_ranking_settings_by_project", {})
+            ),
+            sustained_sdpf_heatmap_settings_by_project=normalize_project_sustained_sdpf_heatmap_settings(
+                data.get("sustained_sdpf_heatmap_settings_by_project", {})
+            ),
+            sustained_sdpf_limit_overrides_by_project=normalize_project_sustained_sdpf_limit_overrides(
+                data.get("sustained_sdpf_limit_overrides_by_project", {})
             ),
             voltage_um_overrides_by_project=normalize_project_voltage_um_overrides(
                 data.get("voltage_um_overrides_by_project", {})

@@ -77,7 +77,10 @@ class LimitService:
         values_by_voltage: dict[str, list[tuple[float, float]]] = {}
         invalid_voltages: set[str] = set()
         for row_number, row in enumerate(rows[1:], start=2):
-            if not row:
+            if not row or all(
+                value is None or (isinstance(value, str) and not value.strip())
+                for value in row
+            ):
                 continue
             try:
                 voltage = float(row[headers["Un"]])

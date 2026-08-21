@@ -411,6 +411,8 @@ def create_plot_batch_rows(
     project_root: Path,
     scope_folder: str,
     checks: tuple[str, ...],
+    *,
+    excel_waveform_exports_enabled: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     path = project_root / "Voltage_envelope" / scope_folder / WORKBOOK_NAME
     if not path.is_file() or not checks:
@@ -425,7 +427,10 @@ def create_plot_batch_rows(
                 name = sheet_name(check, voltage_type)
                 if name not in wb.sheetnames:
                     continue
-                rows = _rows_from_sheet(wb[name])
+                rows = _rows_from_sheet(
+                    wb[name],
+                    excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+                )
                 if rows:
                     output[plot_event_name(check, voltage_type)] = rows
         return output
@@ -433,7 +438,7 @@ def create_plot_batch_rows(
         wb.close()
 
 
-def _rows_from_sheet(ws) -> list[dict[str, Any]]:
+def _rows_from_sheet(ws, *, excel_waveform_exports_enabled: bool = True) -> list[dict[str, Any]]:
     headers = {
         str(ws.cell(1, column).value).strip(): column
         for column in range(1, ws.max_column + 1)
@@ -456,7 +461,7 @@ def _rows_from_sheet(ws) -> list[dict[str, Any]]:
                 "tov_windows": True,
                 "tov_window_count": 4,
                 "limits": True,
-                "excel_export": True,
+                "excel_export": bool(excel_waveform_exports_enabled),
             }
         )
     return rows

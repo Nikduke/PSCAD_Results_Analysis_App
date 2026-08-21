@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -15,7 +17,14 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
-from results_analysis_app import resonance_checks, sustained_sdpf
+from results_analysis_app import resonance_checks, storage, sustained_sdpf, sustained_sdpf_heatmap
+from results_analysis_app.common import (
+    CancelFn,
+    LogFn,
+    as_float,
+    check_cancel as _cancel,
+    log_message as _log,
+)
 from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import ScopeEntry
@@ -37,15 +46,9 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SIGNATURE = b"\xff\xd8"
 WORD_2012_NAMESPACE = "http://schemas.microsoft.com/office/word/2012/wordml"
 WORD_2016_CID_NAMESPACE = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
-
-LogFn = Callable[[str], None]
-CancelFn = Callable[[], None]
-
-
-def _cancel(check_cancel: CancelFn | None) -> None:
-    if check_cancel is not None:
-        check_cancel()
-
+REPORT_MANIFEST_VERSION = 2
+SUSTAINED_REPORT_LAYOUT_VERSION = 2
+LEGACY_REPORT_MANIFEST_FILENAME = ".report_manifest.json"
 
 @dataclass(frozen=True)
 class EnvelopeSummaryRow:
@@ -58,6 +61,12 @@ class EnvelopeSummaryRow:
 
 @dataclass(frozen=True)
 class FigureReference:
+    bookmark: str
+    fallback_label: str
+
+
+@dataclass(frozen=True)
+class TableReference:
     bookmark: str
     fallback_label: str
 
@@ -192,6 +201,35 @@ def _configure_report_header_footer(doc, header_text: str) -> None:
     paragraph_properties.append(borders)
 
 
+def _add_numbered_caption(
+    doc,
+    reference: FigureReference | TableReference,
+    count: int,
+    label: str,
+    bookmark_id_offset: int,
+    text: str,
+) -> None:
+    paragraph = doc.add_paragraph(style="Caption")
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    bookmark_start = OxmlElement("w:bookmarkStart")
+    bookmark_start.set(qn("w:id"), str(count + bookmark_id_offset))
+    bookmark_start.set(qn("w:name"), reference.bookmark)
+    paragraph._p.append(bookmark_start)
+    paragraph.add_run(f"{label} ").bold = True
+    _append_field(paragraph, r"STYLEREF 1 \s", "1", bold=True)
+    paragraph.add_run("-").bold = True
+    _append_field(
+        paragraph,
+        rf"SEQ {label} \* ARABIC \s 1",
+        str(count),
+        bold=True,
+    )
+    bookmark_end = OxmlElement("w:bookmarkEnd")
+    bookmark_end.set(qn("w:id"), str(count + bookmark_id_offset))
+    paragraph._p.append(bookmark_end)
+    paragraph.add_run(f" – {text}")
+
+
 @dataclass
 class _FigureRegistry:
     count: int = 0
@@ -204,20 +242,22 @@ class _FigureRegistry:
         )
 
     def add_caption(self, doc, reference: FigureReference, text: str) -> None:
-        paragraph = doc.add_paragraph(style="Caption")
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        bookmark_start = OxmlElement("w:bookmarkStart")
-        bookmark_start.set(qn("w:id"), str(self.count + 1000))
-        bookmark_start.set(qn("w:name"), reference.bookmark)
-        paragraph._p.append(bookmark_start)
-        paragraph.add_run("Figure ").bold = True
-        _append_field(paragraph, r"STYLEREF 1 \s", "1", bold=True)
-        paragraph.add_run("-").bold = True
-        _append_field(paragraph, r"SEQ Figure \* ARABIC \s 1", str(self.count), bold=True)
-        bookmark_end = OxmlElement("w:bookmarkEnd")
-        bookmark_end.set(qn("w:id"), str(self.count + 1000))
-        paragraph._p.append(bookmark_end)
-        paragraph.add_run(f" – {text}")
+        _add_numbered_caption(doc, reference, self.count, "Figure", 1000, text)
+
+
+@dataclass
+class _TableRegistry:
+    count: int = 0
+
+    def allocate(self) -> TableReference:
+        self.count += 1
+        return TableReference(
+            bookmark=f"ReportTable{self.count}",
+            fallback_label=f"Table 1-{self.count}",
+        )
+
+    def add_caption(self, doc, reference: TableReference, text: str) -> None:
+        _add_numbered_caption(doc, reference, self.count, "Table", 2000, text)
 
 
 def _append_field(paragraph, instruction: str, fallback_text: str, bold: bool = False) -> None:
@@ -479,11 +519,24 @@ def _add_unumbered_plot_heading(doc, text: str) -> None:
     doc.add_paragraph(text, style="Plot Heading")
 
 
-def _add_figure_reference_sentence(doc, before: str, reference: FigureReference, after: str) -> None:
+def _add_caption_reference_sentence(
+    doc,
+    before: str,
+    reference: FigureReference | TableReference,
+    after: str,
+) -> None:
     paragraph = doc.add_paragraph(style="Body Text")
     paragraph.add_run(before)
     _append_field(paragraph, rf"REF {reference.bookmark} \h", reference.fallback_label, bold=True)
     paragraph.add_run(after)
+
+
+def _add_figure_reference_sentence(doc, before: str, reference: FigureReference, after: str) -> None:
+    _add_caption_reference_sentence(doc, before, reference, after)
+
+
+def _add_table_reference_sentence(doc, before: str, reference: TableReference, after: str) -> None:
+    _add_caption_reference_sentence(doc, before, reference, after)
 
 
 def _add_centered_report_image(doc, image_path: Path) -> None:
@@ -505,15 +558,206 @@ PLOT_FAULT_LABEL_PATTERN = "|".join(
 )
 
 
-def _log(log: LogFn | None, message: str) -> None:
-    if log is not None:
-        log(message)
-
-
 def _safe_stem(text: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
     value = re.sub(r"_+", "_", value)
     return value.strip("_.") or "figure"
+
+
+def _report_json_value(value: Any) -> Any:
+    if hasattr(value, "to_mapping") and callable(value.to_mapping):
+        return _report_json_value(value.to_mapping())
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, Mapping):
+        return {str(key): _report_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_report_json_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _report_signature(value: Any) -> str:
+    encoded = json.dumps(
+        _report_json_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def _report_file_manifest_entry(project_root: Path, path: Path) -> dict[str, Any]:
+    try:
+        relative = path.resolve().relative_to(project_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        relative = str(path.resolve())
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": relative, "missing": True}
+    return {
+        "path": relative,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _report_cache_key(project_root: Path, report_dir: Path) -> str:
+    try:
+        return report_dir.resolve().relative_to(project_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return report_dir.resolve().as_posix()
+
+
+def _report_manifest_matches(
+    project_root: Path,
+    report_dir: Path,
+    voltage: str,
+    signature: str,
+    output_path: Path,
+) -> bool:
+    cache = storage.load_project_analysis_cache(project_root)
+    directories = cache.get("reports")
+    directory = directories.get(_report_cache_key(project_root, report_dir)) if isinstance(directories, dict) else None
+    record = directory.get(str(voltage)) if isinstance(directory, dict) else None
+    if not isinstance(record, dict) or record.get("signature") != signature:
+        return False
+    output_record = record.get("output")
+    return (
+        isinstance(output_record, dict)
+        and _report_file_manifest_entry(project_root, output_path) == output_record
+    )
+
+
+def _load_report_manifest_entries(
+    project_root: Path,
+    report_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    cache = storage.load_project_analysis_cache(project_root)
+    directories = cache.get("reports")
+    reports = directories.get(_report_cache_key(project_root, report_dir)) if isinstance(directories, dict) else None
+    if not isinstance(reports, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in reports.items()
+        if isinstance(value, dict)
+    }
+
+
+def _write_report_manifest(
+    project_root: Path,
+    report_dir: Path,
+    reports: dict[str, dict[str, Any]],
+) -> None:
+    cache = storage.load_project_analysis_cache(project_root)
+    directories = cache.setdefault("reports", {})
+    if not isinstance(directories, dict):
+        directories = {}
+        cache["reports"] = directories
+    directories[_report_cache_key(project_root, report_dir)] = reports
+    storage.save_project_analysis_cache(project_root, cache)
+    try:
+        (report_dir / LEGACY_REPORT_MANIFEST_FILENAME).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _report_manifest_payload(
+    project_root: Path,
+    scope: ScopeEntry,
+    voltage: str,
+    selected_events: list[str],
+    dashboard_figure_ids: list[str],
+    parsed_resonance: resonance_checks.ResonanceSettings,
+    event_times: dict[str, float] | None,
+    parsed_sustained: sustained_sdpf.SustainedSDPFSettings,
+    parsed_sustained_ranking: sustained_sdpf.SustainedSDPFRankingSettings,
+    sustained_heatmap_settings: Any,
+    render_heatmaps: bool,
+    image_cache: dict[Path, list[Path]],
+    sustained_cache_valid: bool | None = None,
+) -> dict[str, Any]:
+    source_paths: set[Path] = set()
+
+    def add(path: Path) -> None:
+        source_paths.add(path)
+
+    envelope_dir = project_root / "Voltage_envelope" / scope.folder
+    add(envelope_dir / f"MM_{voltage}.xlsx")
+    add(envelope_dir / f"MM_{voltage}_with_combined_plot.xlsx")
+    add(envelope_dir / resonance_checks.WORKBOOK_NAME)
+    add(sustained_sdpf.result_path(project_root, scope.folder))
+    add(sustained_sdpf.summary_path(project_root, scope.folder))
+
+    for event in selected_events:
+        for image in _find_event_images(project_root, scope, event, voltage, image_cache):
+            add(image)
+
+    for check in parsed_resonance.effective_enabled_checks:
+        for voltage_type in resonance_checks.VOLTAGE_TYPES:
+            for image in _find_resonance_images(
+                project_root,
+                scope,
+                check,
+                voltage_type,
+                voltage,
+                image_cache,
+            ):
+                add(image)
+
+    heatmap_root = (
+        project_root
+        / "Plots"
+        / "Generated"
+        / scope.folder
+        / sustained_sdpf_heatmap.HEATMAP_EVENT
+    )
+    if heatmap_root.is_dir():
+        try:
+            for path in heatmap_root.rglob("*"):
+                if path.is_file():
+                    add(path)
+        except OSError:
+            pass
+
+    for figure_id in dashboard_figure_ids:
+        try:
+            workbook_name, _sheet_name, _chart_index, _title = _parse_dashboard_figure_id(figure_id)
+        except ValueError:
+            continue
+        add(project_root / "Dashboards" / workbook_name)
+
+    payload = {
+        "version": REPORT_MANIFEST_VERSION,
+        "scope": {
+            "name": scope.name,
+            "mode": scope.mode,
+            "tokens": list(scope.tokens),
+        },
+        "voltage": str(voltage),
+        "events": list(selected_events),
+        "dashboard_figure_ids": list(dashboard_figure_ids),
+        "resonance": parsed_resonance.to_mapping(),
+        "event_times": dict(event_times or {}),
+        "sustained": parsed_sustained.to_mapping(),
+        "sustained_ranking": parsed_sustained_ranking.to_mapping(),
+        "sustained_heatmaps": sustained_heatmap_settings,
+        "sustained_cache_valid": sustained_cache_valid,
+        "render_heatmaps": bool(render_heatmaps),
+        "sources": sorted(
+            (_report_file_manifest_entry(project_root, path) for path in source_paths),
+            key=lambda item: str(item["path"]).casefold(),
+        ),
+    }
+    if parsed_sustained.enabled:
+        payload["sustained_sdpf_result_version"] = sustained_sdpf.RESULT_VERSION
+        payload["sustained_sdpf_report_layout_version"] = SUSTAINED_REPORT_LAYOUT_VERSION
+    return payload
 
 
 def _is_report_image(path: Path) -> bool:
@@ -684,16 +928,6 @@ def _find_voltage_images(
     ]
 
 
-def _as_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        number = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
 def _envelope_summary_rows(
     workbook_path: Path,
     event_times: dict[str, float] | None = None,
@@ -744,8 +978,8 @@ def _envelope_summary_rows(
                 continue
             sheet_name, headers, best_row = match
 
-            peak = _as_float(row_value(best_row, headers, "Max_all", "Max"))
-            time_s = _as_float(row_value(best_row, headers, "Time (s)"))
+            peak = as_float(row_value(best_row, headers, "Max_all", "Max"))
+            time_s = as_float(row_value(best_row, headers, "Time (s)"))
             if peak is None or time_s is None:
                 continue
             output.append(
@@ -882,29 +1116,275 @@ def _add_analysis_figure_sentence(
     )
 
 
-def _load_sustained_sdpf_report_result(
+def _load_sustained_sdpf_report_results(
     project_root: Path,
     scope: ScopeEntry,
     voltage: str,
     settings: sustained_sdpf.SustainedSDPFSettings,
-    event_times: dict[str, float] | None,
-) -> sustained_sdpf.SustainedSDPFResult | None:
-    payload = sustained_sdpf.load_results(project_root, scope.folder)
-    if payload.get("settings") != settings.to_mapping() or not sustained_sdpf.result_inputs_current(
-        payload,
-        str(voltage),
-    ):
-        return None
-    raw = payload.get("results", {}).get(str(voltage))
-    if not isinstance(raw, dict):
-        return None
+    payload: Mapping[str, Any] | None = None,
+    shared_manifest_current: bool | None = None,
+    cache_validation: sustained_sdpf.SustainedSDPFCacheValidation | None = None,
+) -> tuple[
+    dict[
+        str,
+        dict[str, dict[str, sustained_sdpf.SustainedSDPFResult]],
+    ],
+    sustained_sdpf.SustainedSDPFCacheValidation,
+]:
+    saved_payload = (
+        payload
+        if isinstance(payload, Mapping)
+        else sustained_sdpf.load_results(project_root, scope.folder)
+    )
+    validation = cache_validation or sustained_sdpf.validate_result_cache(
+        saved_payload,
+        project_root,
+        settings,
+        shared_manifest_current=shared_manifest_current,
+    )
+    if not validation.valid:
+        return {}, validation
+    return sustained_sdpf.current_representatives_for_voltage(
+        saved_payload,
+        voltage,
+        project_root,
+        settings,
+        shared_manifest_current=validation.shared_manifest_current,
+        cache_validation=validation,
+    )
+
+
+def _sustained_image_for_result(
+    images: Iterable[Path],
+    result: sustained_sdpf.SustainedSDPFResult,
+) -> Path | None:
+    prefix = (
+        f"Case: {result.case} | Run: {int(result.run)} | "
+        f"Element: {result.mm_name}"
+    )
+    for image in images:
+        if _plot_heading_from_image_path(image).startswith(prefix):
+            return image
+    return None
+
+
+_SUSTAINED_SELECTION_LABELS = {
+    sustained_sdpf.HIGHEST_VOLTAGE_SUSTAINED_SELECTION: "Highest sustained Vₜ",
+    sustained_sdpf.CUMULATIVE_STRESS_SELECTION: "Cumulative stress",
+    sustained_sdpf.CONTINUOUS_DURATION_SELECTION: "Longest duration",
+}
+
+
+def _sustained_population_title(population: str) -> str:
+    if population == sustained_sdpf.ACTUAL_SDPF_POPULATION:
+        return "Actual SDPF (threshold: SDPF)"
+    return "Safety-margin-only (threshold: SDPF/1.15)"
+
+
+def _sustained_selection_text(metrics: Iterable[str]) -> str:
+    labels = [
+        _SUSTAINED_SELECTION_LABELS[metric]
+        for metric in metrics
+        if metric in _SUSTAINED_SELECTION_LABELS
+    ]
+    return "; ".join(labels)
+
+
+def _sustained_selection_groups(
+    selections: Mapping[str, sustained_sdpf.SustainedSDPFResult],
+) -> list[tuple[sustained_sdpf.SustainedSDPFResult, tuple[str, ...]]]:
+    grouped: dict[tuple[str, int, str], list[str]] = {}
+    for metric in sustained_sdpf.RANKING_SELECTIONS:
+        result = selections.get(metric)
+        if not isinstance(result, sustained_sdpf.SustainedSDPFResult):
+            continue
+        grouped.setdefault(sustained_sdpf._result_identity(result), []).append(metric)
+    return [
+        (selections[metrics[0]], tuple(metrics))
+        for metrics in grouped.values()
+    ]
+
+
+def _report_metric_text(value: float | None, decimals: int = 2) -> str:
+    if value is None:
+        return "—"
     try:
-        result = sustained_sdpf.SustainedSDPFResult.from_dict(raw)
-    except (TypeError, ValueError, KeyError):
-        return None
-    if abs(result.duration_s - settings.effective_duration(event_times)) > 1e-9:
-        return None
-    return result
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return _format_float(number, decimals) if math.isfinite(number) else "—"
+
+
+def _sustained_table_rows(
+    groups: Iterable[tuple[sustained_sdpf.SustainedSDPFResult, tuple[str, ...]]],
+    population: str,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for result, metrics in groups:
+        phase = result.governing
+        (
+            _threshold,
+            _threshold_peak,
+            area,
+            duration_ms,
+            sustained_t_peak,
+            sustained_t_ratio,
+            _event_start,
+            _event_end,
+        ) = sustained_sdpf._population_metric_values(phase, population)
+        ratio_percent = (
+            float(sustained_t_ratio) * 100.0
+            if sustained_t_ratio is not None
+            else None
+        )
+        rows.append(
+            [
+                _sustained_selection_text(metrics),
+                f"{result.case} / {int(result.run)}",
+                str(result.fault_type or "—"),
+                str(result.mm_name or "—"),
+                f"{phase.measurement} {phase.phase}",
+                f"{_report_metric_text(sustained_t_peak)} / {_report_metric_text(ratio_percent, 1)}%",
+                _report_metric_text(area),
+                _report_metric_text(duration_ms),
+            ]
+        )
+    return rows
+
+
+def _add_sustained_selection_table(
+    doc,
+    groups: Iterable[tuple[sustained_sdpf.SustainedSDPFResult, tuple[str, ...]]],
+    population: str,
+    voltage: str,
+    table_registry: _TableRegistry,
+) -> None:
+    reference = table_registry.allocate()
+    _add_table_reference_sentence(
+        doc,
+        "Selected cases are summarized in ",
+        reference,
+        ".",
+    )
+    table_registry.add_caption(
+        doc,
+        reference,
+        f"Selected Sustained SDPF cases — {_sustained_population_title(population)} at {voltage} kV",
+    )
+    headers = (
+        "Selection criteria",
+        "Case / Run",
+        "Fault",
+        "MM element",
+        "Path",
+        "Vₜ (kVₚₑₐₖ / %SDPF)",
+        "Area (pu·ms)",
+        "Duration (ms)",
+    )
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    table.autofit = True
+    for cell, text in zip(table.rows[0].cells, headers):
+        cell.text = text
+    for row in _sustained_table_rows(groups, population):
+        cells = table.add_row().cells
+        for cell, text in zip(cells, row):
+            cell.text = text
+    for row_index, row in enumerate(table.rows):
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1.0
+                for run in paragraph.runs:
+                    run.font.size = Pt(9)
+                    if row_index == 0:
+                        run.bold = True
+
+
+def _add_sustained_selected_plot(
+    doc,
+    metrics: Iterable[str],
+    population: str,
+    voltage: str,
+    image_path: Path | None,
+    figure_registry: _FigureRegistry,
+    rendered_images: set[Path],
+    check_cancel: CancelFn | None = None,
+) -> None:
+    if image_path is None:
+        return
+    _cancel(check_cancel)
+    if image_path in rendered_images:
+        return
+    rendered_images.add(image_path)
+    criteria_text = _sustained_selection_text(metrics)
+    reference = figure_registry.allocate()
+    _add_unumbered_plot_heading(doc, _plot_heading_from_image_path(image_path))
+    _add_figure_reference_sentence(
+        doc,
+        "",
+        reference,
+        f" shows the selected Sustained SDPF case ({criteria_text}).",
+    )
+    _add_centered_report_image(doc, image_path)
+    figure_registry.add_caption(
+        doc,
+        reference,
+        f"Selected Sustained SDPF case — {_sustained_population_title(population)}; "
+        f"{criteria_text}; {voltage} kV",
+    )
+
+
+def _add_sustained_population_subsection(
+    doc,
+    population: str,
+    selections: Mapping[str, sustained_sdpf.SustainedSDPFResult],
+    voltage: str,
+    image_paths: Mapping[str, Path | None],
+    figure_registry: _FigureRegistry,
+    check_cancel: Callable[[], None] | None = None,
+    table_registry: _TableRegistry | None = None,
+) -> None:
+    groups = _sustained_selection_groups(selections)
+    if not groups:
+        return
+    _add_report_heading(
+        doc,
+        f"{_sustained_population_title(population)} selected cases",
+        level=3,
+    )
+    table_registry = table_registry or _TableRegistry()
+    _add_sustained_selection_table(doc, groups, population, voltage, table_registry)
+
+    plot_groups = [
+        (
+            metrics,
+            next(
+                (
+                    image_paths.get(metric)
+                    for metric in metrics
+                    if image_paths.get(metric) is not None
+                ),
+                None,
+            ),
+        )
+        for _result, metrics in groups
+    ]
+    if any(image_path is not None for _metrics, image_path in plot_groups):
+        _add_report_heading(doc, "Selected time-domain plots", level=4)
+    rendered_images: set[Path] = set()
+    for metrics, image_path in plot_groups:
+        _add_sustained_selected_plot(
+            doc,
+            metrics,
+            population,
+            voltage,
+            image_path,
+            figure_registry,
+            rendered_images,
+            check_cancel,
+        )
 
 
 def _add_sustained_sdpf_section(
@@ -914,50 +1394,134 @@ def _add_sustained_sdpf_section(
     image_path: Path | None,
     figure_registry: _FigureRegistry,
     check_cancel: CancelFn | None = None,
+    heatmap_groups: Iterable[tuple[str, Iterable[Path]]] = (),
+    heatmap_settings_by_name: Mapping[str, sustained_sdpf_heatmap.HeatmapSettings] | None = None,
+    selection_results_by_population: Mapping[str, Any] | None = None,
+    image_paths_by_population: Mapping[str, Any] | None = None,
+    ranking_settings: sustained_sdpf.SustainedSDPFRankingSettings | None = None,
+    table_registry: _TableRegistry | None = None,
 ) -> None:
-    _add_report_heading(doc, "Sustained SDPF stress", level=2)
+    _add_report_heading(doc, "Sustained SDPF", level=2)
+    parsed_ranking = ranking_settings or sustained_sdpf.SustainedSDPFRankingSettings()
+    criteria_text = _sustained_selection_text(parsed_ranking.enabled_selections()) or "the enabled criteria"
     duration_ms = result.duration_s * 1000.0
-    doc.add_paragraph(f"Duration criterion: {_format_float(duration_ms, 2)} ms", style="Body Text")
-    relevant = [phase for phase in result.phases if phase.longest_margin_s > 0]
-    if relevant:
-        table = doc.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        for cell, text in zip(table.rows[0].cells, ("Phase", "> 15% margin", "> SDPF")):
-            cell.text = text
-        for phase in relevant:
-            cells = table.add_row().cells
-            cells[0].text = phase.phase
-            cells[1].text = f"{phase.longest_margin_s * 1000.0:.2f} ms"
-            cells[2].text = (
-                f"{phase.longest_sdpf_s * 1000.0:.2f} ms"
-                if phase.longest_sdpf_s > 0
-                else "-"
-            )
-    governing = result.governing
     doc.add_paragraph(
-        f"Highest {_format_float(duration_ms, 2)} ms sustained stress: "
-        f"{_format_float(governing.sustained_peak_kv, 2)} kVpeak / "
-        f"{_format_float(governing.sustained_rms_kv, 2)} kVRMS - "
-        f"{_format_float(governing.sustained_ratio * 100.0, 2)}% SDPF",
+        f"Candidates require peak-envelope persistence for at least {_format_float(duration_ms, 2)} ms. "
+        f"Actual SDPF and SDPF/1.15 safety-margin populations are ranked separately by {criteria_text}.",
         style="Body Text",
     )
-    if governing.longest_sdpf_s + 1e-12 >= result.duration_s:
-        classification = f"SDPF exceeded for >= {_format_float(duration_ms, 2)} ms"
-    elif governing.longest_margin_s + 1e-12 >= result.duration_s:
-        classification = (
-            f"SDPF safety margin exceeded; SDPF not exceeded for >= {_format_float(duration_ms, 2)} ms"
-        )
+    table_registry = table_registry or _TableRegistry()
+    raw_selections = selection_results_by_population or {}
+    population_selections: dict[str, dict[str, sustained_sdpf.SustainedSDPFResult]] = {
+        population: {}
+        for population in sustained_sdpf.RANKING_POPULATIONS
+    }
+    if any(population in raw_selections for population in sustained_sdpf.RANKING_POPULATIONS):
+        for population in sustained_sdpf.RANKING_POPULATIONS:
+            raw_population = raw_selections.get(population, {})
+            if isinstance(raw_population, Mapping):
+                population_selections[population] = {
+                    metric: selected
+                    for metric, selected in raw_population.items()
+                    if metric in sustained_sdpf.RANKING_SELECTIONS
+                    and isinstance(selected, sustained_sdpf.SustainedSDPFResult)
+                }
     else:
-        classification = f"No SDPF safety-margin exceedance sustained for >= {_format_float(duration_ms, 2)} ms"
-    doc.add_paragraph(classification, style="Body Text")
-    if image_path is None:
+        # Keep direct callers that omit the detailed population structure
+        # usable for a concise report section.
+        fallback_population = sustained_sdpf.result_population(result)
+        if fallback_population is not None:
+            population_selections[fallback_population] = {
+                metric: selected
+                for metric, selected in raw_selections.items()
+                if metric in {
+                    sustained_sdpf.CUMULATIVE_STRESS_SELECTION,
+                    sustained_sdpf.CONTINUOUS_DURATION_SELECTION,
+                }
+                and isinstance(selected, sustained_sdpf.SustainedSDPFResult)
+            }
+        if not any(population_selections.values()):
+            fallback_population = fallback_population or sustained_sdpf.SAFETY_MARGIN_ONLY_POPULATION
+            population_selections[fallback_population] = {
+                sustained_sdpf.CUMULATIVE_STRESS_SELECTION: result,
+                sustained_sdpf.CONTINUOUS_DURATION_SELECTION: result,
+            }
+
+    raw_image_paths = image_paths_by_population or {}
+    population_images: dict[str, dict[str, Path | None]] = {
+        population: {}
+        for population in sustained_sdpf.RANKING_POPULATIONS
+    }
+    if any(population in raw_image_paths for population in sustained_sdpf.RANKING_POPULATIONS):
+        for population in sustained_sdpf.RANKING_POPULATIONS:
+            raw_population = raw_image_paths.get(population, {})
+            if isinstance(raw_population, Mapping):
+                population_images[population] = {
+                    metric: path
+                    for metric, path in raw_population.items()
+                    if metric in sustained_sdpf.RANKING_SELECTIONS
+                }
+    else:
+        fallback_population = sustained_sdpf.result_population(result) or sustained_sdpf.SAFETY_MARGIN_ONLY_POPULATION
+        population_images[fallback_population] = {
+            metric: raw_image_paths.get(metric)
+            for metric in sustained_sdpf.RANKING_SELECTIONS
+        }
+        if image_path is not None:
+            for metric in sustained_sdpf.RANKING_SELECTIONS:
+                population_images[fallback_population].setdefault(metric, image_path)
+
+    enabled = set(parsed_ranking.enabled_selections())
+    for population in sustained_sdpf.RANKING_POPULATIONS:
+        selected = {
+            metric: selected_result
+            for metric, selected_result in population_selections[population].items()
+            if metric in enabled
+        }
+        if not selected:
+            continue
+        _add_sustained_population_subsection(
+            doc,
+            population,
+            selected,
+            voltage,
+            population_images[population],
+            figure_registry,
+            check_cancel,
+            table_registry,
+        )
+    groups = [
+        (str(name), [path for path in paths if _is_report_image(path)])
+        for name, paths in heatmap_groups
+    ]
+    groups = [(name, paths) for name, paths in groups if paths]
+    if not groups:
         return
-    _cancel(check_cancel)
-    reference = figure_registry.allocate()
-    _add_unumbered_plot_heading(doc, _plot_heading_from_image_path(image_path))
-    _add_figure_reference_sentence(doc, "", reference, " shows the governing Sustained SDPF MM time-domain plot.")
-    _add_centered_report_image(doc, image_path)
-    figure_registry.add_caption(doc, reference, f"Sustained SDPF stress at {voltage} kV")
+    _add_report_heading(doc, "Incidence heatmaps", level=3)
+    doc.add_paragraph(
+        "Top: actual SDPF incidence; bottom: inclusive SDPF/1.15 safety-margin incidence, "
+        "counted per eligible Run × MM cell.",
+        style="Body Text",
+    )
+    for set_name, paths in groups:
+        heatmap_settings = (heatmap_settings_by_name or {}).get(set_name)
+        report_set_name = (
+            sustained_sdpf_heatmap.display_heatmap_set_name(set_name, heatmap_settings)
+            or "Heatmap"
+        )
+        _add_report_heading(doc, report_set_name, level=4)
+        for heatmap_path in paths:
+            _cancel(check_cancel)
+            reference = figure_registry.allocate()
+            panel_heading = _heatmap_plot_heading_from_image_path(heatmap_path, heatmap_settings)
+            if panel_heading:
+                _add_unumbered_plot_heading(doc, panel_heading)
+            _add_figure_reference_sentence(doc, "", reference, " shows Sustained SDPF incidence.")
+            _add_centered_report_image(doc, heatmap_path)
+            caption = f"Sustained SDPF incidence — {report_set_name}"
+            if panel_heading:
+                caption += f", {panel_heading}"
+            figure_registry.add_caption(doc, reference, f"{caption} at {voltage} kV")
 
 
 def _analysis_figure_caption(label: str, voltage_type: str, voltage: str) -> str:
@@ -988,6 +1552,36 @@ def _plot_heading_from_image_path(path: Path) -> str:
             parts.append(f"Trace: {trace.replace('_', ' & ') if trace == 'LGp_LLp' else trace}")
         return " | ".join(parts)
     return path.stem
+
+
+def _heatmap_plot_heading_from_image_path(
+    path: Path,
+    settings: sustained_sdpf_heatmap.HeatmapSettings | None = None,
+) -> str:
+    """Return a semantic report heading without exposing the PNG filename."""
+    stem = path.stem
+    combined = re.fullmatch(r"MM_[^_]+_faceted_(?P<page>\d+)_heatmap", stem, flags=re.IGNORECASE)
+    if combined:
+        return "Combined panels"
+
+    separate = re.fullmatch(r"MM_[^_]+_(?P<body>.+)_heatmap", stem, flags=re.IGNORECASE)
+    if not separate:
+        return "Heatmap"
+    body = separate.group("body")
+    part = None
+    part_match = re.fullmatch(r"(?P<value>.+)_(?P<part>\d{2})", body)
+    if part_match:
+        body = part_match.group("value")
+        part = int(part_match.group("part"))
+
+    if settings is not None and settings.split_by and body.casefold() != "all":
+        value = sustained_sdpf_heatmap.display_group_value(settings.split_by, body)
+        heading = f"Split {settings.split_by}: {value}"
+    else:
+        heading = "" if body.casefold() == "all" else "Heatmap"
+    if part is not None:
+        heading = f"{heading} · Panel {part}" if heading else f"Panel {part}"
+    return heading
 
 
 def _export_envelope_chart(
@@ -1177,6 +1771,143 @@ def _export_dashboard_figures(
     return exported
 
 
+def _add_sustained_report_content(
+    doc,
+    root: Path,
+    scope: ScopeEntry,
+    voltage: str,
+    parsed_sustained: sustained_sdpf.SustainedSDPFSettings,
+    sustained_payload: Mapping[str, Any],
+    shared_manifest_current: bool | None,
+    sustained_cache_validation: sustained_sdpf.SustainedSDPFCacheValidation | None,
+    image_cache: dict[Path, list[Path]],
+    figure_registry: _FigureRegistry,
+    check_cancel: Callable[[], None] | None,
+    log: LogFn | None,
+    heatmap_settings_value: Any,
+    render_heatmaps: bool,
+    ranking_settings: sustained_sdpf.SustainedSDPFRankingSettings,
+) -> int:
+    """Add Sustained SDPF figures for one report voltage."""
+    _cancel(check_cancel)
+    sustained_results, result_validation = _load_sustained_sdpf_report_results(
+        root,
+        scope,
+        voltage,
+        parsed_sustained,
+        sustained_payload,
+        shared_manifest_current,
+        sustained_cache_validation,
+    )
+    sustained_result = next(
+        (
+            sustained_results.get(population, {}).get(
+                sustained_sdpf.CUMULATIVE_STRESS_SELECTION
+            )
+            for population in sustained_sdpf.RANKING_POPULATIONS
+            if sustained_results.get(population, {}).get(
+                sustained_sdpf.CUMULATIVE_STRESS_SELECTION
+            ) is not None
+        ),
+        next(
+            (
+                selected
+                for population in sustained_sdpf.RANKING_POPULATIONS
+                for selected in sustained_results.get(population, {}).values()
+                if selected is not None
+            ),
+            None,
+        ),
+    )
+    if sustained_result is None:
+        if result_validation is not None and not result_validation.valid:
+            if sustained_cache_validation is None or sustained_cache_validation.valid:
+                _log(
+                    log,
+                    f"Sustained SDPF report result skipped for {voltage} kV: "
+                    f"{result_validation.reason}.",
+                )
+            sustained_sdpf_heatmap.clear_heatmaps(root, scope.folder)
+        elif render_heatmaps:
+            sustained_sdpf_heatmap.clear_heatmaps(root, scope.folder)
+        return 0
+
+    sustained_images = _find_event_images(
+        root,
+        scope,
+        sustained_sdpf.SUSTAINED_SDPF,
+        voltage,
+        image_cache,
+    )
+    image_paths_by_population = {
+        population: {
+            selection: _sustained_image_for_result(sustained_images, selected_result)
+            for selection, selected_result in selections.items()
+        }
+        for population, selections in sustained_results.items()
+    }
+    heatmap_groups: list[tuple[str, list[Path]]] = []
+    heatmap_settings = sustained_sdpf_heatmap.heatmap_sets_from_mapping(
+        heatmap_settings_value
+    )
+    heatmap_enabled = any(item.settings.enabled for item in heatmap_settings)
+    if heatmap_enabled and render_heatmaps:
+        heatmap_groups = sustained_sdpf_heatmap.generate_heatmap_sets(
+            root,
+            scope.folder,
+            voltage,
+            heatmap_settings,
+            parsed_sustained,
+            log=log,
+            check_cancel=check_cancel,
+            payload=sustained_payload,
+            shared_manifest_current=shared_manifest_current,
+        )
+    elif heatmap_enabled:
+        heatmap_groups = sustained_sdpf_heatmap.heatmap_paths_for_sets(
+            root,
+            scope.folder,
+            voltage,
+            heatmap_settings,
+        )
+    else:
+        sustained_sdpf_heatmap.clear_heatmaps(root, scope.folder)
+
+    cumulative_image = next(
+        (
+            image_paths_by_population.get(population, {}).get(
+                sustained_sdpf.CUMULATIVE_STRESS_SELECTION
+            )
+            for population in sustained_sdpf.RANKING_POPULATIONS
+            if image_paths_by_population.get(population, {}).get(
+                sustained_sdpf.CUMULATIVE_STRESS_SELECTION
+            ) is not None
+        ),
+        None,
+    )
+    _add_sustained_sdpf_section(
+        doc,
+        sustained_result,
+        voltage,
+        cumulative_image,
+        figure_registry,
+        check_cancel,
+        heatmap_groups=heatmap_groups,
+        heatmap_settings_by_name={
+            item.name: item.settings for item in heatmap_settings
+        },
+        selection_results_by_population=sustained_results,
+        image_paths_by_population=image_paths_by_population,
+        ranking_settings=ranking_settings,
+    )
+    return len({
+        path
+        for paths in image_paths_by_population.values()
+        for path in paths.values()
+        if path is not None
+    }) + sum(len(paths) for _name, paths in heatmap_groups)
+
+
 def build_reports_from_existing_plots(
     project_roots: Iterable[str | Path],
     scopes: Iterable[ScopeEntry],
@@ -1188,6 +1919,10 @@ def build_reports_from_existing_plots(
     log: LogFn | None = None,
     check_cancel: CancelFn | None = None,
     sustained_sdpf_settings: dict[str, object] | None = None,
+    sustained_sdpf_heatmap_settings_by_project: dict[str, object] | None = None,
+    sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
+    render_heatmaps: bool = True,
+    sustained_payloads_by_project_scope: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -1199,8 +1934,10 @@ def build_reports_from_existing_plots(
     selected_scopes = list(scopes)
     selected_events = list(events)
     selected_voltages = list(voltages)
+    selected_dashboard_figure_ids = list(dashboard_figure_ids)
     parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
     parsed_sustained = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
+    parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings()
     _cancel(check_cancel)
 
     with ExitStack() as stack:
@@ -1228,10 +1965,50 @@ def build_reports_from_existing_plots(
         for project_root in project_roots:
             _cancel(check_cancel)
             root = Path(project_root).resolve()
+            parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings.from_mapping(
+                (sustained_sdpf_ranking_settings_by_project or {}).get(str(root))
+            )
             for scope in selected_scopes:
                 _cancel(check_cancel)
                 report_dir = root / "Reports" / scope.folder
                 report_dir.mkdir(parents=True, exist_ok=True)
+                manifest_entries = _load_report_manifest_entries(root, report_dir)
+                if not parsed_sustained.enabled:
+                    sustained_sdpf_heatmap.clear_heatmaps(root, scope.folder)
+                project_payloads = (sustained_payloads_by_project_scope or {}).get(str(root), {})
+                sustained_payload = (
+                    project_payloads.get(scope.folder)
+                    if isinstance(project_payloads, Mapping)
+                    else None
+                )
+                if parsed_sustained.enabled and not isinstance(sustained_payload, Mapping):
+                    sustained_payload = sustained_sdpf.load_results(root, scope.folder)
+                if not parsed_sustained.enabled:
+                    sustained_payload = {}
+                sustained_cache_validation = (
+                    sustained_sdpf.validate_result_cache(
+                        sustained_payload,
+                        root,
+                        parsed_sustained,
+                    )
+                    if parsed_sustained.enabled
+                    else None
+                )
+                shared_manifest_current = (
+                    sustained_cache_validation.shared_manifest_current
+                    if sustained_cache_validation is not None
+                    else None
+                )
+                if (
+                    sustained_cache_validation is not None
+                    and not sustained_cache_validation.valid
+                ):
+                    _log(
+                        log,
+                        f"Sustained SDPF report data unavailable for {scope.folder}: "
+                        f"{sustained_cache_validation.reason}. "
+                        "Rebuild envelope data/checks before rebuilding reports.",
+                    )
                 for temporary_dir in (
                     report_dir / "_envelope_exports",
                     report_dir / "_dashboard_exports",
@@ -1241,6 +2018,46 @@ def build_reports_from_existing_plots(
                 for voltage in selected_voltages:
                     _cancel(check_cancel)
                     _log(log, f"Building report: {root.name} | {scope.folder} | {voltage} kV")
+                    report_payload = _report_manifest_payload(
+                        root,
+                        scope,
+                        str(voltage),
+                        selected_events,
+                        selected_dashboard_figure_ids,
+                        parsed_resonance,
+                        event_times,
+                        parsed_sustained,
+                        parsed_sustained_ranking,
+                        (sustained_sdpf_heatmap_settings_by_project or {}).get(str(root)),
+                        render_heatmaps,
+                        image_cache,
+                        sustained_cache_valid=(
+                            sustained_cache_validation.valid
+                            if sustained_cache_validation is not None
+                            else None
+                        ),
+                    )
+                    report_signature = _report_signature(report_payload)
+                    output_path = report_dir / f"Voltage_{voltage}_kV.docx"
+                    sustained_cache_invalid = (
+                        parsed_sustained.enabled
+                        and sustained_cache_validation is not None
+                        and not sustained_cache_validation.valid
+                    )
+                    if not sustained_cache_invalid and _report_manifest_matches(
+                        root,
+                        report_dir,
+                        str(voltage),
+                        report_signature,
+                        output_path,
+                    ):
+                        written.append(output_path)
+                        try:
+                            (report_dir / LEGACY_REPORT_MANIFEST_FILENAME).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        _log(log, f"Skipping unchanged report: {output_path.name}")
+                        continue
                     doc = Document()
                     section = doc.sections[0]
                     section.page_width = Cm(21.0)
@@ -1258,7 +2075,7 @@ def build_reports_from_existing_plots(
 
                     _create_heading_numbering(doc)
                     figure_registry = _FigureRegistry()
-                    _add_report_heading(doc, f"Voltage {voltage} kV - {scope.name}", level=1)
+                    _add_report_heading(doc, f"{voltage} kV Voltage Assessment", level=1)
                     envelope_workbook = root / "Voltage_envelope" / scope.folder / f"MM_{voltage}.xlsx"
                     sa_tov_rows = []
                     if any(_report_event_name(event) == "SA" for event in selected_events):
@@ -1272,7 +2089,7 @@ def build_reports_from_existing_plots(
 
                     dashboard_figures = _export_dashboard_figures(
                         root,
-                        dashboard_figure_ids,
+                        selected_dashboard_figure_ids,
                         str(voltage),
                         report_dir / "_dashboard_exports" / f"Voltage_{voltage}_kV",
                         log,
@@ -1301,7 +2118,7 @@ def build_reports_from_existing_plots(
                     if envelope_chart is not None:
                         _add_report_heading(
                             doc,
-                            f"{voltage} kV - Envelope - {scope.name}",
+                            "Voltage Envelope",
                             level=2,
                         )
                         reference = figure_registry.allocate()
@@ -1325,7 +2142,7 @@ def build_reports_from_existing_plots(
                     if dashboard_figures:
                         _add_report_heading(
                             doc,
-                            f"{voltage} kV - Dashboard Figures - {scope.name}",
+                            "Dashboard Figures",
                             level=2,
                         )
                         for figure_title, image_path in dashboard_figures:
@@ -1339,7 +2156,7 @@ def build_reports_from_existing_plots(
                                 reference,
                                 _dashboard_figure_caption(figure_title, str(voltage)),
                             )
-                    elif dashboard_figure_ids:
+                    elif selected_dashboard_figure_ids:
                         doc.add_paragraph(
                             "Selected dashboard figures could not be exported.",
                             style="Body Text",
@@ -1354,7 +2171,7 @@ def build_reports_from_existing_plots(
                             continue
                         _add_report_heading(
                             doc,
-                            f"{voltage} kV - {event} - {scope.name}",
+                            _report_event_name(event),
                             level=2,
                         )
                         for image_path in images:
@@ -1377,32 +2194,23 @@ def build_reports_from_existing_plots(
                             plot_count += 1
 
                     if parsed_sustained.enabled:
-                        _cancel(check_cancel)
-                        sustained_result = _load_sustained_sdpf_report_result(
+                        plot_count += _add_sustained_report_content(
+                            doc,
                             root,
                             scope,
                             str(voltage),
                             parsed_sustained,
-                            event_times,
+                            sustained_payload,
+                            shared_manifest_current,
+                            sustained_cache_validation,
+                            image_cache,
+                            figure_registry,
+                            check_cancel,
+                            log,
+                            (sustained_sdpf_heatmap_settings_by_project or {}).get(str(root)),
+                            render_heatmaps,
+                            parsed_sustained_ranking,
                         )
-                        if sustained_result is not None:
-                            sustained_image = _find_event_images(
-                                root,
-                                scope,
-                                sustained_sdpf.SUSTAINED_SDPF,
-                                str(voltage),
-                                image_cache,
-                            )
-                            _add_sustained_sdpf_section(
-                                doc,
-                                sustained_result,
-                                str(voltage),
-                                sustained_image[0] if sustained_image else None,
-                                figure_registry,
-                                check_cancel,
-                            )
-                            if sustained_image:
-                                plot_count += 1
 
                     for check in parsed_resonance.effective_enabled_checks:
                         _cancel(check_cancel)
@@ -1414,7 +2222,7 @@ def build_reports_from_existing_plots(
                             label = resonance_checks.CHECK_DEFINITIONS[check]["label"]
                             _add_report_heading(
                                 doc,
-                                f"{voltage} kV - {label} - {voltage_type} - {scope.name}",
+                                f"{label} - {voltage_type}",
                                 level=2,
                             )
                             for image_path in images:
@@ -1445,11 +2253,15 @@ def build_reports_from_existing_plots(
                             style="Body Text",
                         )
 
-                    output_path = report_dir / f"Voltage_{voltage}_kV.docx"
                     _cancel(check_cancel)
                     doc.save(output_path)
                     _cancel(check_cancel)
                     written.append(output_path)
+                    manifest_entries[str(voltage)] = {
+                        "signature": report_signature,
+                        "output": _report_file_manifest_entry(root, output_path),
+                    }
+                    _write_report_manifest(root, report_dir, manifest_entries)
                     _log(log, f"Wrote report: {output_path}")
 
                 for temporary_dir in (

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from results_analysis_app import project_scan_cache, scanner, storage
-
-
-CancelFn = Callable[[], None]
-LogFn = Callable[[str], None]
+from results_analysis_app.common import CancelFn, LogFn
 
 
 @dataclass(frozen=True)
