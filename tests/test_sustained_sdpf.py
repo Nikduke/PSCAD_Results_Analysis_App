@@ -787,7 +787,10 @@ def test_sustained_sdpf_summary_is_ranked_per_mm_and_keeps_phase_detail(tmp_path
     assert len(data_rows) == 3
     assert any(row[headers.index("Measurement")] == "LLp" for row in data_rows)
     assert "Normalized excess area (pu*ms)" in headers
-    assert "Longest continuous duration (ms)" in headers
+    assert "Threshold (kVpeak)" in headers
+    assert "Qualification duration (ms)" in headers
+    assert "Full-wave continuous duration (ranking, ms)" in headers
+    assert data_rows[0][headers.index("Qualification duration (ms)")] == 30.0
     assert "Event start (s)" in headers
     assert "Event end (s)" in headers
     assert "Qualifying paths" in headers
@@ -1331,6 +1334,7 @@ def test_sustained_sdpf_report_merges_criteria_for_one_case() -> None:
     assert table.rows[1].cells[0].text == (
         "Highest sustained Vₜ; Cumulative stress; Longest duration"
     )
+    assert table.rows[1].cells[5].text == "1.3 / 92%"
     text = "\n".join(paragraph.text for paragraph in document.paragraphs)
     assert "Maximum qualifying sustained-run" not in text
     assert "RMS diagnostic" not in text

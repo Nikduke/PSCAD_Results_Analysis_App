@@ -123,6 +123,7 @@ class ProjectScan:
     project_frequency: float | None = None
     final_duration: float | None = None
     has_dashboards: bool = False
+    dashboard_figures: list[DashboardFigure] = field(default_factory=list)
     dashboard_changed: bool = False
     has_envelopes: bool = False
     has_plots: bool = False
@@ -959,6 +960,7 @@ def scan_project(
             ),
             "fault_types_by_run": fault_types_future,
             "has_dashboards": executor.submit(_has_dashboard_files, dashboard_root),
+            "dashboard_figures": executor.submit(scan_dashboard_figures, project_root),
             "has_envelopes": executor.submit(_has_non_temp_file, envelope_root, "*.xlsx"),
             "has_plots": executor.submit(_has_plot_files, generated_root),
             "has_reports": executor.submit(_has_non_temp_file, reports_root, "*.docx"),
@@ -985,6 +987,13 @@ def scan_project(
         except Exception as exc:
             scan.messages.append(f"Could not scan fault types: {exc}")
         scan.has_dashboards = futures["has_dashboards"].result()
+        try:
+            scan.dashboard_figures, dashboard_warnings = futures["dashboard_figures"].result()
+            scan.messages.extend(
+                f"Dashboard: {warning}" for warning in dashboard_warnings
+            )
+        except Exception as exc:
+            scan.messages.append(f"Could not scan dashboard figures: {exc}")
         scan.has_envelopes = futures["has_envelopes"].result()
         scan.has_plots = futures["has_plots"].result()
         scan.has_reports = futures["has_reports"].result()

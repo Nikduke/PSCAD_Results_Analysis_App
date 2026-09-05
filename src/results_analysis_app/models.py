@@ -75,6 +75,31 @@ def _json_dict(value: Any) -> dict[Any, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def normalize_dashboard_figure_selection(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    selection: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        figure_id = str(item).strip()
+        if figure_id and figure_id not in seen:
+            seen.add(figure_id)
+            selection.append(figure_id)
+    return selection
+
+
+def normalize_project_dashboard_figure_selection(
+    value: Any,
+) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(project): normalize_dashboard_figure_selection(raw_selection)
+        for project, raw_selection in value.items()
+        if isinstance(raw_selection, list)
+    }
+
+
 def normalize_project_sustained_sdpf_heatmap_settings(value: Any) -> dict[str, list[dict[str, Any]]]:
     """Normalize old single mappings and new ordered heatmap-set lists."""
     if not isinstance(value, dict):
@@ -415,10 +440,11 @@ class AppSession:
     voltage_um_overrides_by_project: dict[str, dict[str, float]] = field(default_factory=dict)
     manual_exclusions_by_project: dict[str, list[ExclusionRule]] = field(default_factory=dict)
     disabled_nonconv_by_project: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
-    high_voltage_exclusions_by_project: dict[str, list[tuple[str, str, int, str]]] = field(default_factory=dict)
     high_voltage_include_overrides_by_project: dict[str, list[tuple[str, str, int, str]]] = field(default_factory=dict)
-    dashboard_figure_selection: list[str] = field(default_factory=list)
-    dashboard_figure_selection_initialized: bool = False
+    dashboard_figure_apply_to_all: bool = True
+    dashboard_figure_shared_selection: list[str] = field(default_factory=list)
+    dashboard_figure_shared_selection_initialized: bool = False
+    dashboard_figure_selection_by_project: dict[str, list[str]] = field(default_factory=dict)
     status_cache: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
@@ -445,8 +471,8 @@ class AppSession:
             self.voltage_um_overrides_by_project,
             self.manual_exclusions_by_project,
             self.disabled_nonconv_by_project,
-            self.high_voltage_exclusions_by_project,
             self.high_voltage_include_overrides_by_project,
+            self.dashboard_figure_selection_by_project,
             self.sustained_sdpf_heatmap_settings_by_project,
             self.sustained_sdpf_ranking_settings_by_project,
             self.sustained_sdpf_limit_overrides_by_project,
@@ -525,13 +551,6 @@ class AppSession:
                 project: [{"case": case, "run": run} for case, run in exclusions]
                 for project, exclusions in self.disabled_nonconv_by_project.items()
             },
-            "high_voltage_exclusions_by_project": {
-                project: [
-                    {"voltage": voltage, "case": case, "run": run, "bus": bus}
-                    for voltage, case, run, bus in exclusions
-                ]
-                for project, exclusions in self.high_voltage_exclusions_by_project.items()
-            },
             "high_voltage_include_overrides_by_project": {
                 project: [
                     {"voltage": voltage, "case": case, "run": run, "bus": bus}
@@ -539,8 +558,12 @@ class AppSession:
                 ]
                 for project, inclusions in self.high_voltage_include_overrides_by_project.items()
             },
-            "dashboard_figure_selection": self.dashboard_figure_selection,
-            "dashboard_figure_selection_initialized": self.dashboard_figure_selection_initialized,
+            "dashboard_figure_apply_to_all": self.dashboard_figure_apply_to_all,
+            "dashboard_figure_shared_selection": self.dashboard_figure_shared_selection,
+            "dashboard_figure_shared_selection_initialized": (
+                self.dashboard_figure_shared_selection_initialized
+            ),
+            "dashboard_figure_selection_by_project": self.dashboard_figure_selection_by_project,
             "status_cache": self.status_cache,
         }
 
@@ -558,9 +581,50 @@ class AppSession:
             manual_exclusions[project] = normalize_exclusion_rules(
                 [*manual_exclusions.get(project, []), *rules]
             )
-        dashboard_selection = [
-            str(item) for item in _json_list(data.get("dashboard_figure_selection")) if str(item)
+        legacy_dashboard_selection = normalize_dashboard_figure_selection(
+            data.get("dashboard_figure_selection")
+        )
+        project_entries = [
+            ProjectEntry.from_dict(value)
+            for value in _json_list(data.get("projects"))
+            if isinstance(value, dict)
         ]
+        dashboard_selection_by_project = normalize_project_dashboard_figure_selection(
+            data.get("dashboard_figure_selection_by_project", {})
+        )
+        if not dashboard_selection_by_project and (
+            legacy_dashboard_selection
+            or bool(data.get("dashboard_figure_selection_initialized", False))
+        ):
+            dashboard_selection_by_project = {
+                project.path: list(legacy_dashboard_selection)
+                for project in project_entries
+            }
+        has_shared_dashboard_selection = "dashboard_figure_shared_selection" in data
+        if has_shared_dashboard_selection:
+            shared_dashboard_selection = normalize_dashboard_figure_selection(
+                data.get("dashboard_figure_shared_selection")
+            )
+            shared_dashboard_selection_initialized = bool(
+                data.get("dashboard_figure_shared_selection_initialized", True)
+            )
+        elif legacy_dashboard_selection or bool(
+            data.get("dashboard_figure_selection_initialized", False)
+        ):
+            shared_dashboard_selection = list(legacy_dashboard_selection)
+            shared_dashboard_selection_initialized = True
+        elif dashboard_selection_by_project:
+            shared_dashboard_selection = []
+            seen_shared_dashboard_selection: set[str] = set()
+            for project in project_entries:
+                for figure_id in dashboard_selection_by_project.get(project.path, []):
+                    if figure_id not in seen_shared_dashboard_selection:
+                        seen_shared_dashboard_selection.add(figure_id)
+                        shared_dashboard_selection.append(figure_id)
+            shared_dashboard_selection_initialized = True
+        else:
+            shared_dashboard_selection = []
+            shared_dashboard_selection_initialized = False
         raw_event_times = data.get("event_times", {})
         if not isinstance(raw_event_times, dict):
             raw_event_times = {}
@@ -582,11 +646,7 @@ class AppSession:
         worker_auto = bool(data.get("envelope_workers_auto", worker_count == 0))
 
         session = cls(
-            projects=[
-                ProjectEntry.from_dict(value)
-                for value in _json_list(data.get("projects"))
-                if isinstance(value, dict)
-            ],
+            projects=project_entries,
             scopes=[
                 ScopeEntry.from_dict(value)
                 for value in _json_list(data.get("scopes"))
@@ -748,16 +808,15 @@ class AppSession:
             disabled_nonconv_by_project=normalize_project_case_run_exclusions(
                 data.get("disabled_nonconv_by_project", {})
             ),
-            high_voltage_exclusions_by_project=normalize_project_high_voltage_exclusions(
-                data.get("high_voltage_exclusions_by_project", {})
-            ),
             high_voltage_include_overrides_by_project=normalize_project_high_voltage_exclusions(
                 data.get("high_voltage_include_overrides_by_project", {})
             ),
-            dashboard_figure_selection=dashboard_selection,
-            dashboard_figure_selection_initialized=bool(
-                data.get("dashboard_figure_selection_initialized", bool(dashboard_selection))
+            dashboard_figure_apply_to_all=bool(
+                data.get("dashboard_figure_apply_to_all", True)
             ),
+            dashboard_figure_shared_selection=shared_dashboard_selection,
+            dashboard_figure_shared_selection_initialized=shared_dashboard_selection_initialized,
+            dashboard_figure_selection_by_project=dashboard_selection_by_project,
             status_cache={
                 str(key): [str(item) for item in value]
                 for key, value in _json_dict(data.get("status_cache")).items()

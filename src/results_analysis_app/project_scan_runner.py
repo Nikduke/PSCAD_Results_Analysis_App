@@ -134,6 +134,33 @@ def scan_projects_cached(
                 if log is not None:
                     for warning in warnings:
                         log(warning)
+            dashboard_files_changed = project_scan_cache.manifest_section_changed(
+                cache,
+                project_path,
+                manifest,
+                "dashboard_files",
+            )
+            if dashboard_files_changed:
+                if log is not None:
+                    log(f"Refreshing dashboard figures: {Path(project_path).name}")
+                try:
+                    figures, warnings = scanner.scan_dashboard_figures(project_path)
+                    cached.dashboard_figures = figures
+                    scanner.refresh_project_scan_outputs(
+                        cached,
+                        refresh_dashboards=True,
+                    )
+                    if project_path not in refreshed_paths:
+                        refreshed_paths.append(project_path)
+                    if log is not None:
+                        for warning in warnings:
+                            log(warning)
+                except Exception as exc:
+                    if log is not None:
+                        log(
+                            f"Dashboard figure refresh failed: "
+                            f"{Path(project_path).name} | {exc}"
+                        )
             scans[project_path] = cached
             if any(
                 project_scan_cache.manifest_section_changed(
@@ -142,14 +169,9 @@ def scan_projects_cached(
                     manifest,
                     key,
                 )
-                for key in ("dashboard_files", "output_state")
+                for key in ("output_state",)
             ) and project_path not in refreshed_paths:
                 refreshed_paths.append(project_path)
-            if cached.dashboard_changed and log is not None:
-                log(
-                    f"Dashboard files changed: {Path(project_path).name}. "
-                    "Use Scan figures or Dashboards update when needed."
-                )
 
     if stale_paths:
         if log is not None:

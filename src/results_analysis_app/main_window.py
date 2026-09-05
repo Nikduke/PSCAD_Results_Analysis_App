@@ -481,10 +481,10 @@ class MainWindow(QtWidgets.QMainWindow):
         manual_layout.addLayout(manual_buttons)
         tabs.addTab(manual_tab, "Manual")
 
-        nonconv_tab = QtWidgets.QWidget(tabs)
-        nonconv_layout = QtWidgets.QVBoxLayout(nonconv_tab)
+        self.nonconv_tab = QtWidgets.QWidget(tabs)
+        nonconv_layout = QtWidgets.QVBoxLayout(self.nonconv_tab)
         nonconv_layout.setContentsMargins(6, 6, 6, 6)
-        self.nonconv_proposal_table = QtWidgets.QTableWidget(0, 6, nonconv_tab)
+        self.nonconv_proposal_table = QtWidgets.QTableWidget(0, 6, self.nonconv_tab)
         self._configure_exclusion_table(
             self.nonconv_proposal_table,
             ["Apply", "Case", "Run", "Fault", "Signal", "Reason"],
@@ -506,12 +506,12 @@ class MainWindow(QtWidgets.QMainWindow):
         nonconv_buttons.addStretch(1)
         self._add_apply_buttons(
             nonconv_buttons,
-            nonconv_tab,
+            self.nonconv_tab,
             self.nonconv_proposal_table,
             "non-convergent exclusion",
         )
         nonconv_layout.addLayout(nonconv_buttons)
-        tabs.addTab(nonconv_tab, "NonConv")
+        tabs.addTab(self.nonconv_tab, "NonConv")
 
         self.high_voltage_tab = QtWidgets.QWidget(tabs)
         high_layout = QtWidgets.QVBoxLayout(self.high_voltage_tab)
@@ -721,10 +721,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._enable_table_clipboard(self.preview_table)
         layout.addWidget(self.preview_table, 2)
 
-        layout.addWidget(make_section_label("Dashboard Figures Shared Across Projects", panel))
+        dashboard_header = QtWidgets.QHBoxLayout()
+        self.dashboard_figure_header = make_section_label("Dashboard Figures", panel)
+        dashboard_header.addWidget(self.dashboard_figure_header)
+        dashboard_header.addStretch(1)
+        self.dashboard_figure_apply_all_checkbox = QtWidgets.QCheckBox("All checked", panel)
+        self.dashboard_figure_apply_all_checkbox.setChecked(
+            bool(self.session.dashboard_figure_apply_to_all)
+        )
+        self.dashboard_figure_apply_all_checkbox.setToolTip(
+            "When enabled, the current project's selection is used for every "
+            "checked project. Project-specific selections are preserved when "
+            "you switch back to local mode."
+        )
+        self.dashboard_figure_apply_all_checkbox.toggled.connect(
+            self._on_dashboard_figure_apply_all_changed
+        )
+        dashboard_header.addWidget(self.dashboard_figure_apply_all_checkbox)
+        layout.addLayout(dashboard_header)
         layout.addWidget(
             make_muted_label(
-                "Choose once. Matching figures are used for every selected project report.",
+                "Select figures to include in reports.",
                 panel,
             )
         )
@@ -751,6 +768,10 @@ class MainWindow(QtWidgets.QMainWindow):
             for check_name, check in self.resonance_checkboxes.items():
                 check.setChecked(check_name in self.session.resonance_enabled_checks)
             self.sustained_sdpf_checkbox.setChecked(bool(self.session.sustained_sdpf_enabled))
+            self.dashboard_figure_apply_all_checkbox.setChecked(
+                bool(self.session.dashboard_figure_apply_to_all)
+            )
+            self._update_dashboard_figure_header()
             self._reload_project_tree()
             self._reload_scope_list()
             self._reload_project_exclusions()
@@ -800,22 +821,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return sorted(unique, key=self._voltage_sort_key)
 
     def _reload_project_tree(self) -> None:
-        self.project_tree.clear()
-        for project in self.session.projects:
-            item = QtWidgets.QTreeWidgetItem(self.project_tree)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
-                0,
-                QtCore.Qt.CheckState.Checked
-                if project.selected
-                else QtCore.Qt.CheckState.Unchecked,
-            )
-            item.setText(0, project.name)
-            item.setData(0, USER_ROLE_PATH, project.path)
-            status_text = ", ".join(self.session.status_cache.get(project.path, []))
-            item.setText(1, status_text)
-            item.setToolTip(0, project.path)
-            item.setToolTip(1, status_text)
+        blocker = QtCore.QSignalBlocker(self.project_tree)
+        try:
+            self.project_tree.clear()
+            for project in self.session.projects:
+                item = QtWidgets.QTreeWidgetItem(self.project_tree)
+                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    0,
+                    QtCore.Qt.CheckState.Checked
+                    if project.selected
+                    else QtCore.Qt.CheckState.Unchecked,
+                )
+                item.setText(0, project.name)
+                item.setData(0, USER_ROLE_PATH, project.path)
+                status_text = ", ".join(self.session.status_cache.get(project.path, []))
+                item.setText(1, status_text)
+                item.setToolTip(0, project.path)
+                item.setToolTip(1, status_text)
+        finally:
+            del blocker
         self.project_tree.setColumnWidth(1, 180)
         if self.project_tree.columnWidth(0) < 260:
             self.project_tree.setColumnWidth(0, 260)
@@ -854,13 +879,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _voltage_sort_key(self, value: str) -> tuple[int, float | str]:
         return (0, float(value)) if is_number(value) else (1, value)
 
-    def _selected_scan(self) -> scanner.ProjectScan | None:
-        project_path = self._current_project_path()
+    def _selected_scan(self, project_path: str | None = None) -> scanner.ProjectScan | None:
+        if project_path is None:
+            project_path = self._current_project_path()
         return self.project_scans.get(project_path) if project_path is not None else None
 
-    def _reload_project_exclusions(self) -> None:
-        project_path = self._current_project_path()
-        scan = self._selected_scan()
+    def _reload_project_exclusions(self, project_path: str | None = None) -> None:
+        scan = self._selected_scan(project_path)
         was_loading = self._loading
         self._loading = True
         try:
@@ -871,8 +896,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_manual_exclusion_rows(
                 self.session.manual_exclusions_by_project.get(project_path or "", [])
             )
-            self._set_nonconv_proposal_rows(scan.nonconv_cases if scan else [])
-            self._set_high_voltage_proposal_rows(scan.high_voltage_exclusions if scan else [])
+            self._set_nonconv_proposal_rows(scan.nonconv_cases if scan else [], project_path)
+            self._set_high_voltage_proposal_rows(
+                scan.high_voltage_exclusions if scan else [],
+                project_path,
+            )
         finally:
             self._loading = was_loading
 
@@ -935,9 +963,14 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setToolTip(text)
         return item
 
-    def _set_nonconv_proposal_rows(self, rows: list[scanner.NonConvergentCase]) -> None:
-        project_path = self._current_project_path() or ""
-        disabled = set(self.session.disabled_nonconv_by_project.get(project_path, []))
+    def _set_nonconv_proposal_rows(
+        self,
+        rows: list[scanner.NonConvergentCase],
+        project_path: str | None = None,
+    ) -> None:
+        if project_path is None:
+            project_path = self._current_project_path()
+        disabled = set(self.session.disabled_nonconv_by_project.get(project_path or "", []))
         prepared_rows = []
         for proposal in rows:
             key = normalize_case_run_exclusions([(proposal.case, proposal.run)])
@@ -957,15 +990,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 for column, value in enumerate(values, start=1):
                     self.nonconv_proposal_table.setItem(row, column, self._table_item(value))
+        self._set_nonconv_ui_visible(bool(prepared_rows))
 
-    def _set_high_voltage_proposal_rows(self, rows: list[scanner.HighVoltageExclusion]) -> None:
-        project_path = self._current_project_path() or ""
+    def _set_high_voltage_proposal_rows(
+        self,
+        rows: list[scanner.HighVoltageExclusion],
+        project_path: str | None = None,
+    ) -> None:
+        if project_path is None:
+            project_path = self._current_project_path()
+        if project_path is None or project_path not in self.project_scans:
+            with self._table_bulk_update(self.high_voltage_proposal_table):
+                self.high_voltage_proposal_table.setRowCount(0)
+            self._set_high_voltage_ui_visible(False)
+            return
         applied = self._applied_high_voltage_keys(project_path)
+        scan_keys = {
+            key
+            for row in self.project_scans[project_path].high_voltage_exclusions
+            for key in normalize_high_voltage_exclusions(
+                [(row.voltage, row.case, row.run, row.bus)]
+            )
+        }
         overrides = set(
             normalize_high_voltage_exclusions(
                 self.session.high_voltage_include_overrides_by_project.get(project_path, [])
             )
         )
+        overrides.intersection_update(scan_keys)
         if not rows:
             grouped: dict[tuple[str, str, int, str], dict[str, Any]] = {}
             self._high_voltage_groups_by_project.pop(project_path, None)
@@ -976,18 +1028,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._high_voltage_groups_by_project[project_path] = (id(rows), grouped)
             else:
                 grouped = cached_groups[1]
-        applied.update(
-            key
-            for key, values in grouped.items()
-            if values["excluded"]
-            or _high_voltage_source(values["sources"])
-            in {
-                scanner.HIGH_VOLTAGE_SOURCE_PSCAD_LOG,
-                scanner.HIGH_VOLTAGE_SOURCE_BOTH,
-            }
-        )
-        applied.difference_update(overrides)
-
         fault_types: dict[tuple[str, int], str] = {}
         needs_fault_types = bool((applied | overrides) - grouped.keys()) or any(
             not values["fault_types"] for values in grouped.values()
@@ -1071,6 +1111,17 @@ class MainWindow(QtWidgets.QMainWindow):
         index = self.exclusion_tabs.indexOf(self.high_voltage_tab)
         if visible and index < 0:
             self.exclusion_tabs.addTab(self.high_voltage_tab, "High Voltage")
+        elif not visible and index >= 0:
+            self.exclusion_tabs.removeTab(index)
+
+    def _set_nonconv_ui_visible(self, visible: bool) -> None:
+        index = self.exclusion_tabs.indexOf(self.nonconv_tab)
+        if visible and index < 0:
+            high_voltage_index = self.exclusion_tabs.indexOf(self.high_voltage_tab)
+            if high_voltage_index >= 0:
+                self.exclusion_tabs.insertTab(high_voltage_index, self.nonconv_tab, "NonConv")
+            else:
+                self.exclusion_tabs.addTab(self.nonconv_tab, "NonConv")
         elif not visible and index >= 0:
             self.exclusion_tabs.removeTab(index)
 
@@ -1252,21 +1303,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 rows.append((case_item.text(), run_item.text()))
         return normalize_case_run_exclusions(rows)
 
-    def _high_voltage_rows(self) -> list[tuple[str, str, int, str]]:
-        rows: list[tuple[str, str, str, str]] = []
-        for row in range(self.high_voltage_proposal_table.rowCount()):
-            apply_item = self.high_voltage_proposal_table.item(row, 0)
-            if apply_item is None or apply_item.checkState() != QtCore.Qt.CheckState.Checked:
-                continue
-            values = [
-                self.high_voltage_proposal_table.item(row, column).text()
-                if self.high_voltage_proposal_table.item(row, column) is not None
-                else ""
-                for column in (1, 2, 3, 5)
-            ]
-            rows.append((values[0], values[1], values[2], values[3]))
-        return normalize_high_voltage_exclusions(rows)
-
     def _high_voltage_table_key(
         self,
         row: int,
@@ -1286,27 +1322,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         project_path: str,
     ) -> set[tuple[str, str, int, str]]:
-        applied = set(
-            normalize_high_voltage_exclusions(
-                self.session.high_voltage_exclusions_by_project.get(project_path, [])
-            )
-        )
         scan = self.project_scans.get(project_path)
-        if scan is not None:
-            applied.update(
-                key
-                for row in scan.high_voltage_exclusions
-                if row.excluded
-                or _is_pscad_log_high_voltage_row(row)
-                for key in normalize_high_voltage_exclusions(
-                    [(row.voltage, row.case, row.run, row.bus)]
-                )
+        if scan is None:
+            return set()
+        scan_keys = {
+            key
+            for row in scan.high_voltage_exclusions
+            for key in normalize_high_voltage_exclusions(
+                [(row.voltage, row.case, row.run, row.bus)]
             )
+        }
+        applied = {
+            key
+            for row in scan.high_voltage_exclusions
+            if row.excluded or _is_pscad_log_high_voltage_row(row)
+            for key in normalize_high_voltage_exclusions(
+                [(row.voltage, row.case, row.run, row.bus)]
+            )
+        }
         overrides = set(
             normalize_high_voltage_exclusions(
                 self.session.high_voltage_include_overrides_by_project.get(project_path, [])
             )
         )
+        overrides.intersection_update(scan_keys)
         return applied - overrides
 
     def _high_voltage_proposals_by_project(
@@ -1316,22 +1355,10 @@ class MainWindow(QtWidgets.QMainWindow):
         result: dict[str, list[dict[str, object]]] = {}
         for project_path in project_paths:
             scan = self.project_scans.get(project_path)
-            grouped = _group_high_voltage_proposals(
-                scan.high_voltage_exclusions if scan is not None else []
-            )
+            if scan is None:
+                continue
+            grouped = _group_high_voltage_proposals(scan.high_voltage_exclusions)
             applied = self._applied_high_voltage_keys(project_path)
-            for key in applied - grouped.keys():
-                grouped[key] = {
-                    "fault_types": [],
-                    "measurements": [],
-                    "signals": [],
-                    "files": [],
-                    "excluded_values": [],
-                    "max_abs": "",
-                    "limit": "",
-                    "sources": {scanner.HIGH_VOLTAGE_SOURCE_ANALYSIS},
-                    "excluded": True,
-                }
             records: list[dict[str, object]] = []
             for (voltage, case, run, bus), values in grouped.items():
                 records.append(
@@ -1381,12 +1408,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.disabled_nonconv_by_project[project_path] = disabled_nonconv
         else:
             self.session.disabled_nonconv_by_project.pop(project_path, None)
-
-        high_voltage = self._high_voltage_rows()
-        if high_voltage:
-            self.session.high_voltage_exclusions_by_project[project_path] = high_voltage
-        else:
-            self.session.high_voltage_exclusions_by_project.pop(project_path, None)
 
     def _on_project_exclusions_changed(self) -> None:
         if self._loading:
@@ -1505,13 +1526,16 @@ class MainWindow(QtWidgets.QMainWindow):
         current: QtWidgets.QTreeWidgetItem | None,
         _previous: QtWidgets.QTreeWidgetItem | None,
     ) -> None:
+        if self._loading:
+            return
+        project_path = self._project_path_from_item(current)
         self._update_project_selection_visual(current)
         if current is None:
             self._load_dashboard_figure_list(None)
-            self._reload_project_exclusions()
+            self._reload_project_exclusions(None)
             return
-        self._load_dashboard_figure_list(str(current.data(0, USER_ROLE_PATH)))
-        self._reload_project_exclusions()
+        self._load_dashboard_figure_list(project_path)
+        self._reload_project_exclusions(project_path)
         self.update_preview()
 
     def _update_project_selection_visual(
@@ -1559,22 +1583,113 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_dashboard_figure_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         if self._loading:
             return
+        project_path = self._current_project_path()
+        if project_path is None and not self.session.dashboard_figure_apply_to_all:
+            return
         checked = self._checked_dashboard_figure_ids()
-        self.session.dashboard_figure_selection = checked
-        self.session.dashboard_figure_selection_initialized = True
+        if self.session.dashboard_figure_apply_to_all:
+            self.session.dashboard_figure_shared_selection = checked
+            self.session.dashboard_figure_shared_selection_initialized = True
+        else:
+            self.session.dashboard_figure_selection_by_project[project_path] = checked
+        self.autosave()
+
+    def _on_dashboard_figure_apply_all_changed(self, checked: bool) -> None:
+        if self._loading:
+            return
+        current_path = self._current_project_path()
+        if checked:
+            if self.dashboard_figure_list.count():
+                self.session.dashboard_figure_shared_selection = (
+                    self._checked_dashboard_figure_ids()
+                )
+                self.session.dashboard_figure_shared_selection_initialized = True
+            else:
+                self._ensure_shared_dashboard_selection()
+        else:
+            self._ensure_shared_dashboard_selection()
+            shared_selection = (
+                self.session.dashboard_figure_shared_selection
+                if self.session.dashboard_figure_shared_selection_initialized
+                else []
+            )
+            for project in self.session.projects:
+                if project.path in self.session.dashboard_figure_selection_by_project:
+                    continue
+                available_ids = {
+                    figure.id for figure in self.dashboard_figures.get(project.path, [])
+                }
+                if available_ids:
+                    self.session.dashboard_figure_selection_by_project[project.path] = [
+                        figure_id
+                        for figure_id in shared_selection
+                        if figure_id in available_ids
+                    ]
+                else:
+                    self.session.dashboard_figure_selection_by_project.pop(
+                        project.path,
+                        None,
+                    )
+        self.session.dashboard_figure_apply_to_all = checked
+        self._update_dashboard_figure_header()
+        self._load_dashboard_figure_list(current_path)
         self.autosave()
 
     def _current_project_path(self) -> str | None:
-        item = self.project_tree.currentItem()
-        if item is not None:
-            return str(item.data(0, USER_ROLE_PATH))
-        # The tree can temporarily have no current row after a background
-        # refresh.  Project-specific dialogs still need a deterministic
-        # project in that state.
+        return self._project_path_from_item(self.project_tree.currentItem())
+
+    def _project_path_from_item(
+        self,
+        item: QtWidgets.QTreeWidgetItem | None,
+    ) -> str | None:
+        if item is None:
+            return None
+        value = item.data(0, USER_ROLE_PATH)
+        return str(value) if value else None
+
+    def _dashboard_figure_catalog(self) -> list[DashboardFigure]:
+        catalog: dict[str, DashboardFigure] = {}
         for project in self.session.projects:
-            if project.selected:
-                return project.path
-        return self.session.projects[0].path if self.session.projects else None
+            for figure in self.dashboard_figures.get(project.path, []):
+                catalog.setdefault(figure.id, figure)
+        return list(catalog.values())
+
+    def _ensure_shared_dashboard_selection(self) -> None:
+        if self.session.dashboard_figure_shared_selection_initialized:
+            return
+        figures = self._dashboard_figure_catalog()
+        if figures:
+            self.session.dashboard_figure_shared_selection = [
+                figure.id for figure in figures
+            ]
+            self.session.dashboard_figure_shared_selection_initialized = True
+
+    def _update_dashboard_figure_header(self) -> None:
+        self.dashboard_figure_header.setText(
+            "Dashboard Figures"
+            if self.session.dashboard_figure_apply_to_all
+            else "Dashboard Figures for Current Project"
+        )
+
+    def _dashboard_figure_ids_for_project(self, project_path: str) -> list[str]:
+        figures = self.dashboard_figures.get(project_path, [])
+        available_ids = {figure.id for figure in figures}
+        if self.session.dashboard_figure_apply_to_all:
+            self._ensure_shared_dashboard_selection()
+            selection = (
+                self.session.dashboard_figure_shared_selection
+                if self.session.dashboard_figure_shared_selection_initialized
+                else [figure.id for figure in figures]
+            )
+        else:
+            selection = self.session.dashboard_figure_selection_by_project.get(project_path)
+            if selection is None:
+                selection = (
+                    self.session.dashboard_figure_shared_selection
+                    if self.session.dashboard_figure_shared_selection_initialized
+                    else [figure.id for figure in figures]
+                )
+        return [figure_id for figure_id in selection if figure_id in available_ids]
 
     def _checked_dashboard_figure_ids(self) -> list[str]:
         checked: list[str] = []
@@ -1584,18 +1699,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 checked.append(str(item.data(USER_ROLE_FIGURE_ID)))
         return checked
 
-    def _dashboard_figure_source_paths(self, project_path: str | None) -> list[str]:
-        if project_path and self.dashboard_figures.get(project_path):
-            return [project_path]
-        selected_paths = [
-            project.path
-            for project in self.session.projects
-            if project.selected and self.dashboard_figures.get(project.path)
-        ]
-        if selected_paths:
-            return selected_paths
-        return [path for path, figures in self.dashboard_figures.items() if figures]
-
     def _load_dashboard_figure_list(self, project_path: str | None) -> None:
         was_loading = self._loading
         self._loading = True
@@ -1604,12 +1707,22 @@ class MainWindow(QtWidgets.QMainWindow):
             blocker = QtCore.QSignalBlocker(self.dashboard_figure_list)
             try:
                 self.dashboard_figure_list.clear()
-                figures_by_id: dict[str, DashboardFigure] = {}
-                for source_path in self._dashboard_figure_source_paths(project_path):
-                    for figure in self.dashboard_figures.get(source_path, []):
-                        figures_by_id.setdefault(figure.id, figure)
-                selected_ids = set(self.session.dashboard_figure_selection)
-                for figure in figures_by_id.values():
+                if self.session.dashboard_figure_apply_to_all:
+                    self._ensure_shared_dashboard_selection()
+                    figures = self._dashboard_figure_catalog()
+                    selected_ids = set(
+                        self.session.dashboard_figure_shared_selection
+                        if self.session.dashboard_figure_shared_selection_initialized
+                        else (figure.id for figure in figures)
+                    )
+                else:
+                    figures = self.dashboard_figures.get(project_path, []) if project_path else []
+                    selected_ids = (
+                        set(self._dashboard_figure_ids_for_project(project_path))
+                        if project_path
+                        else set()
+                    )
+                for figure in figures:
                     item = QtWidgets.QListWidgetItem(figure.label, self.dashboard_figure_list)
                     item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                     item.setData(USER_ROLE_FIGURE_ID, figure.id)
@@ -1622,6 +1735,7 @@ class MainWindow(QtWidgets.QMainWindow):
             finally:
                 del blocker
                 self.dashboard_figure_list.setUpdatesEnabled(True)
+            self._update_dashboard_figure_header()
         finally:
             self._loading = was_loading
 
@@ -1686,6 +1800,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reload_project_tree()
         finally:
             self._loading = False
+        self._load_dashboard_figure_list(self._current_project_path())
+        self._reload_project_exclusions()
         self.autosave()
         self.update_preview()
 
@@ -1911,15 +2027,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if (row.case, row.run) not in disabled
             ]
             result.setdefault(project_path, []).extend(detected)
-        high_voltage_projects = {
-            *self.project_scans,
-            *self.session.high_voltage_exclusions_by_project,
-        }
+        high_voltage_projects = set(self.project_scans)
         for project_path in high_voltage_projects:
-            scan = self.project_scans.get(project_path)
+            scan = self.project_scans[project_path]
             log_keys = {
                 key
-                for row in (scan.high_voltage_exclusions if scan is not None else [])
+                for row in scan.high_voltage_exclusions
                 if _is_pscad_log_high_voltage_row(row)
                 for key in normalize_high_voltage_exclusions(
                     [(row.voltage, row.case, row.run, row.bus)]
@@ -1937,6 +2050,41 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 result.pop(project_path)
         return result
+
+    def _reconcile_project_high_voltage_overrides(
+        self,
+        project_paths: Iterable[str],
+    ) -> None:
+        """Discard include overrides that are absent from the current scan."""
+        for project_path in project_paths:
+            normalized_path = str(Path(project_path).resolve())
+            scan = self.project_scans.get(normalized_path)
+            current_keys = (
+                set(
+                    normalize_high_voltage_exclusions(
+                        [
+                            (row.voltage, row.case, row.run, row.bus)
+                            for row in scan.high_voltage_exclusions
+                        ]
+                    )
+                )
+                if scan is not None
+                else set()
+            )
+            retained = [
+                key
+                for key in normalize_high_voltage_exclusions(
+                    self.session.high_voltage_include_overrides_by_project.get(
+                        normalized_path,
+                        [],
+                    )
+                )
+                if key in current_keys
+            ]
+            if retained:
+                self.session.high_voltage_include_overrides_by_project[normalized_path] = retained
+            else:
+                self.session.high_voltage_include_overrides_by_project.pop(normalized_path, None)
 
     def refresh_project_scans(
         self,
@@ -2039,6 +2187,12 @@ class MainWindow(QtWidgets.QMainWindow):
             for project_path, scan in self.project_scans.items()
             if project_path in known_paths
         }
+        self.dashboard_figures = {
+            project_path: list(scan.dashboard_figures)
+            for project_path, scan in self.project_scans.items()
+            if scan.dashboard_figures
+        }
+        self._reconcile_project_high_voltage_overrides(scans)
         self.session.status_cache = {
             project_path: scan.chips
             for project_path, scan in self.project_scans.items()
@@ -2139,13 +2293,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                     )
                     current_high_voltage.difference_update(overrides)
-                    if current_high_voltage:
-                        self.session.high_voltage_exclusions_by_project[project_path] = sorted(
-                            current_high_voltage,
-                            key=lambda item: (item[0], item[1], item[2], item[3]),
-                        )
-                    else:
-                        self.session.high_voltage_exclusions_by_project.pop(project_path, None)
                     new_count = len(
                         current_high_voltage
                         - set(normalize_high_voltage_exclusions(previous_high_voltage))
@@ -2279,10 +2426,24 @@ class MainWindow(QtWidgets.QMainWindow):
         result: dict[str, tuple[list[DashboardFigure], list[str]]],
     ) -> None:
         for project_path, (figures, _warnings) in result.items():
+            figures = list(figures)
             self.dashboard_figures[project_path] = figures
-            if not self.session.dashboard_figure_selection_initialized and figures:
-                self.session.dashboard_figure_selection = [figure.id for figure in figures]
-                self.session.dashboard_figure_selection_initialized = True
+            scan = self.project_scans.get(project_path)
+            if scan is not None:
+                scan.dashboard_figures = list(figures)
+            available_ids = {figure.id for figure in figures}
+            if not self.session.dashboard_figure_apply_to_all:
+                selection = self.session.dashboard_figure_selection_by_project.get(project_path)
+                if selection is None:
+                    selection = (
+                        self.session.dashboard_figure_shared_selection
+                        if self.session.dashboard_figure_shared_selection_initialized
+                        else [figure.id for figure in figures]
+                    )
+                self.session.dashboard_figure_selection_by_project[project_path] = [
+                    figure_id for figure_id in selection if figure_id in available_ids
+                ]
+        self._ensure_shared_dashboard_selection()
 
     def _dashboard_figures_scan_finished(
         self,
@@ -2304,7 +2465,10 @@ class MainWindow(QtWidgets.QMainWindow):
         events = list(self.session.events)
         if not self._ensure_voltage_um(projects, voltages):
             return
-        dashboard_figure_ids = list(self.session.dashboard_figure_selection)
+        dashboard_figure_ids_by_project = {
+            project_path: self._dashboard_figure_ids_for_project(project_path)
+            for project_path in projects
+        }
         envelope_kwargs = self._envelope_build_kwargs(projects)
         envelope_kwargs["sustained_sdpf_heatmap_settings_by_project"] = dict(
             self.session.sustained_sdpf_heatmap_settings_by_project
@@ -2322,7 +2486,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 scopes,
                 voltages,
                 events,
-                dashboard_figure_ids=dashboard_figure_ids,
+                dashboard_figure_ids_by_project=dashboard_figure_ids_by_project,
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 **envelope_kwargs,
                 log=prompt_log,
@@ -2592,7 +2756,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 scopes,
                 voltages,
                 events,
-                self.session.dashboard_figure_selection,
+                {
+                    project_path: self._dashboard_figure_ids_for_project(project_path)
+                    for project_path in projects
+                },
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
@@ -2913,7 +3080,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_busy(self, busy: bool, status: str) -> None:
         self._busy = busy
-        self.workspace_splitter.setEnabled(not busy)
+        # Keep the preview panel enabled so the read-only log remains
+        # interactive while the rest of the workspace is locked.
+        self.left_workspace_splitter.setEnabled(not busy)
+        self.preview_table.setEnabled(not busy)
+        self.dashboard_figure_apply_all_checkbox.setEnabled(not busy)
+        self.dashboard_figure_list.setEnabled(not busy)
+        for index in range(1, self.workspace_splitter.count()):
+            handle = self.workspace_splitter.handle(index)
+            if handle is not None:
+                handle.setEnabled(not busy)
         self.scan_dashboard_figures_button.setEnabled(not busy)
         self.refresh_dashboards_button.setEnabled(not busy)
         self.run_full_button.setEnabled(not busy)
@@ -2948,8 +3124,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
+        scrollbar = self.log_edit.verticalScrollBar()
+        previous_value = scrollbar.value()
+        was_at_bottom = previous_value >= scrollbar.maximum()
         self.log_edit.appendPlainText(f"[{timestamp}] {message}")
-        self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(previous_value, scrollbar.maximum()))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         if self._worker is not None and self._worker.isRunning():

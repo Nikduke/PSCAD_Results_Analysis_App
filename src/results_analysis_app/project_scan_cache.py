@@ -9,7 +9,7 @@ from results_analysis_app.common import as_float
 from results_analysis_app.project_config import VoltageConfig
 
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 
 
 def _empty_cache() -> dict[str, Any]:
@@ -114,6 +114,16 @@ def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
         "project_frequency": scan.project_frequency,
         "final_duration": scan.final_duration,
         "has_dashboards": scan.has_dashboards,
+        "dashboard_figures": [
+            {
+                "id": figure.id,
+                "workbook": figure.workbook,
+                "sheet": figure.sheet,
+                "chart_index": figure.chart_index,
+                "title": figure.title,
+            }
+            for figure in scan.dashboard_figures
+        ],
         "dashboard_changed": scan.dashboard_changed,
         "has_envelopes": scan.has_envelopes,
         "has_plots": scan.has_plots,
@@ -269,6 +279,35 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
                     str(item.get("source", "workbook")),
                 )
 
+    dashboard_figures: list[scanner.DashboardFigure] = []
+    seen_dashboard_figure_ids: set[str] = set()
+    for item in _payload_list(payload, "dashboard_figures"):
+        if not isinstance(item, dict):
+            continue
+        figure_id = str(item.get("id", "")).strip()
+        workbook = str(item.get("workbook", "")).strip()
+        sheet = str(item.get("sheet", "")).strip()
+        chart_index = _as_int(item.get("chart_index"))
+        if (
+            not figure_id
+            or figure_id in seen_dashboard_figure_ids
+            or not workbook
+            or not sheet
+            or chart_index is None
+            or chart_index < 1
+        ):
+            continue
+        seen_dashboard_figure_ids.add(figure_id)
+        dashboard_figures.append(
+            scanner.DashboardFigure(
+                id=figure_id,
+                workbook=workbook,
+                sheet=sheet,
+                chart_index=chart_index,
+                title=str(item.get("title", "")).strip(),
+            )
+        )
+
     chips = [str(value) for value in _payload_list(payload, "chips")]
     return scanner.ProjectScan(
         path=root,
@@ -290,6 +329,7 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
         project_frequency=as_float(payload.get("project_frequency")),
         final_duration=as_float(payload.get("final_duration")),
         has_dashboards=bool(payload.get("has_dashboards", False)),
+        dashboard_figures=dashboard_figures,
         dashboard_changed=bool(
             payload.get("dashboard_changed", "Dashboards changed" in chips)
         ),

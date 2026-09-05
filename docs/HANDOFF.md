@@ -113,7 +113,14 @@ covered by plotting tests.
    scan keeps compact UI metadata, not full output-file lists.
    In the project tree, double-click the project-name cell to open project-
    specific Settings, or double-click the status cell to open the project
-   folder through the operating system.
+   folder through the operating system. Project-specific scan data and UI state
+   are keyed by the canonical project path. Tree refreshes block intermediate
+   selection signals and the exclusions panel is reloaded only for the active
+   row with a current scan; otherwise it is cleared rather than using another
+   checked project as a fallback. Detected High Voltage rows come only from
+   that project's scan. The session stores only explicit include overrides and
+   reconciles them with the current scan, so an orphaned row from another
+   project cannot reappear as an `Analysis` finding.
 2. **High-voltage proposals.** PSCAD-log warning case/MM pairs are checked
    against matching raw waveform channels for every run and cached. A changed
    factor or `Um` reclassifies cached maxima; it does not reread those files.
@@ -144,8 +151,11 @@ covered by plotting tests.
     create an empty Sustained batch that looks like a clean result. Sustained plot
    rendering receives the same project SDPF overrides as detection and leaves
    SIWL values unchanged. During one connected workflow, the loaded Sustained
-   payload is reused by batch creation, plot rendering, heatmaps, and reports;
-   active parallel plot workers are terminated promptly on Stop.
+   payload is reused by batch creation, plot rendering, heatmaps, and reports.
+   The connected run also computes one in-memory cache validation per scope and
+   passes it through those stages, so the same source fingerprint is not walked
+   repeatedly; standalone actions still validate their saved data locally.
+   Active parallel plot workers are terminated promptly on Stop.
 5. **Post-processing.** The selected action builds combined Excel charts, plot
    batches, rendered plots, heatmaps, and reports. `Rebuild heatmaps` uses the
    saved Sustained SDPF JSON only; it does not reread waveforms. If validation
@@ -160,9 +170,14 @@ covered by plotting tests.
 
 - Manual rules use `Case`, `Run`, and `Bus`; blank fields are wildcards and a
   completely blank row is ignored.
+- The `Scopes` list is intentionally global. A selected token filter is applied
+  to every selected project; this is separate from project-specific scans,
+  exclusions, settings, output state, and status, which are never shared by
+  project name or by list position.
 - NonConv and High Voltage proposals use the same checked/unchecked table
-  workflow. PSCAD-log High Voltage rows start checked. Unchecking a row stores
-  an exact include override for the next envelope build.
+  workflow and are shown only when the active project has corresponding rows.
+  PSCAD-log High Voltage rows start checked. Unchecking a row stores an exact
+  include override for the next envelope build.
 - The envelope build is the authoritative all-case High Voltage check. If one
   phase on a case/run/bus exceeds the configured limit, that bus is excluded
   from both LGp and LLp. Newly found exclusions are added to the UI as checked.
@@ -289,10 +304,12 @@ Heatmap rules:
 - heatmap headers keep only plot-local context; split categories are labelled
   from the selected project token as `Split: <value>`, X grouping is
   shown in a dedicated band containing only the selected token value, and case
-  labels use a dedicated band below the matrix. Tokens already
+  labels use a dedicated band below the matrix when residual case identity
+  remains. Tokens already
   represented by Y/X/Split or constant in the panel are omitted. Equal labels
   are allowed in different visible X-groups or split panels; only a true
-  same-context collision uses a full identity fallback. Continuation order is
+  same-context collision uses an unselected-identity fallback; if no residual
+  identity remains, the case-label band is omitted. Continuation order is
   carried by filenames/page order rather than printed `part i/n` text;
 - figure positioning uses fixed, named inch-based bands for the header, split
   header, X-group band, matrix, case labels, and footer, so these elements do
@@ -350,6 +367,16 @@ mode must survive closing and reopening Settings; changing a ranking checkbox
 does not invalidate the engineering result cache, and changing a heatmap layout
 does not require another project scan.
 
+Dashboard figure metadata is cached by canonical project path. The UI shows
+the union of the cached catalogs by default, with the short `All checked`
+checkbox applying one shared checked-ID list to every checked project. Clearing
+it exposes the active project's list and stores local selections. When shared
+mode is enabled again, the active project's selection becomes the shared source
+and local selections are preserved. The report builder still receives a
+separate filtered ID list per project, so a figure missing from a project is
+skipped harmlessly. Former project-specific or global dashboard selections are
+migrated once into the shared selection format.
+
 The normal action order is: **Build envelope data/checks** for new or changed
 waveform/threshold inputs; the event or Analysis step buttons for selected
 plot work; **Rebuild heatmaps** after heatmap layout changes; and **Rebuild
@@ -401,6 +428,13 @@ Sustained SDPF duration needs the corresponding data/check build.
   Stop; a broken pool is retried sequentially. The current uncommitted staging
   directory is discarded, so a cancelled batch cannot replace the previous
   good output.
+- Heatmap rendering uses the same bounded process policy for independent PNG
+  pages: it switches at three or more pages, uses Windows `spawn` with the
+  shared four-worker cap and queue bound, and falls back to sequential rendering
+  if the pool cannot start or a worker dies. Each worker writes only its own
+  private staged image; heatmap data preparation and the final atomic replacement
+  of the complete set remain in the parent. Cancellation terminates active
+  heatmap workers and removes the uncommitted stage.
 
 ## How to run and validate
 

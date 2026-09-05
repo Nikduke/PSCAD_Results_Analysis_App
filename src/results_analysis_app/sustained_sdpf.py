@@ -25,7 +25,7 @@ RESULT_VERSION = 17
 # The workbook format has its own version because summary-only changes must
 # invalidate the envelope-stage output without changing the engineering-result
 # schema/version.
-SUMMARY_WORKBOOK_VERSION = 1
+SUMMARY_WORKBOOK_VERSION = 2
 SOURCE_MANIFEST_VERSION = 1
 DEFAULT_SUSTAINED_DURATION_MS = 30.0
 # CIGRE/TB 913 expresses the safety factor as 1.15.  The usable threshold is
@@ -1853,13 +1853,15 @@ def _population_metric_values(
     float | None,
     float | None,
     float | None,
+    float | None,
 ]:
-    """Return the selected threshold's compact report metrics for one phase."""
+    """Return compact threshold metrics; the V_T/SDPF value is already a percent."""
     if population == ACTUAL_SDPF_POPULATION:
         return (
             "SDPF",
             float(phase.sdpf_peak_kv),
             float(phase.sdpf_excess_area_norm_ms),
+            float(phase.longest_sdpf_s * 1000.0),
             float(phase.sdpf_longest_continuous_s * 1000.0),
             float(phase.sdpf_sustained_t_peak_kv),
             float(phase.sdpf_sustained_t_ratio * 100.0),
@@ -1871,13 +1873,14 @@ def _population_metric_values(
             "SDPF/1.15",
             float(phase.margin_peak_kv),
             float(phase.margin_excess_area_norm_ms),
+            float(phase.longest_margin_s * 1000.0),
             float(phase.margin_longest_continuous_s * 1000.0),
             float(phase.margin_sustained_t_peak_kv),
             float(phase.margin_sustained_t_ratio * 100.0),
             float(phase.margin_event_start_s),
             float(phase.margin_event_end_s),
         )
-    return ("", None, None, None, None, None, None, None)
+    return ("", None, None, None, None, None, None, None, None)
 
 
 def _summary_metric_values(
@@ -1891,6 +1894,7 @@ def _summary_metric_values(
         threshold,
         threshold_peak,
         normalized_area,
+        qualification_duration_ms,
         continuous_duration_ms,
         sustained_t_peak,
         sustained_t_ratio,
@@ -1914,6 +1918,7 @@ def _summary_metric_values(
         float(phase.sdpf_peak_kv),
         float(phase.margin_peak_kv),
         normalized_area,
+        qualification_duration_ms,
         continuous_duration_ms,
         sustained_t_peak,
         sustained_t_ratio,
@@ -1924,6 +1929,10 @@ def _summary_metric_values(
         "; ".join(qualifying_paths),
         str(limit.source) if limit is not None else "",
     ]
+
+
+QUALIFICATION_DURATION_HEADER = "Qualification duration (ms)"
+FULL_WAVE_DURATION_HEADER = "Full-wave continuous duration (ranking, ms)"
 
 
 SUMMARY_HEADERS = [
@@ -1937,14 +1946,15 @@ SUMMARY_HEADERS = [
     "Measurement",
     "Phase",
     "Threshold",
-    "Threshold (kVₚₑₐₖ)",
-    "SDPF limit (kVₚₑₐₖ)",
-    "Safety margin (kVₚₑₐₖ)",
+    "Threshold (kVpeak)",
+    "SDPF limit (kVpeak)",
+    "Safety margin (kVpeak)",
     "Normalized excess area (pu*ms)",
-    "Longest continuous duration (ms)",
-    "Highest sustained T, Vₜ (kVₚₑₐₖ)",
-    "Vₜ / SDPF (%)",
-    "Sustained peak (kVₚₑₐₖ)",
+    QUALIFICATION_DURATION_HEADER,
+    FULL_WAVE_DURATION_HEADER,
+    "Highest sustained T, VT (kVpeak)",
+    "VT / SDPF (%)",
+    "Sustained peak (kVpeak)",
     "Event start (s)",
     "Event end (s)",
     "Qualifying path count",
@@ -1978,7 +1988,7 @@ def _selection_metric_value(
             if population == ACTUAL_SDPF_POPULATION
             else phase.margin_sustained_t_ratio
         )
-        return "Vₜ / SDPF (%)", float(value * 100.0)
+        return "VT / SDPF (%)", float(value * 100.0)
     if metric == CUMULATIVE_STRESS_SELECTION:
         value = (
             phase.sdpf_excess_area_norm_ms
@@ -1991,7 +2001,7 @@ def _selection_metric_value(
         if population == ACTUAL_SDPF_POPULATION
         else phase.margin_longest_continuous_s
     )
-    return "Longest continuous duration (ms)", float(value * 1000.0)
+    return FULL_WAVE_DURATION_HEADER, float(value * 1000.0)
 
 
 def _representative_rows(

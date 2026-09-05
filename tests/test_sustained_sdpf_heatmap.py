@@ -357,6 +357,54 @@ def test_heatmap_x_group_token_is_not_repeated_in_case_labels() -> None:
     ]
 
 
+def test_heatmap_does_not_restore_selected_tokens_when_no_residual_identity() -> None:
+    from results_analysis_app.sustained_sdpf_heatmap import (
+        HeatmapObservation,
+        HeatmapSettings,
+        _case_display_labels,
+        _case_label_band_height,
+        aggregate_observations,
+        metadata_from_cases,
+    )
+
+    cases = [
+        "O2_RA0_P2_66F01",
+        "O2_RA0_P2_66OFT",
+        "O2_RA0_P2_66S2B2",
+        "O2_RA0_P2_161POC",
+        "O2_RA0_P2_230ONC",
+        "O2_RA0_P2_230ONT",
+        "O2_RA1_P2_66F01",
+        "O2_RA2_P2_66F01",
+    ]
+    observations = [
+        HeatmapObservation(case, 1, "MM_161_A", "AG", False, False)
+        for case in cases
+    ]
+    metadata = metadata_from_cases(
+        cases,
+        {(case, 1): "AG" for case in cases},
+    )
+    layout = aggregate_observations(
+        observations,
+        HeatmapSettings(y_grouping="RA", x_grouping="Token 4"),
+        metadata,
+    )
+
+    labels = _case_display_labels(layout, layout.cases)
+
+    assert layout.cases == (
+        "O2_P2_66F01",
+        "O2_P2_66OFT",
+        "O2_P2_66S2B2",
+        "O2_P2_161POC",
+        "O2_P2_230ONC",
+        "O2_P2_230ONT",
+    )
+    assert labels == ("", "", "", "", "", "")
+    assert _case_label_band_height(labels) == 0.0
+
+
 def test_heatmap_titles_prioritize_split_and_x_group_context() -> None:
     import matplotlib
 
@@ -832,6 +880,7 @@ def test_combined_heatmap_layout_paginates_real_split_panels(tmp_path) -> None:
         observations_by_voltage={"66": results},
     )
 
+    logs = []
     images = sustained_sdpf_heatmap.generate_heatmaps(
         tmp_path,
         "Full",
@@ -844,6 +893,7 @@ def test_combined_heatmap_layout_paginates_real_split_panels(tmp_path) -> None:
             max_panels_per_heatmap=2,
         ),
         sustained_settings,
+        log=logs.append,
     )
 
     assert [image.name for image in images] == [
@@ -852,6 +902,7 @@ def test_combined_heatmap_layout_paginates_real_split_panels(tmp_path) -> None:
         "MM_66_faceted_03_heatmap.png",
     ]
     assert all(image.is_file() for image in images)
+    assert any(message.startswith("Parallel heatmap rendering:") for message in logs)
 
 
 def test_named_heatmap_sets_render_in_ordered_subfolders(tmp_path) -> None:

@@ -442,7 +442,9 @@ def test_report_dashboard_heading_precedes_cross_reference(tmp_path, monkeypatch
         [ScopeEntry.full()],
         ["161"],
         [],
-        dashboard_figure_ids=["dashboard.xlsx|Graphs|1|Initial Reactive Power"],
+        dashboard_figure_ids_by_project={
+            str(project.resolve()): ["dashboard.xlsx|Graphs|1|Initial Reactive Power"]
+        },
     )
 
     document = Document(outputs[0])
@@ -451,6 +453,39 @@ def test_report_dashboard_heading_precedes_cross_reference(tmp_path, monkeypatch
     reference_index = next(index for index, text in enumerate(texts) if text.startswith("The initial reactive power"))
     assert heading_index < reference_index
     assert document.paragraphs[heading_index].style.name == "Plot Heading"
+
+
+def test_reports_use_dashboard_selection_for_each_project(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    first = tmp_path / "O1"
+    second = tmp_path / "O2"
+    first.mkdir()
+    second.mkdir()
+    captured: list[tuple[str, list[str]]] = []
+
+    def export_dashboard_figures(project_root, figure_ids, *_args, **_kwargs):
+        captured.append((str(project_root), list(figure_ids)))
+        return []
+
+    monkeypatch.setattr(reporting, "_export_dashboard_figures", export_dashboard_figures)
+
+    reporting.build_reports_from_existing_plots(
+        [first, second],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        dashboard_figure_ids_by_project={
+            str(first.resolve()): ["first"],
+            str(second.resolve()): ["second"],
+        },
+    )
+
+    assert captured == [
+        (str(first.resolve()), ["first"]),
+        (str(second.resolve()), ["second"]),
+    ]
 
 
 def test_report_orders_initial_dashboard_figures(tmp_path, monkeypatch) -> None:
@@ -480,7 +515,7 @@ def test_report_orders_initial_dashboard_figures(tmp_path, monkeypatch) -> None:
         [ScopeEntry.full()],
         ["161"],
         [],
-        dashboard_figure_ids=["selected"],
+        dashboard_figure_ids_by_project={str(project.resolve()): ["selected"]},
     )
 
     texts = [paragraph.text for paragraph in Document(outputs[0]).paragraphs]
@@ -521,7 +556,7 @@ def test_report_places_envelope_section_before_dashboard_section(tmp_path, monke
         [ScopeEntry.full()],
         ["161"],
         [],
-        dashboard_figure_ids=["selected"],
+        dashboard_figure_ids_by_project={str(project.resolve()): ["selected"]},
     )
 
     document = Document(outputs[0])

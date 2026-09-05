@@ -1226,15 +1226,16 @@ def _sustained_table_rows(
             _threshold,
             _threshold_peak,
             area,
+            _qualification_duration_ms,
             duration_ms,
             sustained_t_peak,
-            sustained_t_ratio,
+            sustained_t_percent,
             _event_start,
             _event_end,
         ) = sustained_sdpf._population_metric_values(phase, population)
         ratio_percent = (
-            float(sustained_t_ratio) * 100.0
-            if sustained_t_ratio is not None
+            float(sustained_t_percent)
+            if sustained_t_percent is not None
             else None
         )
         rows.append(
@@ -1913,7 +1914,7 @@ def build_reports_from_existing_plots(
     scopes: Iterable[ScopeEntry],
     voltages: Iterable[str],
     events: Iterable[str],
-    dashboard_figure_ids: Iterable[str] = (),
+    dashboard_figure_ids_by_project: Mapping[str, Iterable[str]] | None = None,
     resonance_settings: dict[str, object] | None = None,
     event_times: dict[str, float] | None = None,
     log: LogFn | None = None,
@@ -1923,6 +1924,9 @@ def build_reports_from_existing_plots(
     sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
     render_heatmaps: bool = True,
     sustained_payloads_by_project_scope: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
+    sustained_cache_validations_by_project_scope: Mapping[
+        str, Mapping[str, sustained_sdpf.SustainedSDPFCacheValidation]
+    ] | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -1934,7 +1938,6 @@ def build_reports_from_existing_plots(
     selected_scopes = list(scopes)
     selected_events = list(events)
     selected_voltages = list(voltages)
-    selected_dashboard_figure_ids = list(dashboard_figure_ids)
     parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
     parsed_sustained = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
     parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings()
@@ -1965,6 +1968,9 @@ def build_reports_from_existing_plots(
         for project_root in project_roots:
             _cancel(check_cancel)
             root = Path(project_root).resolve()
+            selected_dashboard_figure_ids = list(
+                (dashboard_figure_ids_by_project or {}).get(str(root), ())
+            )
             parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings.from_mapping(
                 (sustained_sdpf_ranking_settings_by_project or {}).get(str(root))
             )
@@ -1985,15 +1991,21 @@ def build_reports_from_existing_plots(
                     sustained_payload = sustained_sdpf.load_results(root, scope.folder)
                 if not parsed_sustained.enabled:
                     sustained_payload = {}
+                project_cache_validations = (
+                    (sustained_cache_validations_by_project_scope or {}).get(str(root), {})
+                )
                 sustained_cache_validation = (
-                    sustained_sdpf.validate_result_cache(
+                    project_cache_validations.get(scope.folder)
+                    if parsed_sustained.enabled
+                    and isinstance(project_cache_validations, Mapping)
+                    else None
+                )
+                if parsed_sustained.enabled and sustained_cache_validation is None:
+                    sustained_cache_validation = sustained_sdpf.validate_result_cache(
                         sustained_payload,
                         root,
                         parsed_sustained,
                     )
-                    if parsed_sustained.enabled
-                    else None
-                )
                 shared_manifest_current = (
                     sustained_cache_validation.shared_manifest_current
                     if sustained_cache_validation is not None

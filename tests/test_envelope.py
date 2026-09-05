@@ -92,6 +92,104 @@ def test_output_tree_does_not_precreate_generated_plot_folders(tmp_path) -> None
     assert not (project / "Plots" / "Generated").exists()
 
 
+def test_run_analysis_pipeline_passes_project_dashboard_mapping_to_reports(
+    tmp_path, monkeypatch
+) -> None:
+    from results_analysis_app import actions
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_key = str(project.resolve())
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(actions, "build_voltage_envelopes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(actions, "create_plot_batches", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(actions, "render_plot_batches", lambda *_args, **_kwargs: None)
+
+    def capture_reports(*_args, **kwargs):
+        captured["dashboard_figure_ids_by_project"] = kwargs[
+            "dashboard_figure_ids_by_project"
+        ]
+        return []
+
+    monkeypatch.setattr(actions, "build_reports_from_existing_plots", capture_reports)
+
+    actions.run_analysis_pipeline(
+        [project],
+        [ScopeEntry.full()],
+        ["66"],
+        [],
+        dashboard_figure_ids_by_project={project_key: ["dashboard.xlsx|Graphs|1|Figure"]},
+    )
+
+    assert captured["dashboard_figure_ids_by_project"] == {
+        project_key: ["dashboard.xlsx|Graphs|1|Figure"]
+    }
+
+
+def test_run_analysis_pipeline_reuses_sustained_cache_validation(
+    tmp_path, monkeypatch
+) -> None:
+    from results_analysis_app import actions, sustained_sdpf
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    payload = {"version": sustained_sdpf.RESULT_VERSION}
+    validation = sustained_sdpf.SustainedSDPFCacheValidation(
+        valid=True,
+        shared_manifest_current=True,
+    )
+    validation_calls = 0
+    captured: dict[str, dict[str, object]] = {}
+
+    monkeypatch.setattr(actions, "build_voltage_envelopes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        actions.sustained_sdpf,
+        "load_results",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    def validate(*_args, **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        return validation
+
+    monkeypatch.setattr(actions.sustained_sdpf, "validate_result_cache", validate)
+    def capture_create(*_args, **kwargs):
+        captured["create"] = kwargs
+        return []
+
+    def capture_render(*_args, **kwargs):
+        captured["render"] = kwargs
+
+    def capture_report(*_args, **kwargs):
+        captured["report"] = kwargs
+        return []
+
+    monkeypatch.setattr(actions, "create_plot_batches", capture_create)
+    monkeypatch.setattr(actions, "render_plot_batches", capture_render)
+    monkeypatch.setattr(actions, "build_reports_from_existing_plots", capture_report)
+
+    actions.run_analysis_pipeline(
+        [project],
+        [ScopeEntry.full()],
+        ["66"],
+        [],
+        sustained_sdpf_settings={"enabled": True, "duration_ms": 30.0},
+    )
+
+    assert validation_calls == 1
+    for stage in ("create", "render"):
+        assert captured[stage]["sustained_cache_validations_by_scope"] == {
+            "Full": validation
+        }
+    assert captured["report"]["sustained_cache_validations_by_project_scope"] == {
+        str(project.resolve()): {"Full": validation}
+    }
+
+
 def test_rebuild_envelope_charts_uses_existing_workbooks(tmp_path, monkeypatch) -> None:
     from results_analysis_app import actions
     from results_analysis_app.models import ScopeEntry

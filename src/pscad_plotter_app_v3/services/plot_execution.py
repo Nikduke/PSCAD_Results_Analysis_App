@@ -28,6 +28,22 @@ def automatic_plot_worker_count(job_count: int) -> int:
     return max(1, min(job_count, MAX_PLOT_PROCESS_WORKERS, available_cpus))
 
 
+def terminate_process_executor(executor) -> None:
+    """Terminate active workers without waiting for queued plotting work."""
+    processes = tuple(getattr(executor, "_processes", {}).values())
+    for process in processes:
+        try:
+            process.terminate()
+        except (OSError, AttributeError):
+            continue
+    executor.shutdown(wait=False, cancel_futures=True)
+    for process in processes:
+        try:
+            process.join(timeout=1.0)
+        except (OSError, AttributeError):
+            continue
+
+
 def execute_plot_job(
     renderer: MatplotlibRenderer,
     exporter: ExcelExporter | None,

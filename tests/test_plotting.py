@@ -308,8 +308,18 @@ def test_create_plot_batches_marks_sustained_plot_with_standard_tov_window(tmp_p
         "Full", "66", "C1", 1, "MM_66_A", "AG", 0.04, phase, (phase,), cycle_coverage=2
     )
     payload = _sustained_cache_payload(result, [result])
+    validation = sustained_sdpf.SustainedSDPFCacheValidation(
+        valid=True,
+        shared_manifest_current=True,
+    )
     monkeypatch.setattr(analysis_engine.sustained_sdpf, "load_results", lambda *_args: payload)
-    monkeypatch.setattr(analysis_engine.sustained_sdpf, "source_manifest_current", lambda *_args: True)
+    monkeypatch.setattr(
+        analysis_engine.sustained_sdpf,
+        "validate_result_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the connected workflow should reuse validation")
+        ),
+    )
     monkeypatch.setattr(analysis_engine.sustained_sdpf, "result_inputs_current", lambda *_args, **_kwargs: True)
     written = []
     monkeypatch.setattr(
@@ -324,6 +334,7 @@ def test_create_plot_batches_marks_sustained_plot_with_standard_tov_window(tmp_p
         ["66"],
         [],
         sustained_sdpf_settings={"enabled": True, "duration_ms": 40.0},
+        sustained_cache_validations_by_scope={"Full": validation},
     )
 
     assert outputs[-1].name == "batch_paste_Full_Sustained_SDPF.xlsx"

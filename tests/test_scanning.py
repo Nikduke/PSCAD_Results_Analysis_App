@@ -143,6 +143,25 @@ def test_project_scan_ignores_corrupt_envelope_workbook(tmp_path) -> None:
     assert any("Could not read high-voltage proposals" in message for message in scan.messages)
 
 
+def test_cold_project_scan_populates_dashboard_figure_catalog(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import scanner
+
+    figure = scanner.DashboardFigure(
+        id="Dashboard.xlsx|Graphs|1|Initial voltages",
+        workbook="Dashboard.xlsx",
+        sheet="Graphs",
+        chart_index=1,
+        title="Initial voltages",
+    )
+    monkeypatch.setattr(scanner, "scan_dashboard_figures", lambda _path: ([figure], []))
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    scan = scanner.scan_project(project)
+
+    assert scan.dashboard_figures == [figure]
+
+
 def test_high_voltage_proposals_prefer_base_envelope_workbook(tmp_path) -> None:
     from openpyxl import Workbook
 
@@ -353,6 +372,45 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
     )
 
 
+def test_project_scan_cache_round_trips_dashboard_figure_catalog(tmp_path) -> None:
+    from results_analysis_app import project_scan_cache, scanner
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_path = str(project.resolve())
+    figure = scanner.DashboardFigure(
+        id="Dashboard.xlsx|Graphs|1|Initial voltages",
+        workbook="Dashboard.xlsx",
+        sheet="Graphs",
+        chart_index=1,
+        title="Initial voltages",
+    )
+    scan = scanner.ProjectScan(
+        path=project.resolve(),
+        exists=True,
+        chips=["Ready"],
+        has_dashboards=True,
+        dashboard_figures=[figure],
+    )
+    cache_path = tmp_path / "project_scan_cache.json"
+
+    project_scan_cache.update_project_scans(
+        {project_path: scan},
+        [project_path],
+        (450.0, 250.0),
+        cache_path,
+    )
+
+    cached = project_scan_cache.cached_scan(
+        project_scan_cache.load(cache_path),
+        project_path,
+        (450.0, 250.0),
+    )
+
+    assert cached is not None
+    assert cached.dashboard_figures == [figure]
+
+
 def test_project_scan_manifest_ignores_unrelated_waveform_files(tmp_path) -> None:
     from results_analysis_app import scanner
 
@@ -548,7 +606,10 @@ def test_post_action_cache_update_preserves_input_manifest(tmp_path, monkeypatch
     assert entry["manifest"]["output_state"]["has_plots"] is True
 
 
-def test_dashboard_change_marks_cached_scan_without_rescanning_project(tmp_path, monkeypatch) -> None:
+def test_dashboard_change_refreshes_cached_figures_without_rescanning_project(
+    tmp_path,
+    monkeypatch,
+) -> None:
     from results_analysis_app import project_scan_cache, project_scan_runner, scanner
 
     project = tmp_path / "Project"
@@ -586,6 +647,11 @@ def test_dashboard_change_marks_cached_scan_without_rescanning_project(tmp_path,
         raise AssertionError("Dashboard-only changes must not rescan the project")
 
     monkeypatch.setattr(project_scan_runner.scanner, "scan_project", fake_scan)
+    monkeypatch.setattr(
+        project_scan_runner.scanner,
+        "scan_dashboard_figures",
+        lambda *_args, **_kwargs: ([], []),
+    )
     result = project_scan_runner.scan_projects_cached(
         [project_path],
         project_path,
@@ -596,9 +662,9 @@ def test_dashboard_change_marks_cached_scan_without_rescanning_project(tmp_path,
     changed_scan = result.scans[project_path]
 
     assert scan_calls == 0
-    assert changed_scan.dashboard_changed is True
-    assert "Dashboards changed" in changed_scan.chips
-    assert any("Dashboard files changed" in message for message in logs)
+    assert changed_scan.dashboard_changed is False
+    assert "Dashboards changed" not in changed_scan.chips
+    assert any("Refreshing dashboard figures" in message for message in logs)
 
     project_scan_cache.update_project_scans(
         result.scans,
@@ -606,29 +672,14 @@ def test_dashboard_change_marks_cached_scan_without_rescanning_project(tmp_path,
         limits,
         cache_path,
     )
-    still_changed = project_scan_runner.scan_projects_cached(
+    still_current = project_scan_runner.scan_projects_cached(
         [project_path],
         project_path,
         *limits,
         cache_path=cache_path,
     ).scans[project_path]
-    assert still_changed.dashboard_changed is True
-
-    scanner.refresh_project_scan_outputs(still_changed, refresh_dashboards=True)
-    project_scan_cache.update_project_scans(
-        {project_path: still_changed},
-        [project_path],
-        limits,
-        cache_path,
-    )
-    acknowledged = project_scan_runner.scan_projects_cached(
-        [project_path],
-        project_path,
-        *limits,
-        cache_path=cache_path,
-    ).scans[project_path]
-    assert acknowledged.dashboard_changed is False
-    assert "Dashboards changed" not in acknowledged.chips
+    assert still_current.dashboard_changed is False
+    assert "Dashboards changed" not in still_current.chips
 
 
 def test_cached_project_scan_runner_skips_hot_scan_and_supports_force(tmp_path, monkeypatch) -> None:
@@ -731,7 +782,7 @@ def test_fresh_scan_messages_are_logged_once_but_not_replayed_from_cache(tmp_pat
     assert not any("Input workbook warning" in message for message in second_logs)
 
 
-def test_dashboard_figure_list_falls_back_to_scanned_selected_projects() -> None:
+def test_dashboard_figure_selection_uses_only_the_requested_project() -> None:
     from types import SimpleNamespace
 
     from results_analysis_app.main_window import MainWindow
@@ -746,15 +797,20 @@ def test_dashboard_figure_list_falls_back_to_scanned_selected_projects() -> None
         ProjectEntry(selected_with_figures, selected=True),
         ProjectEntry(unselected_with_figures, selected=False),
     ]
+    session.dashboard_figure_selection_by_project = {
+        selected_with_figures: ["id-1"],
+        unselected_with_figures: ["id-2"],
+    }
+    session.dashboard_figure_apply_to_all = False
     dashboard_figures = {
         selected_with_figures: [DashboardFigure("id-1", "A.xlsx", "Graphs", 1, "Chart")],
         unselected_with_figures: [DashboardFigure("id-2", "B.xlsx", "Graphs", 1, "Chart")],
     }
     window = SimpleNamespace(session=session, dashboard_figures=dashboard_figures)
 
-    assert MainWindow._dashboard_figure_source_paths(window, None) == [selected_with_figures]
-    assert MainWindow._dashboard_figure_source_paths(window, selected_without_figures) == [selected_with_figures]
-    assert MainWindow._dashboard_figure_source_paths(window, selected_with_figures) == [selected_with_figures]
+    assert MainWindow._dashboard_figure_ids_for_project(window, selected_without_figures) == []
+    assert MainWindow._dashboard_figure_ids_for_project(window, selected_with_figures) == ["id-1"]
+    assert MainWindow._dashboard_figure_ids_for_project(window, unselected_with_figures) == ["id-2"]
 
 
 def test_pscad_log_high_voltage_scan_uses_raw_waveform_runs(tmp_path) -> None:

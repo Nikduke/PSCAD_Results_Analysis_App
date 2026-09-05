@@ -1139,6 +1139,147 @@ class _HeatmapPanelSpec:
     part_count: int = 1
 
 
+@dataclass(frozen=True, slots=True)
+class _HeatmapRenderJob:
+    """One independently renderable heatmap image in a private staging area."""
+
+    layout: HeatmapLayout
+    output_path: Path
+    title: str
+    split_value: str | None = None
+    faceted: bool = False
+    specs: tuple[_HeatmapPanelSpec, ...] = ()
+    page_index: int = 1
+    page_count: int = 1
+    show_page_number: bool = True
+
+
+def _render_heatmap_job(job: _HeatmapRenderJob) -> Path:
+    """Render one heatmap image; kept top-level so Windows spawn can pickle it."""
+    if job.faceted:
+        _plot_faceted_layout(
+            job.layout,
+            job.specs,
+            job.output_path,
+            job.title,
+            job.page_index,
+            job.page_count,
+            show_page_number=job.show_page_number,
+        )
+    else:
+        _plot_layout(job.layout, job.output_path, job.title, job.split_value)
+    return job.output_path
+
+
+def _render_heatmap_jobs(
+    jobs: Sequence[_HeatmapRenderJob],
+    *,
+    log=None,
+    check_cancel=None,
+) -> list[Path]:
+    """Render staged heatmap images with the shared bounded process policy.
+
+    The parent owns the staging directory and final atomic replacement.  A
+    worker only writes its own image, so concurrent pages cannot overwrite one
+    another or expose a partial heatmap set to report generation.
+    """
+    planned_jobs = tuple(jobs)
+    if not planned_jobs:
+        return []
+
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+    from concurrent.futures.process import BrokenProcessPool
+    import multiprocessing
+
+    from results_analysis_app.background import OperationCancelled
+    from pscad_plotter_app_v3.services.plot_execution import (
+        MIN_PARALLEL_PLOT_JOBS,
+        PLOT_PROCESS_QUEUE_MULTIPLIER,
+        automatic_plot_worker_count,
+        terminate_process_executor,
+    )
+
+    def render_sequential() -> list[Path]:
+        output: list[Path] = []
+        for job in planned_jobs:
+            if check_cancel is not None:
+                check_cancel()
+            output.append(_render_heatmap_job(job))
+        return output
+
+    worker_count = automatic_plot_worker_count(len(planned_jobs))
+    if len(planned_jobs) < MIN_PARALLEL_PLOT_JOBS or worker_count <= 1:
+        return render_sequential()
+
+    if log is not None:
+        log(
+            f"Parallel heatmap rendering: {len(planned_jobs)} figure(s) in "
+            f"{worker_count} process(es)"
+        )
+
+    executor = None
+    futures: dict[Any, int] = {}
+    pending_jobs = iter(enumerate(planned_jobs))
+    pending_exhausted = False
+    rendered: list[Path | None] = [None] * len(planned_jobs)
+    pool_failure: BrokenProcessPool | None = None
+    aborted = False
+    try:
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        except Exception as exc:
+            if log is not None:
+                log(f"Parallel heatmap rendering unavailable; continuing sequentially: {exc}")
+            return render_sequential()
+
+        while futures or not pending_exhausted:
+            while not pending_exhausted and len(futures) < worker_count * PLOT_PROCESS_QUEUE_MULTIPLIER:
+                try:
+                    job_index, job = next(pending_jobs)
+                except StopIteration:
+                    pending_exhausted = True
+                    break
+                if check_cancel is not None:
+                    check_cancel()
+                futures[executor.submit(_render_heatmap_job, job)] = job_index
+
+            if not futures:
+                break
+            if check_cancel is not None:
+                check_cancel()
+            completed, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                job_index = futures.pop(future)
+                rendered[job_index] = Path(future.result())
+    except OperationCancelled:
+        aborted = True
+        raise
+    except BrokenProcessPool as exc:
+        aborted = True
+        pool_failure = exc
+    except Exception:
+        aborted = True
+        raise
+    finally:
+        if executor is not None:
+            if aborted:
+                terminate_process_executor(executor)
+            else:
+                executor.shutdown(wait=True)
+
+    if pool_failure is not None:
+        if log is not None:
+            log(f"Parallel heatmap worker failed; retrying sequentially: {pool_failure}")
+        return render_sequential()
+
+    if any(path is None for path in rendered):
+        raise RuntimeError("Heatmap workers returned an incomplete output set.")
+    return [path for path in rendered if path is not None]
+
+
 def _heatmap_panel_specs(layout: HeatmapLayout) -> tuple[_HeatmapPanelSpec, ...]:
     """Return the actual panels without inventing case identities.
 
@@ -1273,12 +1414,12 @@ def _case_display_labels(
     """Return compact case labels using the visible grouping context.
 
     A token is removed only when it is represented by the selected Y/X/Split
-    dimension or is constant across the rendered columns.  The full case
-    identity remains in the persisted data and is used as a collision
-    fallback when shortening would make two columns indistinguishable.  A
-    collision is checked only within the same visible X-group and split
-    context: equal labels in different X-groups are already unambiguous from
-    the group band and must not cause the X-group token to reappear.
+    dimension or is constant across the rendered columns.  A collision is
+    checked only within the same visible X-group and split context: equal
+    labels in different X-groups are already unambiguous from the group band
+    and must not cause a selected token to reappear.  When no non-context
+    identity remains, the case-label band is intentionally left blank because
+    the row and X-group labels already identify the visible column.
     """
     members_by_case = {
         case: layout.column_members.get(case, (case,))
@@ -1320,7 +1461,7 @@ def _case_display_labels(
             for key, raw in token_parts_by_case[index]
             if key not in omitted or key in extra_keys
         ]
-        return _case_tick_label("_".join(kept) or representatives[index])
+        return _case_tick_label("_".join(kept))
 
     labels = [render_label(index) for index in range(len(cases))]
     # X grouping and Split by are already shown in the group band/title.  Do
@@ -1368,7 +1509,16 @@ def _case_display_labels(
                 break
         candidate = [render_label(index, extra_keys) for index in indexes]
         if len({label.casefold() for label in candidate}) != len(candidate):
-            candidate = [_case_tick_label(representatives[index]) for index in indexes]
+            candidate = [
+                _case_tick_label(
+                    "_".join(
+                        raw
+                        for key, raw in token_parts_by_case[index]
+                        if key not in visible_context
+                    )
+                )
+                for index in indexes
+            ]
         for index, label in zip(indexes, candidate):
             labels[index] = label
     return tuple(labels)
@@ -1410,6 +1560,8 @@ def _draw_case_labels(label_ax, labels: Sequence[str]) -> None:
 
 
 def _case_label_band_height(labels: Sequence[str]) -> float:
+    if not any(str(label).strip() for label in labels):
+        return 0.0
     _, max_label_lines = _case_label_metrics(labels)
     rotation = _case_label_rotation(labels)
     # This is a physical figure height, not a GridSpec ratio.  Rotated labels
@@ -1824,13 +1976,10 @@ def _plot_layout(
     bands: list[tuple[str, float]] = [("title", title_band_height)]
     if layout.settings.x_grouping:
         bands.append(("groups", HEATMAP_GROUP_BAND_IN))
-    bands.extend(
-        [
-            ("matrix", _heatmap_matrix_height(n_rows)),
-            ("labels", label_height),
-            ("footer", HEATMAP_FOOTER_BAND_IN),
-        ]
-    )
+    bands.append(("matrix", _heatmap_matrix_height(n_rows)))
+    if label_height > 0:
+        bands.append(("labels", label_height))
+    bands.append(("footer", HEATMAP_FOOTER_BAND_IN))
     fig_height = _heatmap_figure_height(bands, gap=HEATMAP_BAND_GAP_IN)
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=HEATMAP_RENDER_DPI, facecolor="white")
     axes = _stacked_band_axes(
@@ -1847,7 +1996,6 @@ def _plot_layout(
     if "groups" in axes:
         _draw_x_group_band(axes["groups"], layout)
     ax = axes["matrix"]
-    label_ax = axes["labels"]
     footer_ax = axes["footer"]
     _draw_heatmap_panel(
         ax,
@@ -1856,7 +2004,8 @@ def _plot_layout(
         show_x_label=False,
         show_x_labels=False,
     )
-    _draw_case_labels(label_ax, case_labels)
+    if "labels" in axes:
+        _draw_case_labels(axes["labels"], case_labels)
     _add_heatmap_footer(footer_ax, columns=4)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=HEATMAP_RENDER_DPI, facecolor="white")
@@ -1916,12 +2065,9 @@ def _plot_faceted_layout(
             bands.append((f"panel_header_{panel_index}", HEATMAP_PANEL_TITLE_BAND_IN))
         if layout.settings.x_grouping:
             bands.append((f"groups_{panel_index}", HEATMAP_GROUP_BAND_IN))
-        bands.extend(
-            [
-                (f"matrix_{panel_index}", panel_height),
-                (f"labels_{panel_index}", label_heights[panel_index]),
-            ]
-        )
+        bands.append((f"matrix_{panel_index}", panel_height))
+        if label_heights[panel_index] > 0:
+            bands.append((f"labels_{panel_index}", label_heights[panel_index]))
         if panel_index < panel_count - 1:
             bands.append((f"__gap_{panel_index}", HEATMAP_PANEL_GAP_IN))
     bands.append(("footer", HEATMAP_FOOTER_BAND_IN))
@@ -1959,7 +2105,9 @@ def _plot_faceted_layout(
             show_x_label=False,
             show_x_labels=False,
         )
-        _draw_case_labels(band_axes[f"labels_{panel_index}"], panel_labels[panel_index])
+        label_ax = band_axes.get(f"labels_{panel_index}")
+        if label_ax is not None:
+            _draw_case_labels(label_ax, panel_labels[panel_index])
     footer_ax = band_axes["footer"]
     _add_heatmap_footer(footer_ax, columns=4)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2173,7 +2321,6 @@ def generate_heatmaps(
     # deep, and Windows may reject an otherwise valid final PNG path.
     stage_dir = output_dir / f".h{uuid.uuid4().hex[:12]}"
     stage_dir.mkdir(parents=True, exist_ok=False)
-    staged_paths: list[Path] = []
     panel_specs = _heatmap_panel_specs(layout)
     combine_panels = _should_combine_panels(layout.settings, len(panel_specs))
     # Project and scope are report context and belong in the figure caption,
@@ -2184,47 +2331,48 @@ def generate_heatmaps(
         title_parts.append(display_heatmap_set_name(title_prefix, parsed))
     title_parts.append("Sustained SDPF incidence")
     title = " · ".join(title_parts)
-    try:
-        if combine_panels:
-            max_panels = max(1, layout.settings.max_panels_per_heatmap)
-            pages = [
-                panel_specs[index:index + max_panels]
-                for index in range(0, len(panel_specs), max_panels)
-            ] or [()]
-            show_page_number = _faceted_page_number_required(pages)
-            for page_index, page_specs in enumerate(pages, start=1):
-                if check_cancel is not None:
-                    check_cancel()
-                filename = (
-                    f"MM_{_safe_filename(voltage)}_faceted_{page_index:02d}_heatmap.png"
-                )
-                output_path = stage_dir / filename
-                _plot_faceted_layout(
-                    layout,
-                    page_specs,
-                    output_path,
-                    _title_with_split(
+    jobs: list[_HeatmapRenderJob] = []
+    if combine_panels:
+        max_panels = max(1, layout.settings.max_panels_per_heatmap)
+        pages = [
+            tuple(panel_specs[index:index + max_panels])
+            for index in range(0, len(panel_specs), max_panels)
+        ] or [()]
+        show_page_number = _faceted_page_number_required(pages)
+        for page_index, page_specs in enumerate(pages, start=1):
+            filename = f"MM_{_safe_filename(voltage)}_faceted_{page_index:02d}_heatmap.png"
+            jobs.append(
+                _HeatmapRenderJob(
+                    layout=layout,
+                    output_path=stage_dir / filename,
+                    title=_title_with_split(
                         title,
                         layout,
                         [spec.split_value for spec in page_specs],
                     ),
-                    page_index,
-                    len(pages),
+                    faceted=True,
+                    specs=page_specs,
+                    page_index=page_index,
+                    page_count=len(pages),
                     show_page_number=show_page_number,
                 )
-                staged_paths.append(output_path)
-        else:
-            for spec in panel_specs:
-                if check_cancel is not None:
-                    check_cancel()
-                part_layout = _layout_for_cases(layout, spec.cases)
-                suffix = _safe_filename(spec.split_value or "All")
-                part_suffix = f"_{spec.part_index:02d}" if spec.part_count > 1 else ""
-                filename = f"MM_{_safe_filename(voltage)}_{suffix}{part_suffix}_heatmap.png"
-                output_path = stage_dir / filename
-                panel_title = _title_with_split(title, layout, [spec.split_value])
-                _plot_layout(part_layout, output_path, panel_title, spec.split_value)
-                staged_paths.append(output_path)
+            )
+    else:
+        for spec in panel_specs:
+            part_layout = _layout_for_cases(layout, spec.cases)
+            suffix = _safe_filename(spec.split_value or "All")
+            part_suffix = f"_{spec.part_index:02d}" if spec.part_count > 1 else ""
+            filename = f"MM_{_safe_filename(voltage)}_{suffix}{part_suffix}_heatmap.png"
+            jobs.append(
+                _HeatmapRenderJob(
+                    layout=part_layout,
+                    output_path=stage_dir / filename,
+                    title=_title_with_split(title, layout, [spec.split_value]),
+                    split_value=spec.split_value,
+                )
+            )
+    try:
+        staged_paths = _render_heatmap_jobs(jobs, log=log, check_cancel=check_cancel)
 
         if check_cancel is not None:
             check_cancel()

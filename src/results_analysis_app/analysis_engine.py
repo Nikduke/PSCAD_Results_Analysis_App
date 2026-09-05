@@ -202,12 +202,13 @@ def _current_sustained_plot_results(
     payload: Mapping[str, Any] | None = None,
     voltage_keys: Iterable[str] | None = None,
     log: LogFn | None = None,
+    cache_validation: sustained_sdpf.SustainedSDPFCacheValidation | None = None,
 ) -> dict[str, dict[str, dict[str, sustained_sdpf.SustainedSDPFResult]]]:
     saved_payload = payload if isinstance(payload, Mapping) else sustained_sdpf.load_results(
         project_root,
         scope_folder,
     )
-    validation = sustained_sdpf.validate_result_cache(
+    validation = cache_validation or sustained_sdpf.validate_result_cache(
         saved_payload,
         project_root,
         settings,
@@ -229,6 +230,7 @@ def _current_sustained_plot_results(
         dict[str, dict[str, sustained_sdpf.SustainedSDPFResult]],
     ] = {}
     parsed_ranking = ranking_settings or sustained_sdpf.SustainedSDPFRankingSettings()
+    enabled = set(parsed_ranking.enabled_selections())
     for voltage in keys:
         selections, result_validation = sustained_sdpf.current_representatives_for_voltage(
             saved_payload,
@@ -246,7 +248,6 @@ def _current_sustained_plot_results(
                     f"{result_validation.reason}.",
                 )
             continue
-        enabled = set(parsed_ranking.enabled_selections())
         filtered = {
             population: {
                 metric: result
@@ -317,6 +318,7 @@ def _expected_sustained_plot_results(
     payload: Mapping[str, Any] | None,
     voltage_keys: Iterable[str] | None,
     log: LogFn | None,
+    cache_validation: sustained_sdpf.SustainedSDPFCacheValidation | None = None,
 ) -> dict[tuple[str, str, int, str], sustained_sdpf.SustainedSDPFResult]:
     expected: dict[tuple[str, str, int, str], sustained_sdpf.SustainedSDPFResult] = {}
     for voltage_key, population_selections in _current_sustained_plot_results(
@@ -327,6 +329,7 @@ def _expected_sustained_plot_results(
         payload=payload,
         voltage_keys=voltage_keys,
         log=log,
+        cache_validation=cache_validation,
     ).items():
         for selections in population_selections.values():
             for result in selections.values():
@@ -411,6 +414,9 @@ def create_plot_batches(
     sustained_sdpf_ranking_settings: dict[str, Any] | None = None,
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
     excel_waveform_exports_enabled: bool = True,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> list[Path]:
     outputs: list[Path] = []
     selected_events = list(events)
@@ -481,11 +487,13 @@ def create_plot_batches(
                 payload = (sustained_payloads_by_scope or {}).get(scope.folder)
                 if not isinstance(payload, Mapping):
                     payload = sustained_sdpf.load_results(project_root, scope.folder)
-                validation = sustained_sdpf.validate_result_cache(
-                    payload,
-                    project_root,
-                    expected_settings,
-                )
+                validation = (sustained_cache_validations_by_scope or {}).get(scope.folder)
+                if validation is None:
+                    validation = sustained_sdpf.validate_result_cache(
+                        payload,
+                        project_root,
+                        expected_settings,
+                    )
                 if not validation.valid:
                     _log(
                         log,
@@ -506,6 +514,7 @@ def create_plot_batches(
                         payload=payload,
                         voltage_keys=selected_voltages,
                         log=log,
+                        cache_validation=validation,
                     )
                     sustained_rows = _sustained_plot_rows(
                         (
@@ -1144,18 +1153,9 @@ def _render_plot_plans_parallel(
 
 def _terminate_plot_executor(executor: ProcessPoolExecutor) -> None:
     """Stop active plotting workers promptly after cancellation or failure."""
-    processes = tuple(getattr(executor, "_processes", {}).values())
-    for process in processes:
-        try:
-            process.terminate()
-        except (OSError, AttributeError):
-            continue
-    executor.shutdown(wait=False, cancel_futures=True)
-    for process in processes:
-        try:
-            process.join(timeout=1.0)
-        except (OSError, AttributeError):
-            continue
+    from pscad_plotter_app_v3.services.plot_execution import terminate_process_executor
+
+    terminate_process_executor(executor)
 
 
 def _render_plot_plans(
@@ -1199,6 +1199,9 @@ def _render_plot_batches_direct(
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
     sustained_voltage_keys: Iterable[str] | None = None,
     excel_waveform_exports_enabled: bool = True,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> None:
     _cancel(check_cancel)
     selected_scopes = list(scopes)
@@ -1257,6 +1260,9 @@ def _render_plot_batches_direct(
                         (sustained_payloads_by_scope or {}).get(scope.folder),
                         voltage_keys,
                         log,
+                        cache_validation=(sustained_cache_validations_by_scope or {}).get(
+                            scope.folder
+                        ),
                     )
                     batch_is_current = not import_result.errors and _sustained_batch_is_current(
                         import_result.requests,
@@ -1431,6 +1437,9 @@ def render_plot_batches(
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
     sustained_voltage_keys: Iterable[str] | None = None,
     excel_waveform_exports_enabled: bool = True,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> None:
     selected_scopes = list(scopes)
     selected_events = list(events)
@@ -1446,6 +1455,7 @@ def render_plot_batches(
         sustained_payloads_by_scope=sustained_payloads_by_scope,
         sustained_voltage_keys=sustained_voltage_keys,
         excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+        sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
     )
     if sustained_sdpf_settings is not None or sustained_sdpf.SUSTAINED_SDPF in selected_events:
         render_sustained_heatmaps(
@@ -1457,6 +1467,7 @@ def render_plot_batches(
             log=log,
             check_cancel=check_cancel,
             sustained_payloads_by_scope=sustained_payloads_by_scope,
+            sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
         )
 
 
@@ -1469,6 +1480,9 @@ def render_sustained_heatmaps(
     sustained_sdpf_heatmap_settings: Any | None = None,
     event_times: dict[str, float] | None = None,
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> None:
     """Regenerate Sustained SDPF heatmaps from saved analysis results."""
     selected_scopes = list(scopes)
@@ -1509,11 +1523,13 @@ def render_sustained_heatmaps(
             scope.folder,
             voltages,
         )
-        validation = sustained_sdpf.validate_result_cache(
-            payload,
-            project_root,
-            sustained_settings,
-        )
+        validation = (sustained_cache_validations_by_scope or {}).get(scope.folder)
+        if validation is None:
+            validation = sustained_sdpf.validate_result_cache(
+                payload,
+                project_root,
+                sustained_settings,
+            )
         if not validation.valid:
             _log(
                 log,

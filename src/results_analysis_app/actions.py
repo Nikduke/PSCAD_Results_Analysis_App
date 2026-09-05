@@ -289,6 +289,9 @@ def create_plot_batches(
     sustained_sdpf_ranking_settings_by_project: dict[str, object] | None = None,
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
     excel_waveform_exports_enabled: bool = True,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> list[Path]:
     """Create scope/event plot batch workbooks from existing envelope workbooks."""
     selected_scopes = list(scopes)
@@ -316,6 +319,7 @@ def create_plot_batches(
                 ).get(str(root)),
                 sustained_payloads_by_scope=sustained_payloads_by_scope,
                 excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+                sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
             )
         )
     return outputs
@@ -336,6 +340,9 @@ def render_plot_batches(
     sustained_payloads_by_scope: Mapping[str, Mapping[str, Any]] | None = None,
     sustained_voltage_keys: Iterable[str] | None = None,
     excel_waveform_exports_enabled: bool = True,
+    sustained_cache_validations_by_scope: Mapping[
+        str, sustained_sdpf.SustainedSDPFCacheValidation
+    ] | None = None,
 ) -> None:
     """Render existing scope/event plot batches into generated plot folders."""
     selected_scopes = list(scopes)
@@ -365,6 +372,7 @@ def render_plot_batches(
             sustained_payloads_by_scope=sustained_payloads_by_scope,
             sustained_voltage_keys=sustained_voltage_keys,
             excel_waveform_exports_enabled=excel_waveform_exports_enabled,
+            sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
         )
 
 
@@ -399,7 +407,7 @@ def run_analysis_pipeline(
     voltages: Iterable[str],
     events: Iterable[str],
     event_times: dict[str, float] | None = None,
-    dashboard_figure_ids: Iterable[str] = (),
+    dashboard_figure_ids_by_project: Mapping[str, Iterable[str]] | None = None,
     envelope_workers: int | None = None,
     envelope_time_step: float | None = None,
     envelope_time_end: float | None = None,
@@ -481,11 +489,23 @@ def run_analysis_pipeline(
         )
 
         sustained_payloads_by_scope: dict[str, Mapping[str, Any]] = {}
-        if sustained_sdpf.SustainedSDPFSettings.from_mapping(
+        sustained_cache_validations_by_scope: dict[
+            str, sustained_sdpf.SustainedSDPFCacheValidation
+        ] = {}
+        parsed_sustained_settings = sustained_sdpf.SustainedSDPFSettings.from_mapping(
             sustained_sdpf_settings
-        ).enabled:
+        )
+        if parsed_sustained_settings.enabled:
             sustained_payloads_by_scope = {
                 scope.folder: sustained_sdpf.load_results(root, scope.folder)
+                for scope in selected_scopes
+            }
+            sustained_cache_validations_by_scope = {
+                scope.folder: sustained_sdpf.validate_result_cache(
+                    sustained_payloads_by_scope.get(scope.folder),
+                    root,
+                    parsed_sustained_settings,
+                )
                 for scope in selected_scopes
             }
 
@@ -502,6 +522,7 @@ def run_analysis_pipeline(
             sustained_sdpf_ranking_settings_by_project=sustained_sdpf_ranking_settings_by_project,
             excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             sustained_payloads_by_scope=sustained_payloads_by_scope,
+            sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
             log=log,
             check_cancel=check_cancel,
         )
@@ -518,6 +539,7 @@ def run_analysis_pipeline(
             event_times=event_times,
             sustained_sdpf_limit_overrides_by_project=sustained_sdpf_limit_overrides_by_project,
             sustained_payloads_by_scope=sustained_payloads_by_scope,
+            sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
             sustained_voltage_keys=selected_voltages,
             excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             log=log,
@@ -531,7 +553,7 @@ def run_analysis_pipeline(
                 selected_scopes,
                 selected_voltages,
                 selected_events,
-                dashboard_figure_ids,
+                dashboard_figure_ids_by_project=dashboard_figure_ids_by_project,
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
                 sustained_sdpf_heatmap_settings_by_project=sustained_sdpf_heatmap_settings_by_project,
@@ -539,6 +561,9 @@ def run_analysis_pipeline(
                 render_heatmaps=False,
                 sustained_payloads_by_project_scope={
                     str(root): sustained_payloads_by_scope,
+                },
+                sustained_cache_validations_by_project_scope={
+                    str(root): sustained_cache_validations_by_scope,
                 },
                 event_times=event_times,
                 log=log,
