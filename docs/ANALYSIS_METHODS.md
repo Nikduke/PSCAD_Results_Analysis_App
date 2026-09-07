@@ -46,7 +46,7 @@ files. `Run analysis` and report rebuilding do not refresh dashboard data.
 
 The source code and focused tests are authoritative. The compact cache
 versions currently governing invalidation are: project scan **7**, project
-analysis **1**, envelope manifest **2**, Sustained result JSON **19**, Sustained
+analysis **1**, envelope manifest **3**, Sustained result JSON **19**, Sustained
 summary workbook **4**, plot batch manifest **2**, and report/report-layout
 manifests **2/3**. No processed waveform arrays are persisted.
 
@@ -62,7 +62,7 @@ For each selected project, scope, and voltage, the app follows this sequence:
 6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. If Sustained SDPF is enabled, assess each raw fixed phase/pair from the same loaded worker data; no separate `.out` read is performed.
 7. Write the base workbook, resonance workbook, combined Excel charts, compact Sustained SDPF JSON metadata, rank-sorted Sustained SDPF summary workbook, plot batches, rendered waveform plots, and DOCX reports through the selected workflow steps. Automatically generated waveform plot batches request Excel exports by default; the Settings option `Create automatic Excel waveform exports` can disable those `.xlsx` writes without changing the PNG plots or analysis results.
 
-Voltage levels are processed sequentially. Runs within one voltage use one shared bounded process pool. The automatic worker setting selects the nearest quarter of detected logical CPUs, capped at 60 and reduced when fewer runs exist. This is intentionally an SSD-oriented default; a positive manual value remains available when a machine or workload needs a different balance.
+The selected voltage levels submit their raw-read jobs concurrently through one shared bounded process pool. The pool cap is shared across voltages, so concurrency does not multiply the configured worker count. The automatic worker setting selects the ceiling of 80% of detected logical CPUs, capped at 60 and reduced when fewer runs exist. A positive manual value remains available when a machine or workload needs a different balance. This scheduling change does not alter envelope, resonance, exclusion, or Sustained SDPF calculations.
 
 ### 1.1 Analysis paths and selection rules
 
@@ -408,7 +408,7 @@ The following values are persisted in the session and passed into the build/chec
 |---|---|
 | Envelope time step | `0.002 s` |
 | Envelope time end | Project `Final duration` automatically; manual positive cap when automatic mode is cleared; `1.0 s` fallback if timing is unavailable |
-| Envelope workers | Automatic nearest-quarter logical CPU selection, capped at `60`; manual override available |
+| Envelope workers | Automatic ceiling of 80% of logical CPUs, capped at `60`; manual override available |
 | Frequency fallback | `50 Hz`, superseded by project `Input_Data` frequency when available |
 | High Voltage factor | `5.0 × Um × sqrt(2)` |
 | NonConv `CB_IIp` / `CB_IIr` | `400` / `200` |

@@ -526,18 +526,10 @@ def _finite_segments(time: np.ndarray, values: np.ndarray) -> list[tuple[np.ndar
     values = values[order]
     finite_values = np.isfinite(values)
     segments: list[tuple[np.ndarray, np.ndarray]] = []
-    segment_start = 0
-    for index in range(len(values) + 1):
-        if index < len(values) and finite_values[index]:
-            continue
-        if index - segment_start >= 2:
-            segments.append(
-                (
-                    time[segment_start:index],
-                    values[segment_start:index],
-                )
-            )
-        segment_start = index + 1
+    boundaries = np.flatnonzero(np.diff(np.r_[False, finite_values, False]))
+    for segment_start, segment_end in boundaries.reshape(-1, 2):
+        if segment_end - segment_start >= 2:
+            segments.append((time[segment_start:segment_end], values[segment_start:segment_end]))
     return segments
 
 
@@ -596,8 +588,10 @@ def _full_cycle_tracks(
             valid_values: list[np.ndarray] = []
             boundary_tolerance = max(1.5 * median_dt, NUMERIC_TOLERANCE * 100.0)
             for cycle in unique_cycles:
-                times_for_cycle = segment_time_part[cycle_index == cycle]
-                values_for_cycle = segment_values_part[cycle_index == cycle]
+                cycle_start_index = int(np.searchsorted(cycle_index, cycle, side="left"))
+                cycle_end_index = int(np.searchsorted(cycle_index, cycle, side="right"))
+                times_for_cycle = segment_time_part[cycle_start_index:cycle_end_index]
+                values_for_cycle = segment_values_part[cycle_start_index:cycle_end_index]
                 if len(values_for_cycle) < 2:
                     continue
                 cycle_start = reference_time + int(cycle) * period

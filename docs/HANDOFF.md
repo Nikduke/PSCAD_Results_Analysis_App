@@ -125,7 +125,7 @@ every selected project.
 | generated folders | authoritative current workbooks, PNG/Excel outputs, and DOCX reports | duplicate cache manifests in every output folder |
 
 Current source versions are: project scan cache **7**, project analysis cache
-**1**, voltage-envelope manifest **2**, Sustained result JSON **19**, Sustained
+**1**, voltage-envelope manifest **3**, Sustained result JSON **19**, Sustained
 summary workbook **4**, plot-batch manifest **2**, and report/report-layout
 manifests **2/3**. The embedded plotter's SQLite/MM caches are **2/1**.
 Obsolete or incomplete artifacts are rebuilt; they are not treated as valid
@@ -202,8 +202,10 @@ covered by plotting tests.
    envelope data, merges the selected runs, and writes the base workbook. A
    processed envelope data exists only during the current build, and the
    single project `.state/analysis_cache.json` can skip the complete stage
-   when its artifacts are current. One bounded process pool is shared within
-   a voltage; voltage levels remain sequential. Stress/Late/No-settle consume
+   when its artifacts are current. Selected voltage levels submit reads
+   concurrently through one shared bounded process pool, so the worker cap is
+   not multiplied by voltage count. Presentation-only changes can reuse
+   validated calculation artifacts without rereading raw waveforms. Stress/Late/No-settle consume
    the envelope data. Sustained SDPF consumes the raw phase/pair arrays already
    loaded by the envelope workers; it must not create a second raw-read pass.
    The project analysis cache is versioned and stores only signatures and
@@ -458,11 +460,11 @@ Sustained SDPF duration needs the corresponding data/check build.
 
 ## Important settings and performance decisions
 
-- Envelope workers: `Automatic` is on by default. It selects the nearest
-  quarter of detected logical CPUs, capped at 60 and reduced when fewer runs
-  exist. Clearing Automatic enables a positive manual override. This is a
-  measured SSD-oriented default, not a promise that all machines scale with
-  every core.
+- Envelope workers: `Automatic` is on by default. It selects the ceiling of
+  80% of detected logical CPUs, capped at 60 and reduced when fewer runs exist.
+  The cap is shared across concurrently submitted voltage levels. Clearing
+  Automatic enables a positive manual override. This is a measured SSD-oriented
+  default, not a promise that all machines scale with every core.
 - Envelope duration: automatic project duration by default; manual end time is
   supported for targeted studies.
 - Automatic waveform Excel exports are enabled by default. Clearing the option

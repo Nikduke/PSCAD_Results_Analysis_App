@@ -735,6 +735,25 @@ def test_envelope_manifest_validates_artifacts_and_return_outputs(tmp_path) -> N
     assert voltage_envelope._envelope_manifest_matches(project_root, "signature") is None
 
 
+def test_envelope_source_inventory_matches_per_file_manifest(tmp_path) -> None:
+    from results_analysis_app import voltage_envelope
+
+    project_root = tmp_path / "Project"
+    source_dir = project_root / "Case_folder" / "C1.1"
+    source_dir.mkdir(parents=True)
+    inf_path = source_dir / "C1_r00001.inf"
+    inf_path.write_text("descriptor", encoding="utf-8")
+    matching_out = source_dir / "C1_r00001_01.out"
+    matching_out.write_text("waveform", encoding="utf-8")
+    (source_dir / "C1_r00002_01.out").write_text("other", encoding="utf-8")
+
+    inventory = voltage_envelope._source_file_inventory(project_root, [inf_path])
+
+    assert voltage_envelope._run_source_manifest(project_root, inf_path) == (
+        voltage_envelope._run_source_manifest(project_root, inf_path, inventory)
+    )
+
+
 def test_sustained_cache_signature_tracks_summary_workbook_version() -> None:
     from results_analysis_app import sustained_sdpf, voltage_envelope
 
@@ -779,21 +798,21 @@ def test_nonconvergent_scan_process_workers_preserve_results(tmp_path) -> None:
     ]
 
 
-def test_automatic_envelope_workers_use_nearest_quarter_with_safe_cap(monkeypatch) -> None:
+def test_automatic_envelope_workers_use_eighty_percent_with_safe_cap(monkeypatch) -> None:
     from results_analysis_app import voltage_envelope
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 32, raising=False)
-    assert voltage_envelope._configured_worker_count(0) == 8
+    assert voltage_envelope._configured_worker_count(0) == 26
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 128, raising=False)
-    assert voltage_envelope._configured_worker_count(0) == 32
+    assert voltage_envelope._configured_worker_count(0) == 60
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: None, raising=False)
     monkeypatch.setattr(voltage_envelope.os, "cpu_count", lambda: 8)
-    assert voltage_envelope._configured_worker_count(0) == 2
+    assert voltage_envelope._configured_worker_count(0) == 7
 
     monkeypatch.setattr(voltage_envelope.os, "cpu_count", lambda: 6)
-    assert voltage_envelope._configured_worker_count(0) == 2
+    assert voltage_envelope._configured_worker_count(0) == 5
 
     monkeypatch.setattr(voltage_envelope.os, "process_cpu_count", lambda: 1, raising=False)
     assert voltage_envelope._configured_worker_count(0) == 1
@@ -840,7 +859,7 @@ def test_envelope_build_reuses_shared_run_executor(tmp_path, monkeypatch) -> Non
         build_charts=False,
     )
 
-    assert [call[0] for call in calls] == ["66", "161"]
+    assert sorted(call[0] for call in calls) == ["161", "66"]
     assert [call[1] for call in calls] == [2.5, 2.5]
     assert [call[2] for call in calls] == [4, 4]
     assert len({id(call[3]) for call in calls}) == 1

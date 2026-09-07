@@ -76,7 +76,9 @@ MAX_WORKERS_ENV = "RESULTS_ANALYSIS_ENVELOPE_WORKERS"
 # failure.  The entry is kept with the project's other stage fingerprints and
 # contains no processed waveform data.
 LEGACY_ENVELOPE_MANIFEST_FILENAME = ".envelope_manifest.json"
-ENVELOPE_MANIFEST_VERSION = 2
+ENVELOPE_MANIFEST_VERSION = 3
+ENVELOPE_CALCULATION_VERSION = 1
+ENVELOPE_PRESENTATION_VERSION = 1
 
 ENVELOPE_HEADERS = [
     "Time (s)",
@@ -155,6 +157,94 @@ def _file_manifest_entry(project_root: Path, path: Path) -> dict[str, Any]:
     }
 
 
+@dataclass(slots=True)
+class _SourceFileInventory:
+    """One directory listing shared by the envelope cache fingerprints."""
+
+    records: dict[str, dict[str, Any]]
+    paths_by_directory: dict[str, tuple[Path, ...]]
+
+    @staticmethod
+    def _key(path: Path) -> str:
+        try:
+            return str(path.resolve(strict=False)).casefold()
+        except (OSError, RuntimeError):
+            return str(path).casefold()
+
+    def record(self, path: Path, project_root: Path) -> dict[str, Any]:
+        record = self.records.get(self._key(path))
+        if record is not None:
+            return dict(record)
+        return _file_manifest_entry(project_root, path)
+
+    def directory_paths(self, directory: Path) -> tuple[Path, ...]:
+        return self.paths_by_directory.get(self._key(directory), ())
+
+
+def _source_file_inventory(
+    project_root: Path,
+    inf_paths: Iterable[Path],
+    extra_paths: Iterable[Path] = (),
+) -> _SourceFileInventory:
+    """Collect source file metadata with one scan per input directory.
+
+    The envelope and Sustained manifests need the same small size/mtime
+    records.  Building the directory index once avoids a separate glob/stat
+    pass for every `.inf` file and every selected scope.
+    """
+    root = Path(project_root)
+    root_resolved = root.resolve()
+    directories = list(dict.fromkeys(Path(path).parent for path in inf_paths))
+    records: dict[str, dict[str, Any]] = {}
+    paths_by_directory: dict[str, tuple[Path, ...]] = {}
+
+    def relative_path(path: Path) -> str:
+        try:
+            return path.relative_to(root_resolved).as_posix()
+        except (OSError, ValueError):
+            return str(path.resolve(strict=False))
+
+    def add_path(path: Path, stat_result: os.stat_result | None = None) -> None:
+        key = _SourceFileInventory._key(path)
+        if key in records:
+            return
+        if stat_result is None:
+            try:
+                stat_result = path.stat()
+            except OSError:
+                records[key] = {"path": relative_path(path), "missing": True}
+                return
+        records[key] = {
+            "path": relative_path(path),
+            "size": int(stat_result.st_size),
+            "mtime_ns": int(stat_result.st_mtime_ns),
+        }
+
+    for directory in directories:
+        found: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    suffix = Path(entry.name).suffix.casefold()
+                    if suffix not in {".inf", ".out"}:
+                        continue
+                    path = directory / entry.name
+                    found.append(path)
+                    try:
+                        add_path(path, entry.stat())
+                    except OSError:
+                        add_path(path)
+        except OSError:
+            pass
+        paths_by_directory[_SourceFileInventory._key(directory)] = tuple(
+            sorted(found, key=lambda path: path.name.casefold())
+        )
+
+    for path in extra_paths:
+        add_path(Path(path))
+    return _SourceFileInventory(records, paths_by_directory)
+
+
 def _remove_legacy_envelope_cache(project_root: Path) -> None:
     output_root = project_root / "Voltage_envelope"
     try:
@@ -164,14 +254,27 @@ def _remove_legacy_envelope_cache(project_root: Path) -> None:
     shutil.rmtree(output_root / ".run_cache", ignore_errors=True)
 
 
-def _run_source_manifest(project_root: Path, inf_path: Path) -> list[dict[str, Any]]:
+def _run_source_manifest(
+    project_root: Path,
+    inf_path: Path,
+    source_inventory: _SourceFileInventory | None = None,
+) -> list[dict[str, Any]]:
     candidates = [inf_path]
-    try:
-        candidates.extend(sorted(inf_path.parent.glob(f"{inf_path.stem}*.out")))
-    except OSError:
-        pass
+    if source_inventory is None:
+        try:
+            candidates.extend(sorted(inf_path.parent.glob(f"{inf_path.stem}*.out")))
+        except OSError:
+            pass
+        return [_file_manifest_entry(project_root, path) for path in dict.fromkeys(candidates)]
+
+    stem = inf_path.stem.casefold()
+    candidates.extend(
+        path
+        for path in source_inventory.directory_paths(inf_path.parent)
+        if path.suffix.casefold() == ".out" and path.name.casefold().startswith(stem)
+    )
     return [
-        _file_manifest_entry(project_root, path)
+        source_inventory.record(path, project_root)
         for path in dict.fromkeys(candidates)
     ]
 
@@ -179,36 +282,66 @@ def _run_source_manifest(project_root: Path, inf_path: Path) -> list[dict[str, A
 def _run_source_manifests(
     project_root: Path,
     inf_paths: Iterable[Path],
+    source_inventory: _SourceFileInventory | None = None,
 ) -> dict[Path, list[dict[str, Any]]]:
     return {
-        path: _run_source_manifest(project_root, path)
+        path: _run_source_manifest(project_root, path, source_inventory)
         for path in sorted(set(inf_paths))
     }
 
 
-def _envelope_manifest_matches(
+def _validated_envelope_manifest(
     project_root: Path,
-    signature: str,
-) -> list[Path] | None:
+    calculation_signature: str,
+) -> tuple[dict[str, Any], dict[str, Path]] | None:
     cache = storage.load_project_analysis_cache(project_root)
     payload = cache.get("envelope")
     if not isinstance(payload, dict) or payload.get("version") != ENVELOPE_MANIFEST_VERSION:
         return None
-    if payload.get("signature") != signature:
+    stored_signature = payload.get("calculation_signature", payload.get("signature"))
+    if stored_signature != calculation_signature:
         return None
     output_records = payload.get("outputs")
-    if not isinstance(output_records, list):
+    calculation_records = payload.get("calculation_outputs", output_records)
+    if not isinstance(output_records, list) or not isinstance(calculation_records, list):
         return None
     outputs_by_record: dict[str, Path] = {}
-    for record in output_records:
+    for record in calculation_records:
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
             return None
         path = project_root / Path(record["path"])
         if _file_manifest_entry(project_root, path) != record:
             return None
         outputs_by_record[record["path"]] = path
+    for record in output_records:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            return None
+        if record["path"] in outputs_by_record:
+            continue
+        path = project_root / Path(record["path"])
+        if path.is_file() and _file_manifest_entry(project_root, path) == record:
+            outputs_by_record[record["path"]] = path
+    return payload, outputs_by_record
 
-    return_records = payload.get("return_outputs", output_records)
+
+def _envelope_manifest_payload(
+    project_root: Path,
+    calculation_signature: str,
+) -> dict[str, Any] | None:
+    validated = _validated_envelope_manifest(project_root, calculation_signature)
+    return validated[0] if validated is not None else None
+
+
+def _envelope_manifest_matches(
+    project_root: Path,
+    signature: str,
+) -> list[Path] | None:
+    validated = _validated_envelope_manifest(project_root, signature)
+    if validated is None:
+        return None
+    payload, outputs_by_record = validated
+
+    return_records = payload.get("return_outputs", payload.get("outputs", []))
     if not isinstance(return_records, list):
         return None
     outputs: list[Path] = []
@@ -227,6 +360,11 @@ def _write_envelope_manifest(
     signature: str,
     outputs: Iterable[Path],
     return_outputs: Iterable[Path] | None = None,
+    *,
+    presentation_signature: str | None = None,
+    artifacts: dict[str, Any] | None = None,
+    calculation_outputs: Iterable[Path] | None = None,
+    presentation_outputs: Iterable[Path] | None = None,
 ) -> None:
     output_paths = list(dict.fromkeys(Path(output) for output in outputs))
     return_paths = list(
@@ -245,17 +383,207 @@ def _write_envelope_manifest(
         for path in return_paths
         if path.is_file()
     ]
+    calculation_paths = list(
+        dict.fromkeys(
+            Path(output)
+            for output in (calculation_outputs if calculation_outputs is not None else output_paths)
+        )
+    )
+    calculation_records = [
+        _file_manifest_entry(project_root, path)
+        for path in calculation_paths
+        if path.is_file()
+    ]
+    presentation_paths = list(
+        dict.fromkeys(
+            Path(output)
+            for output in (presentation_outputs if presentation_outputs is not None else ())
+        )
+    )
+    presentation_records = [
+        _file_manifest_entry(project_root, path)
+        for path in presentation_paths
+        if path.is_file()
+    ]
     cache = storage.load_project_analysis_cache(project_root)
-    cache["envelope"] = {
+    envelope_cache: dict[str, Any] = {
         "version": ENVELOPE_MANIFEST_VERSION,
         "signature": signature,
+        "calculation_signature": signature,
         "outputs": sorted(records, key=lambda item: str(item["path"]).casefold()),
+        "calculation_outputs": sorted(
+            calculation_records,
+            key=lambda item: str(item["path"]).casefold(),
+        ),
+        "presentation_outputs": sorted(
+            presentation_records,
+            key=lambda item: str(item["path"]).casefold(),
+        ),
         "return_outputs": sorted(
             return_records,
             key=lambda item: str(item["path"]).casefold(),
         ),
     }
+    if presentation_signature is not None:
+        envelope_cache["presentation_signature"] = presentation_signature
+    if artifacts is not None:
+        envelope_cache["artifacts"] = artifacts
+    cache["envelope"] = envelope_cache
     storage.save_project_analysis_cache(project_root, cache)
+
+
+def _refresh_cached_presentation(
+    project_root: Path,
+    payload: dict[str, Any] | None,
+    voltage_keys: list[str],
+    chart_axis_limits: dict[str, float | None],
+    chart_axis_limits_by_voltage: dict[str, dict[str, float | None]] | None,
+    event_times: dict[str, float] | None,
+    show_sa_label: bool,
+    chart_top_left_cell: str | None,
+    chart_size: dict[str, float],
+    build_charts: bool,
+    log: LogFn | None,
+    check_cancel: CancelFn | None,
+    calculation_signature: str,
+    presentation_signature: str,
+) -> list[Path] | None:
+    """Refresh chart/display artifacts while retaining valid calculations."""
+    if not isinstance(payload, dict):
+        return None
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+
+    def artifact_paths(key: str) -> list[Path] | None:
+        raw_paths = artifacts.get(key, [])
+        if not isinstance(raw_paths, list):
+            return None
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str):
+                return None
+            path = project_root / Path(raw_path)
+            if not path.is_file():
+                return None
+            paths.append(path)
+        return paths
+
+    result_outputs = artifact_paths("result_outputs")
+    data_outputs = artifact_paths("data_outputs")
+    resonance_workbooks = artifact_paths("resonance_workbooks")
+    sustained_summary_outputs = artifact_paths("sustained_summary_outputs")
+    raw_chart_inputs = artifacts.get("chart_inputs", [])
+    if None in (result_outputs, data_outputs, resonance_workbooks, sustained_summary_outputs):
+        return None
+    if not isinstance(raw_chart_inputs, list):
+        return None
+    chart_inputs: list[tuple[str, Path, Path]] = []
+    for item in raw_chart_inputs:
+        if not isinstance(item, dict):
+            return None
+        voltage = str(item.get("voltage", ""))
+        envelope_raw = item.get("envelope")
+        combined_raw = item.get("combined")
+        if not isinstance(envelope_raw, str) or not isinstance(combined_raw, str):
+            return None
+        envelope_path = project_root / Path(envelope_raw)
+        combined_path = project_root / Path(combined_raw)
+        if not envelope_path.is_file():
+            return None
+        chart_inputs.append((voltage, envelope_path, combined_path))
+
+    outputs = list(result_outputs or [])
+    chart_outputs: list[Path] = []
+    if build_charts:
+        with ExitStack() as stack:
+            excel = stack.enter_context(excel_app()) if data_outputs or chart_inputs or resonance_workbooks else None
+            for workbook_path in data_outputs or []:
+                _cancel(check_cancel)
+                autofit_workbook(excel, workbook_path)
+            outputs.extend(sustained_summary_outputs or [])
+            for voltage_key, envelope_path, combined_path in chart_inputs:
+                if voltage_key not in voltage_keys:
+                    continue
+                _cancel(check_cancel)
+                chart_outputs.append(
+                    create_combined_envelope_plot(
+                        envelope_path,
+                        combined_path,
+                        excel,
+                        axis_limits_override=chart_axis_limits,
+                        axis_limits_by_voltage=chart_axis_limits_by_voltage,
+                        event_times=event_times,
+                        show_sa_label=show_sa_label,
+                        chart_top_left_cell=chart_top_left_cell,
+                        chart_size=chart_size,
+                    )
+                )
+            for workbook_path in resonance_workbooks or []:
+                _cancel(check_cancel)
+                create_resonance_check_charts(
+                    workbook_path,
+                    excel,
+                    x_max=chart_axis_limits["x_max"],
+                    x_major=chart_axis_limits["x_major"],
+                )
+        outputs.extend(chart_outputs)
+    else:
+        if data_outputs:
+            with excel_app() as excel:
+                for workbook_path in data_outputs:
+                    _cancel(check_cancel)
+                    autofit_workbook(excel, workbook_path)
+        outputs.extend(data_outputs or [])
+        outputs.extend(resonance_workbooks or [])
+
+    manifest_outputs = [
+        *outputs,
+        *(data_outputs or []),
+        *(resonance_workbooks or []),
+        *(sustained_summary_outputs or []),
+        *chart_outputs,
+    ]
+    artifacts = {
+        "result_outputs": [
+            _relative_project_path(project_root, path) for path in result_outputs or []
+        ],
+        "data_outputs": [
+            _relative_project_path(project_root, path) for path in data_outputs or []
+        ],
+        "sustained_summary_outputs": [
+            _relative_project_path(project_root, path)
+            for path in sustained_summary_outputs or []
+        ],
+        "resonance_workbooks": [
+            _relative_project_path(project_root, path)
+            for path in resonance_workbooks or []
+        ],
+        "chart_inputs": [
+            {
+                "voltage": voltage,
+                "envelope": _relative_project_path(project_root, envelope_path),
+                "combined": _relative_project_path(project_root, combined_path),
+            }
+            for voltage, envelope_path, combined_path in chart_inputs
+        ],
+    }
+    _write_envelope_manifest(
+        project_root,
+        calculation_signature,
+        manifest_outputs,
+        return_outputs=outputs,
+        presentation_signature=presentation_signature,
+        artifacts=artifacts,
+        calculation_outputs=[
+            *(result_outputs or []),
+            *(data_outputs or []),
+            *(resonance_workbooks or []),
+        ],
+        presentation_outputs=chart_outputs,
+    )
+    _log(log, f"Reused envelope calculations; refreshed presentation: {project_root.name}")
+    return outputs
 
 
 @dataclass
@@ -446,31 +774,44 @@ def build_voltage_envelopes(
 
     voltage_keys = [str(voltage).strip() for voltage in voltages if str(voltage).strip()]
     all_inf_paths = sorted({path for paths in scope_inf_paths.values() for path in paths})
-    run_source_manifests = _run_source_manifests(project_root, all_inf_paths)
+    static_source_paths = [
+        *sorted(project_root.glob("Input_Data_PSCAD*.xlsx")),
+        project_root / "PSCAD_log.txt",
+        project_root / "Plots" / ".plottool_v3" / "limits.json",
+    ]
+    source_inventory = _source_file_inventory(
+        project_root,
+        all_inf_paths,
+        static_source_paths,
+    )
+    run_source_manifests = _run_source_manifests(
+        project_root,
+        all_inf_paths,
+        source_inventory,
+    )
     inf_descriptor_cache = _read_inf_descriptor_cache(all_inf_paths, total_workers, check_cancel, log)
     sustained_source_files_by_scope = {}
     if sustained_settings_obj.enabled:
-        static_source_files = _sustained_source_manifest(project_root, [])
+        static_source_files = _sustained_source_manifest(
+            project_root,
+            [],
+            source_inventory=source_inventory,
+        )
         sustained_source_files_by_scope = {
             scope.folder: _sustained_source_manifest(
                 project_root,
                 scope_inf_paths[scope.folder],
                 static_files=static_source_files,
+                source_inventory=source_inventory,
             )
             for scope in selected_scopes
         }
 
-    manifest_settings = {
-        "build_charts": build_charts,
+    calculation_settings = {
         "project_timing": project_timing,
         "time_step": time_step,
         "time_end": time_end,
         "fallback_frequency": fallback_frequency,
-        "chart_axis_limits": chart_axis_limits,
-        "chart_y_limits_by_voltage": envelope_chart_y_limits_by_voltage,
-        "chart_show_sa_label": envelope_chart_show_sa_label,
-        "chart_top_left_cell": envelope_chart_top_left_cell,
-        "chart_size": chart_size,
         "high_voltage_limit_factor": limit_factor,
         "nonconv_cb_iip_limit": cb_iip_limit,
         "nonconv_cb_iir_limit": cb_iir_limit,
@@ -487,10 +828,20 @@ def build_voltage_envelopes(
         "sustained_limit_warnings": sustained_limit_warnings,
         "sustained_sources": sustained_source_files_by_scope,
     }
-    manifest_settings.update(_sustained_cache_versions(sustained_settings_obj))
+    calculation_settings.update(_sustained_cache_versions(sustained_settings_obj))
+    presentation_settings = {
+        "build_charts": build_charts,
+        "chart_axis_limits": chart_axis_limits,
+        "chart_y_limits_by_voltage": envelope_chart_y_limits_by_voltage,
+        "chart_show_sa_label": envelope_chart_show_sa_label,
+        "chart_top_left_cell": envelope_chart_top_left_cell,
+        "chart_size": chart_size,
+    }
 
     manifest_payload = {
         "version": ENVELOPE_MANIFEST_VERSION,
+        "calculation_version": ENVELOPE_CALCULATION_VERSION,
+        "presentation_version": ENVELOPE_PRESENTATION_VERSION,
         "scopes": [
             {
                 "name": scope.name,
@@ -511,53 +862,104 @@ def build_voltage_envelopes(
             _relative_project_path(project_root, path): source_manifest
             for path, source_manifest in run_source_manifests.items()
         },
-        "settings": manifest_settings,
+        "calculation": calculation_settings,
+        "presentation": presentation_settings,
     }
-    manifest_signature = _cache_signature(manifest_payload)
-    cached_outputs = _envelope_manifest_matches(project_root, manifest_signature)
-    if cached_outputs is not None:
-        _log(log, f"Skipping unchanged envelope build: {project_root.name}")
-        return cached_outputs
+    calculation_payload = {
+        "version": ENVELOPE_CALCULATION_VERSION,
+        "scopes": manifest_payload["scopes"],
+        "scope_inf_paths": manifest_payload["scope_inf_paths"],
+        "voltages": voltage_keys,
+        "sources": manifest_payload["sources"],
+        "settings": calculation_settings,
+    }
+    calculation_signature = _cache_signature(calculation_payload)
+    presentation_signature = _cache_signature(
+        {
+            "version": ENVELOPE_PRESENTATION_VERSION,
+            "calculation_signature": calculation_signature,
+            "settings": presentation_settings,
+        }
+    )
+    cached_manifest = _envelope_manifest_payload(project_root, calculation_signature)
+    if cached_manifest is not None:
+        if cached_manifest.get("presentation_signature") == presentation_signature:
+            cached_outputs = _envelope_manifest_matches(project_root, calculation_signature)
+            if cached_outputs is not None:
+                _log(log, f"Skipping unchanged envelope build: {project_root.name}")
+                return cached_outputs
+        else:
+            refreshed_outputs = _refresh_cached_presentation(
+                project_root,
+                cached_manifest,
+                voltage_keys,
+                chart_axis_limits,
+                envelope_chart_y_limits_by_voltage,
+                event_times,
+                envelope_chart_show_sa_label,
+                envelope_chart_top_left_cell,
+                chart_size,
+                build_charts,
+                log,
+                check_cancel,
+                calculation_signature,
+                presentation_signature,
+            )
+            if refreshed_outputs is not None:
+                return refreshed_outputs
 
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
+    result_outputs: list[Path] = []
     resonance_results: list[resonance_checks.ResonanceResult] = []
     sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = {}
     sustained_observations: dict[tuple[str, str], list[sustained_sdpf.SustainedSDPFResult]] = {}
     sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = {}
-    _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads sequential")
+    _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads concurrent")
+
+    def build_voltage(voltage_key: str) -> _VoltageBuildResult:
+        return _build_voltage_workbooks(
+            project_root,
+            selected_scopes,
+            scope_inf_paths,
+            all_inf_paths,
+            inf_descriptor_cache,
+            voltage_key,
+            voltage_configs,
+            exclusion_matcher,
+            high_voltage_proposals or [],
+            include_override_keys,
+            limit_factor,
+            time_step,
+            time_end,
+            fallback_frequency,
+            df_stat,
+            df_nonconv,
+            total_workers,
+            log,
+            check_cancel,
+            notify_frequency_fallback,
+            resonance_settings_obj,
+            event_times,
+            executor,
+            sustained_worker_settings,
+            sustained_limits_by_voltage.get(voltage_key),
+            project_frequency or fallback_frequency,
+            sustained_source_files_by_scope,
+        )
+
     with ProcessPoolExecutor(max_workers=total_workers) as executor:
-        for voltage_key in voltage_keys:
-            _cancel(check_cancel)
-            result = _build_voltage_workbooks(
-                project_root,
-                selected_scopes,
-                scope_inf_paths,
-                all_inf_paths,
-                inf_descriptor_cache,
-                voltage_key,
-                voltage_configs,
-                exclusion_matcher,
-                high_voltage_proposals or [],
-                include_override_keys,
-                limit_factor,
-                time_step,
-                time_end,
-                fallback_frequency,
-                df_stat,
-                df_nonconv,
-                total_workers,
-                log,
-                check_cancel,
-                notify_frequency_fallback,
-                resonance_settings_obj,
-                event_times,
-                executor,
-                sustained_worker_settings,
-                sustained_limits_by_voltage.get(voltage_key),
-                project_frequency or fallback_frequency,
-                sustained_source_files_by_scope,
-            )
+        if len(voltage_keys) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(voltage_keys), 3)) as voltage_executor:
+                voltage_futures = {
+                    voltage_key: voltage_executor.submit(build_voltage, voltage_key)
+                    for voltage_key in voltage_keys
+                }
+                voltage_results = [voltage_futures[voltage_key].result() for voltage_key in voltage_keys]
+        else:
+            voltage_results = [build_voltage(voltage_key) for voltage_key in voltage_keys]
+
+        for result in voltage_results:
             chart_inputs.extend(result.chart_inputs)
             data_outputs.extend(result.data_outputs)
             resonance_results.extend(result.resonance_results)
@@ -591,6 +993,7 @@ def build_voltage_envelopes(
                 observations_by_voltage=scope_observations,
             )
             outputs.append(result_path)
+            result_outputs.append(result_path)
             _log(log, f"Sustained SDPF result saved: {result_path}")
             summary_path = sustained_sdpf.write_summary_workbook(
                 project_root,
@@ -676,11 +1079,43 @@ def build_voltage_envelopes(
         *resonance_workbooks,
         *(combined_path for _voltage, _envelope_path, combined_path in chart_inputs),
     ]
+    artifacts = {
+        "result_outputs": [
+            _relative_project_path(project_root, path) for path in result_outputs
+        ],
+        "data_outputs": [
+            _relative_project_path(project_root, path) for path in data_outputs
+        ],
+        "sustained_summary_outputs": [
+            _relative_project_path(project_root, path)
+            for path in sustained_summary_outputs
+        ],
+        "resonance_workbooks": [
+            _relative_project_path(project_root, path)
+            for path in resonance_workbooks
+        ],
+        "chart_inputs": [
+            {
+                "voltage": voltage,
+                "envelope": _relative_project_path(project_root, envelope_path),
+                "combined": _relative_project_path(project_root, combined_path),
+            }
+            for voltage, envelope_path, combined_path in chart_inputs
+        ],
+    }
     _write_envelope_manifest(
         project_root,
-        manifest_signature,
+        calculation_signature,
         manifest_outputs,
         return_outputs=outputs,
+        presentation_signature=presentation_signature,
+        artifacts=artifacts,
+        calculation_outputs=[
+            *result_outputs,
+            *data_outputs,
+            *resonance_workbooks,
+        ],
+        presentation_outputs=[combined_path for _v, _e, combined_path in chart_inputs],
     )
     _log(log, f"Envelope build total: {project_root.name} | {_elapsed(started)}")
     return outputs
@@ -998,6 +1433,7 @@ def _sustained_source_manifest(
     project_root: Path,
     inf_paths: list[Path],
     static_files: list[dict[str, Any]] | None = None,
+    source_inventory: _SourceFileInventory | None = None,
 ) -> list[dict[str, Any]]:
     """Collect Sustained SDPF source metadata once per scope.
 
@@ -1019,40 +1455,26 @@ def _sustained_source_manifest(
     # The source directory is the smallest stable scope we can persist.  The
     # compact result stores these directories plus one fingerprint instead of
     # retaining every raw-file metadata triple.
-    for directory in dict.fromkeys(path.parent for path in inf_paths):
-        try:
-            outputs = sorted(directory.glob("*.inf"))
-            outputs.extend(sorted(directory.glob("*.out")))
-        except OSError:
-            outputs = []
-        candidates.extend(outputs)
+    if source_inventory is not None:
+        for directory in dict.fromkeys(path.parent for path in inf_paths):
+            candidates.extend(source_inventory.directory_paths(directory))
+    else:
+        for directory in dict.fromkeys(path.parent for path in inf_paths):
+            try:
+                outputs = sorted(directory.glob("*.inf"))
+                outputs.extend(sorted(directory.glob("*.out")))
+            except OSError:
+                outputs = []
+            candidates.extend(outputs)
 
     root_path = Path(project_root)
-    root_resolved = root_path.resolve()
     files: list[dict[str, Any]] = [dict(entry) for entry in (static_files or [])]
     for path in dict.fromkeys(candidates):
-        try:
-            stat = path.stat()
-            try:
-                relative_path = path.relative_to(root_path).as_posix()
-            except ValueError:
-                relative_path = path.resolve().relative_to(root_resolved).as_posix()
-            files.append(
-                {
-                    "path": relative_path,
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                }
-            )
-        except (OSError, RuntimeError, ValueError):
-            try:
-                try:
-                    relative_path = path.relative_to(root_path).as_posix()
-                except ValueError:
-                    relative_path = path.resolve().relative_to(root_resolved).as_posix()
-            except (RuntimeError, ValueError):
-                relative_path = str(path.resolve())
-            files.append({"path": relative_path, "missing": True})
+        files.append(
+            source_inventory.record(path, root_path)
+            if source_inventory is not None
+            else _file_manifest_entry(root_path, path)
+        )
     return files
 
 

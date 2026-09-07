@@ -62,7 +62,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     )
     workers_spin.setToolTip("Manual worker count used while reading envelope waveform files.")
     workers_auto_check.setToolTip(
-        "Use the nearest quarter of detected logical CPUs, capped for Windows process pools."
+        "Use the ceiling of 80% of detected logical CPUs, capped for Windows process pools."
     )
     workers_spin.setEnabled(not workers_auto_check.isChecked())
     workers_auto_check.toggled.connect(workers_spin.setDisabled)

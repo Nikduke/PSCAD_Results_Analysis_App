@@ -199,20 +199,20 @@ def normalize_worker_count(value: Any) -> int:
 
 
 def automatic_worker_count() -> int:
-    """Choose a conservative SSD-oriented pool from the detected CPU count.
+    """Choose a bounded waveform pool from 80% of detected logical CPUs.
 
-    Raw waveform parsing is both CPU and storage intensive.  Using every
-    logical CPU makes the parent and storage queue contend on smaller or
-    otherwise busy machines, so automatic mode uses the nearest quarter of
-    the detected logical CPUs, with the existing safety cap.
+    Raw waveform parsing is both CPU and storage intensive.  Keeping a small
+    portion of the machine available leaves headroom for the UI, Excel, and
+    the operating system while allowing the SSD-backed read stage to use the
+    parallelism it can sustain.
     """
     cpu_counter = getattr(os, "process_cpu_count", None)
     cpu_count = cpu_counter() if callable(cpu_counter) else None
     if cpu_count is None:
         cpu_count = os.cpu_count()
     detected_cpus = max(1, int(cpu_count or 1))
-    quarter_cores = (detected_cpus + 2) // 4
-    return max(1, min(MAX_ENVELOPE_WORKERS, quarter_cores))
+    worker_target = math.ceil(detected_cpus * 0.8)
+    return max(1, min(MAX_ENVELOPE_WORKERS, worker_target))
 
 
 def normalize_positive_int(value: Any, default: int) -> int:
