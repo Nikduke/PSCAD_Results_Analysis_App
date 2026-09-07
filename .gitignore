@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .tmp/
 .pytest_tmp*/
+graphify-out/
 
 # Local environment and application state
 .conda/

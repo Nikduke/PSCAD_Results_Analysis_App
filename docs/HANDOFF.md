@@ -1,6 +1,6 @@
 # Codex handoff: PSCAD Results Analysis
 
-Last reviewed: 2026-08-20
+Last reviewed: 2026-09-07
 
 This is the short, current handoff for starting a new Codex chat in this
 project. It describes the implemented app and its contracts; the source code
@@ -22,6 +22,24 @@ Always inspect `git status` before editing. The worktree may contain
 user-approved changes from an earlier chat. Preserve unrelated changes and do
 not use destructive reset/checkout commands.
 
+## Graphify navigation layer
+
+`graphify-out/` is a generated, ignored local graph for repository navigation.
+When it exists, use Graphify's `query`, `path`, and `explain` commands to locate
+the relevant modules and relationships before opening source files. Rebuild the
+code graph after source changes with:
+
+```bat
+..\.conda\pscad-results-analysis\Scripts\graphify.exe . --update --code-only
+..\.conda\pscad-results-analysis\Scripts\graphify.exe cluster-only .
+```
+
+The current graph is a code-navigation layer (1,560 nodes, 4,993 edges, 61
+communities, built from commit `619d5656`). It does not override source or
+tests, and its inferred relationships should be verified before changing
+behavior. The project documentation listed above remains the semantic handoff
+for engineering methods and operating rules.
+
 ## What the app is
 
 This is a native Windows PySide6 desktop app for analysing PSCAD simulation
@@ -40,6 +58,32 @@ The parent folder is reference material, not app source:
 - `../Original_examples/` contains original scripts and sample PSCAD data.
 - `../02_Backup/` contains backup material.
 - `../.conda/pscad-results-analysis/` is the dedicated conda environment.
+
+## Operating regimes
+
+Treat the application as five related but distinct regimes:
+
+1. **Project/session** - add or remove projects, restore the session, select
+   the active project, inspect project-specific settings/exclusions, and open
+   a project folder.
+2. **Scan/catalog** - validate or rebuild the compact project scan cache,
+   discover dashboard figures, and optionally refresh Excel dashboards.
+3. **Envelope/check** - apply exclusions, read raw PSCAD waveforms, build
+   voltage envelopes, perform the all-case High Voltage gate, and run the
+   selected Stress/Late/No-settle/Sustained SDPF checks.
+4. **Batch/render/report** - create plot batches, render MM plots and optional
+   waveform workbooks, render Sustained SDPF heatmaps, and assemble DOCX
+   reports.
+5. **Rebuild-only** - rebuild charts, heatmaps, or reports from valid saved
+   artifacts without repeating unrelated waveform work.
+
+`Run analysis` is the connected path through the envelope/check and
+batch/render/report regimes. It passes the already loaded Sustained payload and
+one cache-validation result per scope through batch creation, plotting,
+heatmaps, and report assembly. The step buttons are narrower and should not
+silently redo unrelated stages. It does not refresh Excel dashboards. Use
+`Dashboards update` for Excel `RefreshAll`; use `Scan figures` only to discover
+or recatalog saved dashboard figures.
 
 ## Main source map
 
@@ -63,6 +107,30 @@ The parent folder is reference material, not app source:
 
 The embedded plotting engine is MM-only. Do not reintroduce the old CB,
 arbitrary-channel, FFT, combined-mode, or unused catalog branches.
+
+## State ownership and cache contract
+
+Canonical absolute project paths are the identity boundary. Project scan data,
+settings, exclusions, dashboard metadata/selections, analysis outputs, and
+status must never be looked up by project name or list position. `Scopes` are
+the intentional exception: their token filters are global and are applied to
+every selected project.
+
+| Artifact | Scope and content | Not stored |
+| --- | --- | --- |
+| Session/autosave | app-level UI selections plus project-keyed settings and overrides | raw waveform arrays |
+| `.state/project_scan_cache.json` | compact discovery metadata, input timing/voltage/MM data, proposals, and dashboard catalogs | full `.out` inventory and waveform data |
+| project `.state/analysis_cache.json` | one compact stage-signature/output-metadata cache | engineering result payloads and waveform arrays |
+| `Sustained_SDpf.json` | compact Sustained observations, selection references, heatmap flags, and source fingerprint | raw cycle samples, plot settings, RMS diagnostics |
+| generated folders | authoritative current workbooks, PNG/Excel outputs, and DOCX reports | duplicate cache manifests in every output folder |
+
+Current source versions are: project scan cache **7**, project analysis cache
+**1**, voltage-envelope manifest **2**, Sustained result JSON **19**, Sustained
+summary workbook **4**, plot-batch manifest **2**, and report/report-layout
+manifests **2/3**. The embedded plotter's SQLite/MM caches are **2/1**.
+Obsolete or incomplete artifacts are rebuilt; they are not treated as valid
+empty results. The app deliberately does not persist a processed-waveform
+cache.
 
 ## Function ownership rules
 
@@ -239,7 +307,10 @@ the waveform never crossed SDPF instantaneously. The physical minimum
 duration is configured in milliseconds and is independent of the ordinary TOV
 event setting. The new `V_T` metric is the highest level the same
 piecewise-linear qualification envelope remains at or above for the full
-physical duration T, ranked as `V_T / actual SDPF peak limit`; separate events,
+physical duration T, ranked as `V_T / actual SDPF peak limit`; a lower
+opposite-polarity lobe is retained as a full-wave severity gap even when the
+absolute peak keeps the screening run consecutive;
+separate events,
 phases, and pairs are not stitched. For ranking, the full-wave envelope
 retains both positive and negative peak magnitudes with true timestamps, so a
 lower opposite-polarity peak creates a real below-limit gap. The two
@@ -249,8 +320,9 @@ and `Longest continuous duration`. Areas are not summed across paths or
 separated events. The summary workbook includes all Case/Run/MM rows, including
 non-candidates, but only a voltage with a candidate receives a Sustained
 waveform and DOCX section. If several criteria identify the same
-Voltage/Case/Run/MM, the plot is reused and the report retains all criterion
-values and fixed-path provenance. Short events stay with SFO/AFO.
+Voltage/Case/Run/MM and fixed path/event, the plot is reused; a different
+fixed path or event remains a separate report row. Short events stay with
+SFO/AFO.
 This is intentionally different from a formal CIGRE TB 913 voltage-based
 assessment.
 
@@ -262,7 +334,7 @@ changes the source label to `Manual` and recalculates peak and margin values.
 
 Each selected scope writes:
 
-- `Voltage_envelope/<scope>/Sustained_SDpf.json` - compact version-17 result
+- `Voltage_envelope/<scope>/Sustained_SDpf.json` - compact version-19 result
   metadata with one shared source fingerprint, fixed-path `V_T`, area and
   duration scalars, independent Actual SDPF and Safety-margin-only selection
   references, and Run x MM observations;
@@ -455,10 +527,21 @@ $env:TEMP = "$PWD\.tmp"
 ..\.conda\pscad-results-analysis\python.exe -m pytest -q -o cache_dir=.tmp\pytest_cache
 ```
 
-The last local source-level validation for this snapshot passed **220 tests**.
-Run the command and report its actual result rather than relying on the number. Also
-run the dependency import smoke check when packaging/setup is touched, and
-`Create_executable.bat` only when the executable itself is being validated.
+The latest recorded local source-level validation for this snapshot passed
+**242 tests**. Run the command and report its actual result rather than relying
+on the number. Also run the dependency import smoke check when packaging/setup
+is touched, and `Create_executable.bat` only when the executable itself is
+being validated.
+
+Measured reference timings on the development machine are approximately **7.8
+s cold / 0.48 s warm** for the persistent project scan of
+`../Original_examples/03_Test_project_case`; raw envelope reads across
+66/161/230 kV were about **53 s** in one run. Plotter catalog/indexing and
+temporary batch creation were below **0.04 s** and **0.3 s**, respectively, so
+raw waveform/envelope processing remains the main optimization target. Excel
+COM work remains shared and sequential. Plot and heatmap rendering use the
+existing three-job threshold and four-worker cap; do not change that policy
+without a representative benchmark.
 
 ## Safe change checklist for a new chat
 

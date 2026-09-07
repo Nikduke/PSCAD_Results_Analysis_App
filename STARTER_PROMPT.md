@@ -2,6 +2,31 @@
 
 You are working in this folder as the active PSCAD Results Analysis app root.
 
+App context:
+
+- This is a native Windows PySide6 post-processing tool for PSCAD simulation
+  result projects. It discovers cases/runs/faults/voltages/MM elements and
+  dashboards, builds voltage envelopes, applies exclusions and the
+  all-case High Voltage gate, runs optional Stress/Late/No-settle/Sustained
+  SDPF checks, renders MM plots, creates Sustained SDPF heatmaps, and assembles
+  DOCX reports.
+- The operating regimes are project/session, scan/catalog, envelope/check,
+  batch/render/report, and rebuild-only. `Run analysis` connects the envelope,
+  batch, render, and report stages; the step buttons are narrower operations.
+- Project state is isolated by canonical project path. Scopes are intentionally
+  global token filters. Do not let one project provide another project's
+  exclusions, dashboard selection, settings, scan rows, status, or outputs.
+- The project scan cache and project analysis cache are compact metadata caches;
+  `Sustained_SDpf.json` is compact engineering metadata and heatmap flags. No
+  persistent cache stores raw waveform arrays or acts as a replacement for
+  source PSCAD `.out` data.
+- `graphify-out/` is the generated local repository graph. If it exists, use
+  Graphify `query`, `path`, and `explain` as the primary architecture/navigation
+  layer before opening source files. Rebuild it after source changes with
+  `..\.conda\pscad-results-analysis\Scripts\graphify.exe . --update --code-only`
+  followed by `graphify.exe cluster-only .`; verify inferred edges against
+  source/tests before changing behavior.
+
 Rules:
 
 - Work silently by default and provide a final report only, unless clarification or approval is required.
@@ -35,6 +60,22 @@ $env:TMP = "$PWD\.tmp"
 $env:TEMP = "$PWD\.tmp"
 ..\.conda\pscad-results-analysis\python.exe -m pytest -q -o cache_dir=.tmp\pytest_cache
 ```
+
+Current output contract:
+
+- Envelopes/checks: `Voltage_envelope/<scope>/`.
+- Sustained results: `Sustained_SDpf.json` and
+  `Sustained_SDpf_summary.xlsx` in that scope folder.
+- Generated plots and heatmaps: `Plots/Generated/<scope>/`.
+- Reports: `Reports/<scope>/`.
+- Stage signatures/output metadata: the single project-local
+  `.state/analysis_cache.json`.
+
+Current invalidation versions are project scan 7, project analysis 1,
+envelope manifest 2, Sustained result 17, Sustained summary workbook 2, plot
+batch 2, report/report-layout 2/2, and embedded plotter SQLite/MM cache 2/1.
+Obsolete or incomplete artifacts must be rebuilt rather than treated as a
+valid empty result.
 
 Before editing, establish:
 

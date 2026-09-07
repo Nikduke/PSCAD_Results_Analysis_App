@@ -18,14 +18,17 @@ from results_analysis_app.project_config import normalize_voltage
 SUSTAINED_SDPF = "Sustained_SDPF"
 RESULT_FILENAME = "Sustained_SDpf.json"
 SUMMARY_FILENAME = "Sustained_SDpf_summary.xlsx"
-# Version 17 keeps only population-specific compact selection descriptors.
+# Version 19 persists compact event descriptors for metric-specific report
+# provenance.  The project screening rule remains the absolute peak per
+# complete cycle; polarity-specific peaks are used by the full-wave ranking
+# envelope.
 # Older result caches must be rebuilt because the persisted result schema
 # deliberately no longer carries flat aliases or embedded duplicate results.
-RESULT_VERSION = 17
+RESULT_VERSION = 19
 # The workbook format has its own version because summary-only changes must
 # invalidate the envelope-stage output without changing the engineering-result
 # schema/version.
-SUMMARY_WORKBOOK_VERSION = 2
+SUMMARY_WORKBOOK_VERSION = 4
 SOURCE_MANIFEST_VERSION = 1
 DEFAULT_SUSTAINED_DURATION_MS = 30.0
 # CIGRE/TB 913 expresses the safety factor as 1.15.  The usable threshold is
@@ -363,6 +366,10 @@ class PhaseStressResult:
     sdpf_sustained_t_peak_kv: float = 0.0
     sdpf_sustained_t_rms_kv: float = 0.0
     sdpf_sustained_t_ratio: float = 0.0
+    # Compact event descriptors keep report duration, area, and V_T tied to
+    # the same physical run when different events win different metrics.
+    margin_events: tuple[_CycleRun, ...] = ()
+    sdpf_events: tuple[_CycleRun, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -433,6 +440,8 @@ class PhaseStressResult:
                 data,
                 "sdpf_sustained_t_ratio",
             ),
+            margin_events=_cycle_runs_from_dict(data, "margin_events"),
+            sdpf_events=_cycle_runs_from_dict(data, "sdpf_events"),
         )
 
 
@@ -637,9 +646,38 @@ class _CycleRun:
     longest_continuous_s: float = 0.0
     sustained_t_peak_kv: float = 0.0
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> _CycleRun:
+        if not isinstance(data, Mapping):
+            raise TypeError("Sustained SDPF event data must be a mapping")
+        return cls(
+            start_s=_finite_float(data, "start_s"),
+            end_s=_finite_float(data, "end_s"),
+            max_peak_kv=_finite_float(data, "max_peak_kv"),
+            max_rms_kv=_finite_float(data, "max_rms_kv"),
+            excess_area_kv_s=_finite_float(data, "excess_area_kv_s"),
+            excess_area_norm_s=_finite_float(data, "excess_area_norm_s"),
+            longest_continuous_s=_finite_float(data, "longest_continuous_s"),
+            sustained_t_peak_kv=_finite_float(data, "sustained_t_peak_kv"),
+        )
+
     @property
     def duration_s(self) -> float:
         return max(0.0, self.end_s - self.start_s)
+
+
+def _cycle_runs_from_dict(
+    data: Mapping[str, Any],
+    key: str,
+) -> tuple[_CycleRun, ...]:
+    raw_events = data.get(key, ())
+    if raw_events in (None, ()):
+        return ()
+    if not isinstance(raw_events, (list, tuple)):
+        raise ValueError(f"Invalid Sustained SDPF event list: {key}")
+    if any(not isinstance(item, Mapping) for item in raw_events):
+        raise ValueError(f"Invalid Sustained SDPF event entry: {key}")
+    return tuple(_CycleRun.from_dict(item) for item in raw_events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,7 +764,9 @@ def _shared_cycle_metrics(
     times: tuple[np.ndarray, ...],
     values: tuple[np.ndarray, ...],
     frequency_hz: float,
-) -> tuple[list[_CycleMetrics], ...] | None:
+    *,
+    include_tracks: bool = False,
+) -> tuple[list[_CycleMetrics], ...] | tuple[tuple[list[_CycleMetrics], ...], tuple[list[_CycleTrack], ...]] | None:
     """Reuse one cycle index for finite phases on one common time grid.
 
     PSCAD bus channels normally share one strictly increasing time vector.
@@ -772,6 +812,7 @@ def _shared_cycle_metrics(
         indexed_tracks.append((track, tuple(indices)))
 
     metrics_by_phase: list[list[_CycleMetrics]] = []
+    tracks_by_phase: list[list[_CycleTrack]] = []
     for waveform in waveforms:
         phase_tracks = [
             _CycleTrack(
@@ -781,7 +822,10 @@ def _shared_cycle_metrics(
             )
             for track, indices in indexed_tracks
         ]
+        tracks_by_phase.append(phase_tracks)
         metrics_by_phase.append(_cycle_metrics(phase_tracks))
+    if include_tracks:
+        return tuple(metrics_by_phase), tuple(tracks_by_phase)
     return tuple(metrics_by_phase)
 
 
@@ -1029,16 +1073,17 @@ def _full_wave_segment_metrics(
     return 0.5 * excess_b * interval, crossing, time_b, interval
 
 
-def _full_wave_envelope_metrics(
-    metrics: _CycleMetrics,
-    start: int,
-    end: int,
+def _envelope_metrics(
+    times: np.ndarray,
+    values: np.ndarray,
     threshold: float,
 ) -> tuple[float, float, float]:
-    """Return full-wave area, normalized area, and longest continuous duration."""
+    """Return area, normalized area, and longest continuous duration."""
     if threshold <= 0 or not math.isfinite(threshold):
         return 0.0, 0.0, 0.0
-    times, values = _full_wave_envelope_points(metrics, start, end)
+    finite = np.isfinite(times) & np.isfinite(values)
+    times = np.asarray(times[finite], dtype=float)
+    values = np.asarray(values[finite], dtype=float)
     if len(times) < 2:
         return 0.0, 0.0, 0.0
     area_kv_s = 0.0
@@ -1085,13 +1130,111 @@ def _full_wave_envelope_metrics(
     return area_kv_s, area_kv_s / threshold, longest_continuous_s
 
 
+def _full_wave_envelope_metrics(
+    metrics: _CycleMetrics,
+    start: int,
+    end: int,
+    threshold: float,
+) -> tuple[float, float, float]:
+    """Return full-wave area, normalized area, and longest continuous duration."""
+    times, values = _full_wave_envelope_points(metrics, start, end)
+    return _envelope_metrics(times, values, threshold)
+
+
+def _threshold_crossing_bounds(
+    times: np.ndarray,
+    values: np.ndarray,
+    threshold: float,
+) -> tuple[float, float] | None:
+    """Return first/last absolute-waveform threshold crossings in one run."""
+    finite = np.isfinite(times) & np.isfinite(values)
+    times = np.asarray(times[finite], dtype=float)
+    values = np.abs(np.asarray(values[finite], dtype=float))
+    if len(times) == 0 or len(times) != len(values):
+        return None
+    order = np.argsort(times, kind="stable")
+    times = times[order]
+    values = values[order]
+    qualifying = values + NUMERIC_TOLERANCE >= threshold
+    indices = np.flatnonzero(qualifying)
+    if len(indices) == 0:
+        return None
+    first = int(indices[0])
+    last = int(indices[-1])
+    if first == 0:
+        start = float(times[0])
+    else:
+        start = _threshold_crossing_time(
+            float(times[first - 1]),
+            float(values[first - 1]),
+            float(times[first]),
+            float(values[first]),
+            threshold,
+        )
+    if last == len(times) - 1:
+        end = float(times[-1])
+    else:
+        end = _threshold_crossing_time(
+            float(times[last]),
+            float(values[last]),
+            float(times[last + 1]),
+            float(values[last + 1]),
+            threshold,
+        )
+    return start, max(start, end)
+
+
+def _run_envelope_points(
+    metrics: _CycleMetrics,
+    start: int,
+    end: int,
+    threshold: float,
+    start_s: float,
+    end_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the absolute qualification envelope with exact boundaries.
+
+    The qualification and ``V_T`` calculations use the maximum absolute peak
+    per complete cycle.  The separate full-wave envelope remains responsible
+    for area and continuous-duration ranking, where a lower opposite-polarity
+    peak creates a real below-limit gap.
+    """
+    peak_times, peaks = _peak_envelope_points(metrics, start, end, threshold)
+    times = np.r_[float(start_s), peak_times, float(end_s)]
+    values = np.r_[float(threshold), peaks, float(threshold)]
+    finite = np.isfinite(times) & np.isfinite(values)
+    times = np.asarray(times[finite], dtype=float)
+    values = np.asarray(values[finite], dtype=float)
+    if len(times) == 0:
+        return times, values
+    order = np.argsort(times, kind="stable")
+    times = times[order]
+    values = values[order]
+    unique_times: list[float] = []
+    unique_values: list[float] = []
+    for time, value in zip(times, values):
+        if unique_times and time <= unique_times[-1] + NUMERIC_TOLERANCE:
+            unique_values[-1] = max(unique_values[-1], float(value))
+        else:
+            unique_times.append(float(time))
+            unique_values.append(float(value))
+    return np.asarray(unique_times, dtype=float), np.asarray(unique_values, dtype=float)
+
+
 def _threshold_cycle_runs(
     cycle_metrics: Iterable[_CycleMetrics],
     minimum_duration_s: float,
     frequency_hz: float,
     threshold: float,
+    cycle_tracks: Iterable[_CycleTrack] | None = None,
 ) -> list[_CycleRun]:
-    """Return qualifying peak-envelope runs at one threshold."""
+    """Return qualifying absolute-peak runs at one threshold.
+
+    A complete cycle qualifies when its maximum absolute peak reaches the
+    threshold.  Raw cycle tracks, when available, refine the physical event
+    start/end to the first and last waveform crossings; polarity-specific peak
+    points are used only for full-wave area and continuous-duration ranking.
+    """
     if (
         not math.isfinite(minimum_duration_s)
         or minimum_duration_s <= 0
@@ -1105,18 +1248,20 @@ def _threshold_cycle_runs(
     required_cycles = required_cycles_for_duration(minimum_duration_s, frequency_hz)
     if required_cycles <= 0:
         return []
+    metric_tracks = tuple(cycle_tracks) if cycle_tracks is not None else None
     runs: list[_CycleRun] = []
-    for metrics in cycle_metrics:
+    for track_index, metrics in enumerate(cycle_metrics):
         cycle_starts = metrics.starts
         peaks = metrics.peaks
         qualifying = _peak_qualifying_mask(metrics, threshold)
         run_start: int | None = None
+        track = (
+            metric_tracks[track_index]
+            if metric_tracks is not None and track_index < len(metric_tracks)
+            else None
+        )
 
-        def finish(
-            run_end: int,
-            _metrics: _CycleMetrics = metrics,
-            _peaks: np.ndarray = peaks,
-        ) -> None:
+        def finish(run_end: int) -> None:
             nonlocal run_start
             if run_start is None:
                 return
@@ -1124,24 +1269,54 @@ def _threshold_cycle_runs(
             if run_length < required_cycles:
                 run_start = None
                 return
-            envelope_times, envelope_values = _peak_envelope_points(
-                _metrics,
-                run_start,
-                run_end,
-                threshold,
-            )
+            if track is not None and run_end <= len(track.times):
+                first_cycle_times = track.times[run_start]
+                last_cycle_times = track.times[run_end - 1]
+                first_bounds = _threshold_crossing_bounds(
+                    first_cycle_times,
+                    track.values[run_start],
+                    threshold,
+                )
+                last_bounds = _threshold_crossing_bounds(
+                    last_cycle_times,
+                    track.values[run_end - 1],
+                    threshold,
+                )
+                if first_bounds is None or last_bounds is None:
+                    run_start = None
+                    return
+                start_s = float(first_bounds[0])
+                end_s = float(last_bounds[1])
+                envelope_times, envelope_values = _run_envelope_points(
+                    metrics,
+                    run_start,
+                    run_end,
+                    threshold,
+                    start_s,
+                    end_s,
+                )
+            else:
+                envelope_times, envelope_values = _peak_envelope_points(
+                    metrics,
+                    run_start,
+                    run_end,
+                    threshold,
+                )
+                if len(envelope_times) == 0:
+                    run_start = None
+                    return
+                start_s = float(envelope_times[0])
+                end_s = max(start_s, float(envelope_times[-1]))
             if len(envelope_times) == 0:
                 run_start = None
                 return
-            start_s = float(envelope_times[0])
-            end_s = max(start_s, float(envelope_times[-1]))
             if end_s - start_s + NUMERIC_TOLERANCE >= minimum_duration_s:
                 (
                     excess_area_kv_s,
                     excess_area_norm_s,
                     longest_continuous_s,
                 ) = _full_wave_envelope_metrics(
-                    _metrics,
+                    metrics,
                     run_start,
                     run_end,
                     threshold,
@@ -1150,8 +1325,8 @@ def _threshold_cycle_runs(
                     _CycleRun(
                         start_s=start_s,
                         end_s=end_s,
-                        max_peak_kv=float(np.max(_peaks[run_start:run_end])),
-                        max_rms_kv=float(np.max(_metrics.rms[run_start:run_end])),
+                        max_peak_kv=float(np.max(peaks[run_start:run_end])),
+                        max_rms_kv=float(np.max(metrics.rms[run_start:run_end])),
                         excess_area_kv_s=excess_area_kv_s,
                         excess_area_norm_s=excess_area_norm_s,
                         longest_continuous_s=longest_continuous_s,
@@ -1270,6 +1445,7 @@ def _phase_result_from_metrics(
     sdpf_rms: float,
     minimum_duration_s: float,
     frequency_hz: float = 60.0,
+    cycle_tracks: Iterable[_CycleTrack] | None = None,
 ) -> PhaseStressResult:
     cycle_metrics = tuple(cycle_metrics)
     sdpf_peak = float(sdpf_rms) * math.sqrt(2.0)
@@ -1286,10 +1462,18 @@ def _phase_result_from_metrics(
     finite_peaks = np.abs(finite_peaks[np.isfinite(finite_peaks)])
     peak_kv = float(np.max(finite_peaks)) if len(finite_peaks) else 0.0
     margin_peak_runs = _threshold_cycle_runs(
-        cycle_metrics, minimum_duration, effective_frequency, margin_peak
+        cycle_metrics,
+        minimum_duration,
+        effective_frequency,
+        margin_peak,
+        cycle_tracks,
     )
     sdpf_peak_runs = _threshold_cycle_runs(
-        cycle_metrics, minimum_duration, effective_frequency, sdpf_peak
+        cycle_metrics,
+        minimum_duration,
+        effective_frequency,
+        sdpf_peak,
+        cycle_tracks,
     )
     # Keep RMS persistence as a separate diagnostic.  It is intentionally not
     # allowed to register a sustained TOV: the project rule is peak-based.
@@ -1395,6 +1579,8 @@ def _phase_result_from_metrics(
             if sdpf_t_run is not None and sdpf_peak > 0
             else 0.0
         ),
+        margin_events=tuple(margin_peak_runs),
+        sdpf_events=tuple(sdpf_peak_runs),
     )
 
 
@@ -1415,9 +1601,6 @@ def analyze_phase_amplitude(
     )
     cycle_tracks = _full_cycle_tracks(time, amplitude_peak, effective_frequency)
     cycle_metrics = _cycle_metrics(cycle_tracks)
-    # The complete-cycle track retains raw arrays only until the compact peak
-    # and RMS metrics have been calculated.
-    del cycle_tracks
     return _phase_result_from_metrics(
         cycle_metrics,
         amplitude_peak,
@@ -1426,6 +1609,7 @@ def analyze_phase_amplitude(
         sdpf_rms,
         minimum_duration_s,
         effective_frequency,
+        cycle_tracks,
     )
 
 
@@ -1471,16 +1655,17 @@ def analyze_bus_phase_results(
         if math.isfinite(frequency_hz) and frequency_hz > 0
         else 0.0
     )
-    shared_metrics = _shared_cycle_metrics(
+    shared_data = _shared_cycle_metrics(
         time_values[:phase_count],
         waveform_values[:phase_count],
         effective_frequency,
+        include_tracks=True,
     )
     results: list[PhaseStressResult] = []
     for index in range(phase_count):
         phase = labels[index] if index < len(labels) else f"Phase {index + 1}"
         waveform = np.asarray(waveform_values[index], dtype=float)
-        if shared_metrics is None:
+        if shared_data is None:
             result = analyze_phase_amplitude(
                 time_values[index],
                 waveform,
@@ -1491,6 +1676,7 @@ def analyze_bus_phase_results(
                 effective_frequency,
             )
         else:
+            shared_metrics, shared_tracks = shared_data
             result = _phase_result_from_metrics(
                 shared_metrics[index],
                 waveform,
@@ -1499,6 +1685,7 @@ def analyze_bus_phase_results(
                 sdpf_rms,
                 minimum_duration_s,
                 effective_frequency,
+                shared_tracks[index],
             )
         results.append(result)
     return results
@@ -1841,9 +2028,31 @@ def _qualifying_path_labels(
     )
 
 
+def selected_event(
+    phase: PhaseStressResult,
+    population: str | None,
+    metric: str = CUMULATIVE_STRESS_SELECTION,
+) -> _CycleRun | None:
+    """Return the event that supplies one population/selection metric."""
+    if population == ACTUAL_SDPF_POPULATION:
+        events = phase.sdpf_events
+    elif population == SAFETY_MARGIN_ONLY_POPULATION:
+        events = phase.margin_events
+    else:
+        return None
+    if not events:
+        return None
+    if metric == HIGHEST_VOLTAGE_SUSTAINED_SELECTION:
+        return max(events, key=lambda event: (event.sustained_t_peak_kv, -event.start_s))
+    if metric == CONTINUOUS_DURATION_SELECTION:
+        return max(events, key=lambda event: (event.longest_continuous_s, -event.start_s))
+    return max(events, key=lambda event: (event.excess_area_norm_s, -event.start_s))
+
+
 def _population_metric_values(
     phase: PhaseStressResult,
     population: str | None,
+    metric: str = CUMULATIVE_STRESS_SELECTION,
 ) -> tuple[
     str,
     float | None,
@@ -1856,7 +2065,25 @@ def _population_metric_values(
     float | None,
 ]:
     """Return compact threshold metrics; the V_T/SDPF value is already a percent."""
+    event = selected_event(phase, population, metric)
     if population == ACTUAL_SDPF_POPULATION:
+        if event is not None:
+            ratio = (
+                event.sustained_t_peak_kv / phase.sdpf_peak_kv * 100.0
+                if phase.sdpf_peak_kv > 0
+                else 0.0
+            )
+            return (
+                "SDPF",
+                float(phase.sdpf_peak_kv),
+                float(event.excess_area_norm_s * 1000.0),
+                float(event.duration_s * 1000.0),
+                float(event.longest_continuous_s * 1000.0),
+                float(event.sustained_t_peak_kv),
+                float(ratio),
+                float(event.start_s),
+                float(event.end_s),
+            )
         return (
             "SDPF",
             float(phase.sdpf_peak_kv),
@@ -1869,6 +2096,23 @@ def _population_metric_values(
             float(phase.sdpf_event_end_s),
         )
     if population == SAFETY_MARGIN_ONLY_POPULATION:
+        if event is not None:
+            ratio = (
+                event.sustained_t_peak_kv / phase.sdpf_peak_kv * 100.0
+                if phase.sdpf_peak_kv > 0
+                else 0.0
+            )
+            return (
+                "SDPF/1.15",
+                float(phase.margin_peak_kv),
+                float(event.excess_area_norm_s * 1000.0),
+                float(event.duration_s * 1000.0),
+                float(event.longest_continuous_s * 1000.0),
+                float(event.sustained_t_peak_kv),
+                float(ratio),
+                float(event.start_s),
+                float(event.end_s),
+            )
         return (
             "SDPF/1.15",
             float(phase.margin_peak_kv),
@@ -1982,26 +2226,12 @@ def _selection_metric_value(
     metric: str,
     population: str,
 ) -> tuple[str, float]:
+    values = _population_metric_values(phase, population, metric)
     if metric == HIGHEST_VOLTAGE_SUSTAINED_SELECTION:
-        value = (
-            phase.sdpf_sustained_t_ratio
-            if population == ACTUAL_SDPF_POPULATION
-            else phase.margin_sustained_t_ratio
-        )
-        return "VT / SDPF (%)", float(value * 100.0)
+        return "VT / SDPF (%)", float(values[6])
     if metric == CUMULATIVE_STRESS_SELECTION:
-        value = (
-            phase.sdpf_excess_area_norm_ms
-            if population == ACTUAL_SDPF_POPULATION
-            else phase.margin_excess_area_norm_ms
-        )
-        return "Normalized excess area (pu*ms)", float(value)
-    value = (
-        phase.sdpf_longest_continuous_s
-        if population == ACTUAL_SDPF_POPULATION
-        else phase.margin_longest_continuous_s
-    )
-    return FULL_WAVE_DURATION_HEADER, float(value * 1000.0)
+        return "Normalized excess area (pu*ms)", float(values[2])
+    return FULL_WAVE_DURATION_HEADER, float(values[4])
 
 
 def _representative_rows(

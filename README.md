@@ -1,6 +1,6 @@
 # PSCAD Results Analysis
 
-Current working snapshot: 2026-08-20.
+Current working snapshot: 2026-09-07.
 
 For a new Codex chat, read [`docs/HANDOFF.md`](docs/HANDOFF.md) first. It is
 the concise architecture and workflow map; then use
@@ -9,13 +9,96 @@ the concise architecture and workflow map; then use
 
 This is the active app root inside the copied project folder. It contains only the current PSCAD Results Analysis app code, tests, setup files, build outputs, session state, and current documentation.
 
+## Fresh-chat orientation
+
+The application source and focused tests are authoritative. The documentation
+has deliberately separated responsibilities so a new chat can recover the
+design without reading every module first:
+
+- `docs/HANDOFF.md` is the short architecture and workflow contract.
+- `docs/CURRENT_CONTEXT.md` records the current implementation state, cache
+  versions, validation evidence, and remaining risks.
+- `docs/ANALYSIS_METHODS.md` defines the engineering calculations,
+  qualification rules, ranking, heatmap semantics, and report selection.
+- `STARTER_PROMPT.md` is the compact instruction set to paste into a clean
+  task.
+- `graphify-out/` is the local, generated repository-navigation graph. Use
+  Graphify queries/path/explain commands before opening source files when the
+  task is architectural; the graph is a navigation aid, while source and
+  tests remain authoritative.
+- This README covers setup, user actions, outputs, state ownership, and
+  performance decisions.
+
+## Operating regimes
+
+The app is easier to reason about when its actions are treated as separate
+regimes rather than one undifferentiated run:
+
+1. **Project/session** - add/remove projects, restore the session, switch the
+   active project, inspect project-specific settings/exclusions, and open a
+   project folder.
+2. **Scan/catalog** - validate or rebuild compact project metadata, discover
+   dashboard figures, and optionally refresh Excel dashboards.
+3. **Envelope/check** - apply exclusions, read raw PSCAD waveforms, build
+   voltage envelopes, perform the authoritative High Voltage gate, and run the
+   selected Stress/Late/No-settle/Sustained SDPF checks.
+4. **Batch/render/report** - create plot batches, render MM plots and optional
+   waveform workbooks, create Sustained SDPF heatmaps, and assemble DOCX
+   reports.
+5. **Rebuild-only** - rebuild charts, heatmaps, or reports from valid saved
+   outputs without rereading unrelated raw waveforms.
+
+`Run analysis` is the connected path through regimes 3 and 4. It reuses the
+loaded Sustained SDPF payload and one cache validation per scope. The separate
+buttons are intentionally narrower: they operate on existing stage outputs
+and must not silently rerun unrelated stages. `Run analysis` and `Rebuild
+reports` do not call Excel `RefreshAll`; dashboard refresh is explicit through
+`Dashboards update`, while `Scan figures` only discovers/catalogs saved figures.
+
+## State and cache ownership
+
+All project-local state is keyed by canonical absolute project path; a project
+must never inherit another project's exclusions, dashboard selection, scan
+rows, settings, status, or output metadata. Scopes are the exception: the
+selected token filters are global and are applied to every selected project.
+
+| State | Location | Purpose | Deliberately not stored |
+| --- | --- | --- | --- |
+| Session/autosave | app `.state/` or executable directory | UI selections, project settings, exclusions, shared/local dashboard selection | raw waveforms and project scan inventories |
+| Project scan cache | app `.state/project_scan_cache.json` | compact per-project discovery metadata and catalogs for warm startup | waveform arrays and full output-file lists |
+| Project analysis cache | project `.state/analysis_cache.json` | stage signatures and output metadata for safe skips/rebuilds | engineering results and waveform arrays |
+| Sustained result | `Voltage_envelope/<scope>/Sustained_SDpf.json` | compact engineering observations, selection references, heatmap flags, and source freshness | raw samples, plot settings, RMS diagnostics |
+| Generated outputs | `Voltage_envelope/`, `Plots/`, `Reports/` | workbooks, PNG/Excel plot outputs, heatmaps, and DOCX reports | source-of-truth metadata beyond the stage cache |
+
+The app intentionally has no persistent processed-waveform cache. The raw
+waveform/envelope build is the expensive stage; the saved caches are compact
+metadata and engineering results, not copies of the PSCAD `.out` data.
+
+## Current versioned artifact contract
+
+These source constants explain when old generated data must be rebuilt:
+
+| Artifact | Current version | Owner |
+| --- | ---: | --- |
+| Project scan cache | 7 | `project_scan_cache.py` |
+| Project analysis cache | 1 | `storage.py` |
+| Voltage-envelope manifest | 2 | `voltage_envelope.py` |
+| Sustained SDPF result JSON | 19 | `sustained_sdpf.py` |
+| Sustained SDPF summary workbook | 4 | `sustained_sdpf.py` |
+| Plot batch manifest | 2 | `analysis_engine.py` |
+| Report manifest/layout | 2 / 2 | `reporting.py` |
+| Embedded plotter SQLite/MM cache | 2 / 1 | `pscad_plotter_app_v3/services/project.py` |
+
+An obsolete or incomplete generated artifact is invalidated and rebuilt from
+current inputs. It must not be interpreted as a clean empty result.
+
 ## What the app does
 
 - Native Windows desktop app for PSCAD result post-analysis.
 - Scans PSCAD project folders, dashboard workbooks, result files, scopes, voltage levels, and exclusions.
 - Builds voltage envelopes and combined envelope charts for selected scopes and voltages.
 - Creates TOV/SFO/SA plot batches, renders waveform plots with the embedded plotting engine, and builds DOCX reports.
-- Runs optional analysis checks: Stress, Late, No-settle, and Sustained SDPF. Stress/Late/No-settle use chronological envelope data from envelope building and do not reread raw waveforms; their findings use separate check/voltage/measurement groups and their documented area/slope ranking rules. Sustained SDPF uses the already loaded raw phase/pair data. Its peak-envelope event must satisfy both the 30 ms physical duration default and the derived `ceil(duration × frequency)` consecutive-complete-cycle condition, then persists compact version-17 JSON metadata plus a two-sheet audit/selection summary workbook. Actual SDPF and Safety-margin-only populations are selected independently. Within each population, the three optional representative views are highest voltage sustained for the configured duration `T`, normalized full-wave excess area, and longest continuous full-wave duration. Current result caches are validated for settings, source freshness, finite values, and complete population-specific selected paths; obsolete versions are rebuilt. Ranking checkbox changes reuse the persisted engineering metrics and do not rebuild raw waveform results. A connected analysis run reuses the loaded Sustained payload and one in-memory source-fingerprint validation per scope across batch creation, plotting, heatmaps, and reports; standalone actions validate their saved data locally. Event-only batch actions leave valid Sustained SDPF batches and heatmaps untouched. `Resonance_Checks.xlsx` omits empty result tabs and retains only `Settings` when no findings exist.
+- Runs optional analysis checks: Stress, Late, No-settle, and Sustained SDPF. Stress/Late/No-settle use chronological envelope data from envelope building and do not reread raw waveforms; their findings use separate check/voltage/measurement groups and their documented area/slope ranking rules. Sustained SDPF uses the already loaded raw phase/pair data. Its screening event uses the maximum absolute peak in each complete cycle, must satisfy both the 30 ms physical duration default and the derived `ceil(duration × frequency)` consecutive-complete-cycle condition, and retains the positive/negative peak sequence separately for full-wave severity metrics. It then persists compact version-19 JSON metadata plus a two-sheet audit/selection summary workbook. Actual SDPF and Safety-margin-only populations are selected independently. Within each population, the three optional representative views are highest voltage sustained for the configured duration `T`, normalized full-wave excess area, and longest continuous full-wave duration. Current result caches are validated for settings, source freshness, finite values, and complete population-specific selected paths; obsolete versions are rebuilt. Ranking checkbox changes reuse the persisted engineering metrics and do not rebuild raw waveform results. A connected analysis run reuses the loaded Sustained payload and one in-memory source-fingerprint validation per scope across batch creation, plotting, heatmaps, and reports; standalone actions validate their saved data locally. Event-only batch actions leave valid Sustained SDPF batches and heatmaps untouched. `Resonance_Checks.xlsx` omits empty result tabs and retains only `Settings` when no findings exist.
 - The optional project-specific Sustained SDPF incidence heatmaps reuse compact persisted Run × MM flags (LGp/LLp are merged for each Run × MM). A project with fault classifications starts with one enabled **Faults** set; a project without faults starts with **Cases by <token>**, using the first varying case-name part for Y grouping. Additional named sets can be cloned, reordered, enabled, and configured independently. Fault type and MM element are optional Y-only groupings: fault rows aggregate all MM elements, while MM rows aggregate all fault types. MM element is not selected automatically for no-fault projects. Case-name tokens remain available for Y, X grouping, and Split by. Each set uses separate or combined PNGs; combined panels are arranged vertically with one shared legend and repeated Y rows on every panel. All Y-dimension captions are omitted: the named view in the horizontal title and the row labels provide the context, while MM identifiers stay horizontal. The human-readable **MM elements** view name is used in figure/report titles. Heatmap figures use fixed, named inch-based bands: a large header, an optional X-group band containing only the selected group token, the matrix, an optional case-label band when residual identity remains, and a compact legend/footer. Split values are rendered generically as `Split: <value>` from the selected project token; no equality-style or `X group:` captions are generated. Long Y-axis and MM labels wrap at readable widths without changing their identity. Grouping/split tokens are not repeated in case labels, and selected tokens are never restored when no residual identity remains. Actual and margin-only colours use separate incidence scales. A page suffix is shown only when the same split continues across multiple combined files; distinct split pages are identified by their `Split: <value>` title. Case labels remain compact and unambiguous within each visible group. Valid-cache heatmaps can be rebuilt without waveform reads; they are appended to the existing Sustained SDPF report section only when that voltage has a governing candidate.
 - Supports high-voltage proposal import from envelope output and from `PSCAD_log.txt` plus fast raw waveform maxima for matching case/MM buses.
 - Uses `Input_Data_PSCAD*.xlsx` and `.inf` files as the project-opening voltage sources; treated result CSVs and generated plot filenames are not used to define available voltages.
@@ -110,7 +193,9 @@ Dependency smoke test:
 ..\.conda\pscad-results-analysis\python.exe -c "import PySide6.QtCore, pandas, openpyxl, docx, win32com.client, matplotlib, numpy, pyexpat; import results_analysis_app; print('ok')"
 ```
 
-The last local source-level validation for this snapshot passed **220 tests**. Use the current command output, rather than this number alone, to determine whether validation succeeded.
+The latest recorded local source-level validation for this snapshot passed
+**242 tests**. Run the command and use its current output rather than relying
+on this number alone.
 
 ## Build executable
 
@@ -136,7 +221,10 @@ The build spec explicitly bundles conda runtime DLLs used by Python startup modu
 
 ## Source control
 
-Git is configured in this app root on branch `main`, with `origin` pointing to the project GitHub repository. Generated state, environments, caches, build output, and project output folders are excluded by `.gitignore`.
+Git is configured in this app root with `origin` pointing to the project GitHub
+repository. The active branch is intentionally not hard-coded in documentation;
+check it with `git branch --show-current`. Generated state, environments,
+caches, build output, and project output folders are excluded by `.gitignore`.
 
 Inspect `git status` before editing or committing. Preserve unrelated worktree changes and do not use destructive reset or checkout commands to discard them.
 
@@ -185,9 +273,9 @@ Outputs are written inside each selected PSCAD project, normally under:
 - Removing a project clears its project-specific x-axis settings, `Um` overrides, exclusions, status, and cached scan. Re-adding it starts with clean project-specific state.
 - Project opening automatically reads PSCAD-log warning case/MM pairs and uses a bounded pool to find one raw waveform maximum per matching case/run/bus. These maxima are cached. Changing only the high-voltage factor or `Um` reclassifies cached maxima without rereading waveforms. A changed log, matching `.inf`, or matching raw `.out` file refreshes only the log-derived high-voltage data. Projects without a log do not trigger a full raw-results scan.
 - Envelope builds enumerate `.inf` files once per build and hash each selected layout with BLAKE2b. Files with identical content share one parsed descriptor template across scopes and voltages. NonConv summary files and raw voltage runs are processed through bounded process workers; one run is submitted per worker and processed envelope data exists only for the current build. There is no persistent processed-waveform cache. The single project `.state/analysis_cache.json` stores only the envelope signature and generated-output metadata, allowing an unchanged complete envelope stage to be skipped. The process pool is reused for one voltage at a time, while voltage levels remain sequential. Envelope workers default to automatic selection: the nearest quarter of detected logical CPUs, capped at 60 for Windows process-pool compatibility and reduced when fewer runs exist. Settings expose an `Automatic` checkbox enabled by default; clearing it enables a positive manual override. Raw `.out` waveform reads remain voltage-specific.
-- The project analysis cache has one explicit schema version and stores only stage signatures, output paths, sizes, and modification times. Its envelope entry includes both the current Sustained SDPF result version and the summary-workbook format version, so summary-only layout changes force the envelope/summary outputs to rebuild while leaving the engineering result schema unchanged. Its plot entries include the current Sustained SDPF result version, while Sustained report entries also include the current Sustained report-layout version, so obsolete outputs are regenerated without storing per-folder JSON manifests. Obsolete per-run pickle caches and folder manifests are ignored and removed during the next relevant build. Sustained plot rendering receives the same project SDPF overrides as detection and changes only the SDPF fields; SIWL values remain those loaded by the plotter from the workbook/plotter override source. Sustained result version 17 persists the compact fixed-path sustained-T metric and independent population-specific representative references without flat aliases or embedded duplicate results.
+- The project analysis cache has one explicit schema version and stores only stage signatures, output paths, sizes, and modification times. Its envelope entry includes both the current Sustained SDPF result version and the summary-workbook format version, so summary-only layout changes force the envelope/summary outputs to rebuild while leaving the engineering result schema unchanged. Its plot entries include the current Sustained SDPF result version, while Sustained report entries also include the current Sustained report-layout version, so obsolete outputs are regenerated without storing per-folder JSON manifests. Obsolete per-run pickle caches and folder manifests are ignored and removed during the next relevant build. Sustained plot rendering receives the same project SDPF overrides as detection and changes only the SDPF fields; SIWL values remain those loaded by the plotter from the workbook/plotter override source. Sustained result version 19 persists the compact fixed-path sustained-T metric, qualifying-event descriptors, and independent population-specific representative references without flat aliases or embedded duplicate results.
 - `Envelope time end` uses the selected project's `Final duration` automatically by default. Clearing `Use project duration` enables a manual upper limit. Each run is capped again by the final timestamp already loaded with its raw waveform columns. No separate `.out` scan is performed and no zero-valued samples are generated after a run ends.
-- Sustained SDPF uses the project frequency from `Input_Data` when it is present and valid; otherwise it uses the configured envelope fallback frequency from Settings. It also uses the embedded plotter's per-voltage `MM_blocks` SDPF limits. The dedicated Settings table labels workbook-derived values, allows per-project RMS overrides with immediately recalculated peak/margin values, and labels edited rows `Manual`. It evaluates fixed LG phases and LL pairs independently: each complete cycle contributes its maximum absolute peak, and a sustained TOV is registered only when the selected peak threshold is met across a qualifying peak-envelope event that lasts at least the configured physical duration (30 ms by default) and at least `ceil(duration × frequency)` consecutive complete cycles. A short continuous excursion crossing a cycle boundary is rejected when its interpolated duration is too short; a sub-threshold or missing-cycle gap ends the event and a later excursion remains separate. RMS remains a supporting diagnostic and cannot qualify a sustained TOV alone. The analysis and plotter use the same RMS-to-peak conversion and SDPF/1.15 threshold. Short decaying events are excluded from the sustained result and remain with SFO/AFO. For ranking, the same max-absolute qualification envelope defines `V_T = max(t0) min(E(t) over [t0, t0+T])`; the cross-path value is `V_T / actual SDPF peak limit`, so a short high spike cannot determine the sustained-T metric. The full-wave envelope keeps both polarity peak magnitudes at their true timestamps, so a lower opposite-polarity peak creates a real below-limit gap. Actual SDPF candidates and Safety-margin-only candidates are never compared with one common severity rank. Each population independently selects the enabled highest sustained-T voltage, highest normalized full-wave excess area (`Worst cumulative stress`), and longest continuous full-wave duration (`Longest continuous duration`). Areas are never summed across phases, LL pairs, or separate events. The app writes compact result JSON plus a two-sheet `Sustained_SDpf_summary.xlsx`: `Ranked cases` is an audit table with one row per Case/Run/MM observation, explicit population rank and threshold, normalized excess area, qualification duration, full-wave continuous duration for ranking, sustained `V_T`, event timestamps, qualifying paths, and limit source; `Representative selections` lists the selected row for each criterion and population. A method block records result version, persistence, effective frequency, and cycle coverage. The workbook contains no waveform data, raw paths, RMS diagnostics, or plot settings. The persistence duration is independent of the ordinary TOV event setting. Result freshness uses one source fingerprint plus compact source-directory roots rather than a full raw-file metadata list.
+- Sustained SDPF uses the project frequency from `Input_Data` when it is present and valid; otherwise it uses the configured envelope fallback frequency from Settings. It also uses the embedded plotter's per-voltage `MM_blocks` SDPF limits. The dedicated Settings table labels workbook-derived values, allows per-project RMS overrides with immediately recalculated peak/margin values, and labels edited rows `Manual`. It evaluates fixed LG phases and LL pairs independently: each complete cycle contributes its maximum absolute peak to screening, so a positive violation → negative non-violation → positive violation sequence can remain a candidate when the absolute peak run is consecutive. The first and last raw waveform threshold crossings define the physical event duration. The positive/negative peak sequence is retained for full-wave area and continuous-duration ranking, where the lower opposite-polarity lobe creates a real below-limit gap; `V_T` uses the absolute qualification envelope. A short continuous excursion crossing a cycle boundary is rejected when its interpolated duration is too short; a missing-cycle gap ends the event and a later excursion remains separate. RMS remains a supporting diagnostic and cannot qualify a sustained TOV alone. The analysis and plotter use the same RMS-to-peak conversion and SDPF/1.15 threshold. Short decaying events are excluded from the sustained result and remain with SFO/AFO. The cross-path `V_T` value is normalized by the actual SDPF peak limit, so a short high spike cannot determine the sustained-T metric. Actual SDPF candidates and Safety-margin-only candidates are never compared with one common severity rank. Each population independently selects the enabled highest sustained-T voltage, highest normalized full-wave excess area (`Worst cumulative stress`), and longest continuous full-wave duration (`Longest continuous duration`). Areas are never summed across phases, LL pairs, or separate events. The app writes compact result JSON plus a two-sheet `Sustained_SDpf_summary.xlsx`: `Ranked cases` is an audit table with one row per Case/Run/MM observation, explicit population rank and threshold, normalized excess area, qualification duration, full-wave continuous duration for ranking, sustained `V_T`, event timestamps, qualifying paths, and limit source; `Representative selections` lists the selected row for each criterion and population. A method block records result version, persistence, effective frequency, and cycle coverage. The workbook contains no waveform data, raw paths, RMS diagnostics, or plot settings. The persistence duration is independent of the ordinary TOV event setting. Result freshness uses one source fingerprint plus compact source-directory roots rather than a full raw-file metadata list.
 - Project `Final duration` and frequency are read during project initialization and stored in the project scan cache. `Chart x max` defaults to that project-specific duration; `Chart x major` defaults to a readable interval near one tenth of the effective range. Both can be overridden per project in Settings and are saved in `.state`. Envelope and resonance charts share these values and remain capped by the available generated data duration.
 - Envelope waveform absolute values are reused between high-voltage checks and envelope rolling. Rolling envelopes are calculated only after a run's high-voltage scan, so automatically excluded buses do not perform work that will be discarded. Envelope workbooks keep the existing openpyxl table/filter formatting, then use Excel's native AutoFit through the already-packaged Excel automation support.
 - Envelope phase candidates are reduced directly with NumPy while preserving the existing source-order tie rule and Case/Run attribution; intermediate dataframe merge chains are no longer built.
@@ -211,6 +299,27 @@ Outputs are written inside each selected PSCAD project, normally under:
 - Full `Run analysis` reuses the same envelope, batch, render, and report action functions as the step buttons. Completed actions update only affected project output status and cache entries.
 - Documentation uses relative paths only. Update docs after meaningful behavior or workflow changes.
 - Git is used for source control; generated outputs and local state remain excluded from commits.
+
+## Measured performance reference
+
+These measurements are representative development-machine evidence, not
+guaranteed timings for every PSCAD project:
+
+- On `../Original_examples/03_Test_project_case`, a persistent project-scan
+  cache was about **7.8 s cold**, **0.48 s warm**, and **7.5 s forced**. The
+  warm path validates metadata without rereading waveforms.
+- On the same reference data, raw envelope reads took about **53 s** across
+  66/161/230 kV in one run; voltage levels are intentionally sequential and
+  waveform work is parallel within one voltage. This remains the main runtime
+  cost.
+- Plotter catalog/index work was below **0.04 s** in the same project, and
+  temporary plot-batch creation was below **0.3 s**. Reworking plotter
+  indexing is therefore not the primary optimization target.
+- Excel chart generation remains a shared COM process and took about **5.1 s
+  for three temporary workbooks**. Excel COM work is not parallelized.
+- Plot and heatmap rendering switch to bounded parallel workers at **three or
+  more independent jobs/pages**, use at most **four** workers, and fall back
+  to sequential work when parallel startup is not worthwhile or fails.
 
 ## Current validation gaps and risks
 

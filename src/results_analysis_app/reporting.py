@@ -47,7 +47,7 @@ JPEG_SIGNATURE = b"\xff\xd8"
 WORD_2012_NAMESPACE = "http://schemas.microsoft.com/office/word/2012/wordml"
 WORD_2016_CID_NAMESPACE = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
 REPORT_MANIFEST_VERSION = 2
-SUSTAINED_REPORT_LAYOUT_VERSION = 2
+SUSTAINED_REPORT_LAYOUT_VERSION = 3
 LEGACY_REPORT_MANIFEST_FILENAME = ".report_manifest.json"
 
 @dataclass(frozen=True)
@@ -1192,13 +1192,25 @@ def _sustained_selection_text(metrics: Iterable[str]) -> str:
 
 def _sustained_selection_groups(
     selections: Mapping[str, sustained_sdpf.SustainedSDPFResult],
+    population: str,
 ) -> list[tuple[sustained_sdpf.SustainedSDPFResult, tuple[str, ...]]]:
-    grouped: dict[tuple[str, int, str], list[str]] = {}
+    grouped: dict[tuple[Any, ...], list[str]] = {}
     for metric in sustained_sdpf.RANKING_SELECTIONS:
         result = selections.get(metric)
         if not isinstance(result, sustained_sdpf.SustainedSDPFResult):
             continue
-        grouped.setdefault(sustained_sdpf._result_identity(result), []).append(metric)
+        phase = result.governing
+        event = sustained_sdpf.selected_event(phase, population, metric)
+        grouped.setdefault(
+            (
+                *sustained_sdpf._result_identity(result),
+                str(phase.measurement).casefold(),
+                str(phase.phase).casefold(),
+                round(float(event.start_s), 12) if event is not None else None,
+                round(float(event.end_s), 12) if event is not None else None,
+            ),
+            [],
+        ).append(metric)
     return [
         (selections[metrics[0]], tuple(metrics))
         for metrics in grouped.values()
@@ -1222,17 +1234,18 @@ def _sustained_table_rows(
     rows: list[list[str]] = []
     for result, metrics in groups:
         phase = result.governing
+        metric = metrics[0] if metrics else sustained_sdpf.CUMULATIVE_STRESS_SELECTION
         (
             _threshold,
             _threshold_peak,
             area,
-            _qualification_duration_ms,
-            duration_ms,
+            qualification_duration_ms,
+            _duration_ms,
             sustained_t_peak,
             sustained_t_percent,
             _event_start,
             _event_end,
-        ) = sustained_sdpf._population_metric_values(phase, population)
+        ) = sustained_sdpf._population_metric_values(phase, population, metric)
         ratio_percent = (
             float(sustained_t_percent)
             if sustained_t_percent is not None
@@ -1247,7 +1260,7 @@ def _sustained_table_rows(
                 f"{phase.measurement} {phase.phase}",
                 f"{_report_metric_text(sustained_t_peak)} / {_report_metric_text(ratio_percent, 1)}%",
                 _report_metric_text(area),
-                _report_metric_text(duration_ms),
+                _report_metric_text(qualification_duration_ms),
             ]
         )
     return rows
@@ -1280,7 +1293,7 @@ def _add_sustained_selection_table(
         "Path",
         "Vₜ (kVₚₑₐₖ / %SDPF)",
         "Area (pu·ms)",
-        "Duration (ms)",
+        "Episode duration (ms)",
     )
     table = doc.add_table(rows=1, cols=len(headers))
     table.style = "Table Grid"
@@ -1347,7 +1360,7 @@ def _add_sustained_population_subsection(
     check_cancel: Callable[[], None] | None = None,
     table_registry: _TableRegistry | None = None,
 ) -> None:
-    groups = _sustained_selection_groups(selections)
+    groups = _sustained_selection_groups(selections, population)
     if not groups:
         return
     _add_report_heading(

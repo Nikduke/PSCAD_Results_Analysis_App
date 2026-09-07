@@ -70,12 +70,13 @@ def test_sustained_sdpf_uses_the_largest_polarity_peak_per_cycle() -> None:
     frequency = 60.0
     time = np.arange(0.0, 0.3, 0.0001)
     # Positive peaks reach 2.0 while negative excursions reach only -1.2.
-    # The positive half-wave alone must qualify each complete cycle.
+    # The positive half-wave alone remains a screening candidate.
     waveform = 1.6 * np.sin(2.0 * np.pi * frequency * time) + 0.4
     result = analyze_phase_amplitude(time, waveform, "LGp", "A-G", 1.0, 0.03, frequency)
 
     assert result.sdpf_exceeded
     assert result.sustained_peak_kv > 1.9
+    assert result.sdpf_longest_continuous_s < result.longest_sdpf_s
 
 
 def test_sustained_sdpf_keeps_a_later_event_separate_from_a_short_first_event() -> None:
@@ -802,7 +803,7 @@ def test_sustained_sdpf_summary_is_ranked_per_mm_and_keeps_phase_detail(tmp_path
         for row in ranked[1:header_index]
         if row and row[0]
     }
-    assert context["Result version"] == 17
+    assert context["Result version"] == 19
     assert context["Minimum persistence (ms)"] == 30.0
 
     representative = list(workbook["Representative selections"].values)
@@ -1272,7 +1273,7 @@ def test_sustained_sdpf_report_section_is_compact() -> None:
         "Path",
         "Vₜ (kVₚₑₐₖ / %SDPF)",
         "Area (pu·ms)",
-        "Duration (ms)",
+        "Episode duration (ms)",
     ]
     assert document.tables[0].rows[1].cells[0].text == (
         "Cumulative stress; Longest duration"
@@ -1335,6 +1336,7 @@ def test_sustained_sdpf_report_merges_criteria_for_one_case() -> None:
         "Highest sustained Vₜ; Cumulative stress; Longest duration"
     )
     assert table.rows[1].cells[5].text == "1.3 / 92%"
+    assert table.rows[1].cells[7].text == "30"
     text = "\n".join(paragraph.text for paragraph in document.paragraphs)
     assert "Maximum qualifying sustained-run" not in text
     assert "RMS diagnostic" not in text
