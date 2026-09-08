@@ -419,6 +419,58 @@ def test_report_plot_heading_precedes_cross_reference(tmp_path, monkeypatch) -> 
     assert document.paragraphs[heading_index].style.name == "Plot Heading"
 
 
+def test_report_places_rms_first_after_event_sections(tmp_path, monkeypatch) -> None:
+    from docx import Document
+
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    event_image = tmp_path / "C1_MM_161_A_001_LGp_LLp_3Ph.png"
+    rms_image = tmp_path / "C1_MM_161_A_001_LGr_max_3Ph.png"
+    resonance_image = tmp_path / "C1_MM_161_A_001_LGp_3Ph.png"
+    for path in (event_image, rms_image, resonance_image):
+        path.write_bytes(b"placeholder")
+
+    monkeypatch.setattr(reporting, "_is_report_image", lambda _path: True)
+    monkeypatch.setattr(reporting, "_add_centered_report_image", lambda *_args: None)
+    monkeypatch.setattr(reporting, "_find_event_images", lambda *_args: [event_image])
+    monkeypatch.setattr(reporting, "_find_rms_images", lambda *_args: [rms_image])
+    monkeypatch.setattr(
+        reporting,
+        "_find_resonance_images",
+        lambda _root, _scope, _check, voltage_type, _voltage, _cache: (
+            [resonance_image] if voltage_type == "LGp" else []
+        ),
+    )
+
+    outputs = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        ["SFO", "TOV", "SA"],
+        resonance_settings={"enabled_checks": ["Post_Event_Stress"]},
+        rms_settings_by_project={
+            str(project.resolve()): {
+                "enabled": True,
+                "quantities": ["LG"],
+                "elements": ["MM_161_A"],
+            }
+        },
+    )
+
+    headings = [
+        paragraph.text
+        for paragraph in Document(outputs[0]).paragraphs
+        if paragraph.style.name == "Heading 2"
+    ]
+    assert headings.index("SFO") < headings.index("RMS")
+    assert headings.index("TOV") < headings.index("RMS")
+    assert headings.index("SA") < headings.index("RMS")
+    assert headings.index("RMS") < headings.index("Post-event stress - LGp")
+
+
 def test_report_dashboard_heading_precedes_cross_reference(tmp_path, monkeypatch) -> None:
     from docx import Document
 

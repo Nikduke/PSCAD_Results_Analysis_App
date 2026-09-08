@@ -20,6 +20,7 @@ from results_analysis_app.project_config import DEFAULT_EVENT_TIMES, normalize_v
 DEFAULT_VOLTAGES: tuple[str, ...] = ()
 DEFAULT_EVENTS = ("SFO", "TOV", "SA")
 DEFAULT_RESONANCE_CHECKS = ("Post_Event_Stress", "Late_Growth", "No_Settle_Growth")
+DEFAULT_ANALYSIS_STUDIES = (*DEFAULT_RESONANCE_CHECKS, "Sustained_SDPF", "RMS")
 DEFAULT_ENVELOPE_TIME_STEP = 0.002
 DEFAULT_ENVELOPE_TIME_END = 1.0
 DEFAULT_ENVELOPE_TIME_END_AUTO = True
@@ -160,6 +161,53 @@ def normalize_project_sustained_sdpf_limit_overrides(
                 project_limits[voltage_key] = values
         if project_limits:
             output[str(project)] = project_limits
+    return output
+
+
+def normalize_project_analysis_enabled(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, list[str]] = {}
+    for project, raw_values in value.items():
+        if not isinstance(raw_values, (list, tuple, set)):
+            continue
+        values: list[str] = []
+        for item in raw_values:
+            name = str(item).strip()
+            if name in DEFAULT_ANALYSIS_STUDIES and name not in values:
+                values.append(name)
+        output[str(project)] = [name for name in DEFAULT_ANALYSIS_STUDIES if name in values]
+    return output
+
+
+def normalize_project_rms_settings(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    # Keep model loading independent from the UI and from the plotter package.
+    quantities_allowed = {"LG", "LL"}
+    output: dict[str, dict[str, Any]] = {}
+    for project, raw in value.items():
+        if not isinstance(raw, dict):
+            continue
+        quantities: list[str] = []
+        raw_quantities = raw.get("quantities", ["LG", "LL"])
+        if isinstance(raw_quantities, (list, tuple, set)):
+            for item in raw_quantities:
+                quantity = str(item).strip().upper()
+                if quantity in quantities_allowed and quantity not in quantities:
+                    quantities.append(quantity)
+        elements: list[str] = []
+        raw_elements = raw.get("elements", [])
+        if isinstance(raw_elements, (list, tuple, set)):
+            for item in raw_elements:
+                element = str(item or "").strip()
+                if element and element.casefold() not in {value.casefold() for value in elements}:
+                    elements.append(element)
+        output[str(project)] = {
+            "enabled": bool(raw.get("enabled", False)),
+            "quantities": [item for item in ("LG", "LL") if item in quantities],
+            "elements": sorted(elements, key=str.casefold),
+        }
     return output
 
 
@@ -420,6 +468,10 @@ class AppSession:
     nonconv_cb_iip_limit: float = DEFAULT_NONCONV_CB_IIP_LIMIT
     nonconv_cb_iir_limit: float = DEFAULT_NONCONV_CB_IIR_LIMIT
     resonance_enabled_checks: list[str] = field(default_factory=list)
+    # New sessions keep the analysis selection per project.  Empty mappings
+    # retain the legacy global controls when loading older session files.
+    analysis_enabled_by_project: dict[str, list[str]] = field(default_factory=dict)
+    rms_settings_by_project: dict[str, dict[str, Any]] = field(default_factory=dict)
     resonance_top_n: int = DEFAULT_RESONANCE_TOP_N
     resonance_limit_multiplier: float = DEFAULT_RESONANCE_LIMIT_MULTIPLIER
     resonance_auto_release: bool = DEFAULT_RESONANCE_AUTO_RELEASE
@@ -466,6 +518,14 @@ class AppSession:
         if any(project.path.casefold() == resolved.casefold() for project in self.projects):
             return
         self.projects.append(ProjectEntry(path=resolved, selected=True))
+        self.analysis_enabled_by_project.setdefault(
+            resolved,
+            [name for name in DEFAULT_ANALYSIS_STUDIES if name != "RMS"],
+        )
+        self.rms_settings_by_project.setdefault(
+            resolved,
+            {"enabled": False, "quantities": ["LG", "LL"], "elements": []},
+        )
 
     def remove_projects(self, paths: set[str]) -> None:
         keys = {path.casefold() for path in paths}
@@ -481,6 +541,8 @@ class AppSession:
             self.sustained_sdpf_heatmap_settings_by_project,
             self.sustained_sdpf_ranking_settings_by_project,
             self.sustained_sdpf_limit_overrides_by_project,
+            self.analysis_enabled_by_project,
+            self.rms_settings_by_project,
             self.status_cache,
         ):
             for project in list(mapping):
@@ -525,6 +587,8 @@ class AppSession:
             "nonconv_cb_iip_limit": self.nonconv_cb_iip_limit,
             "nonconv_cb_iir_limit": self.nonconv_cb_iir_limit,
             "resonance_enabled_checks": self.resonance_enabled_checks,
+            "analysis_enabled_by_project": self.analysis_enabled_by_project,
+            "rms_settings_by_project": self.rms_settings_by_project,
             "resonance_top_n": self.resonance_top_n,
             "resonance_limit_multiplier": self.resonance_limit_multiplier,
             "resonance_auto_release": self.resonance_auto_release,
@@ -594,6 +658,12 @@ class AppSession:
             for value in _json_list(data.get("projects"))
             if isinstance(value, dict)
         ]
+        analysis_enabled_by_project = normalize_project_analysis_enabled(
+            data.get("analysis_enabled_by_project", {})
+        )
+        rms_settings_by_project = normalize_project_rms_settings(
+            data.get("rms_settings_by_project", {})
+        )
         dashboard_selection_by_project = normalize_project_dashboard_figure_selection(
             data.get("dashboard_figure_selection_by_project", {})
         )
@@ -725,6 +795,8 @@ class AppSession:
                 for value in _json_list(data.get("resonance_enabled_checks"))
                 if str(value) in DEFAULT_RESONANCE_CHECKS
             ],
+            analysis_enabled_by_project=analysis_enabled_by_project,
+            rms_settings_by_project=rms_settings_by_project,
             resonance_top_n=normalize_positive_int(
                 data.get("resonance_top_n", DEFAULT_RESONANCE_TOP_N),
                 DEFAULT_RESONANCE_TOP_N,

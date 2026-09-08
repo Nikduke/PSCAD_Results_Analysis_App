@@ -14,6 +14,7 @@ from results_analysis_app import (
     project_scan_runner,
     reporting,
     resonance_checks,
+    rms_analysis,
     scanner,
     storage,
     sustained_sdpf,
@@ -103,6 +104,74 @@ class _VoltagePopupContent(QtWidgets.QWidget):
             child_centres.append((child_x, child_y))
         painter.drawLine(branch_x, root_y, branch_x, child_centres[-1][1])
         for child_x, child_y in child_centres:
+            painter.drawLine(branch_x, child_y, child_x, child_y)
+
+
+class _RMSPopupContent(QtWidgets.QWidget):
+    """Project-specific RMS quantity and MM-element selections."""
+
+    _CHILD_INDENT = 20
+    _BRANCH_OFFSET = 8
+
+    def __init__(
+        self,
+        quantity_checks: Iterable[QtWidgets.QCheckBox],
+        element_checks: Iterable[QtWidgets.QCheckBox],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.quantity_checks = list(quantity_checks)
+        self.element_checks = list(element_checks)
+        self.element_rows: list[QtWidgets.QWidget] = []
+        self.setMinimumWidth(220)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 3, 8, 3)
+        layout.setSpacing(0)
+        quantity_label = QtWidgets.QLabel("Quantities", self)
+        quantity_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(quantity_label)
+        quantity_row = QtWidgets.QWidget(self)
+        quantity_layout = QtWidgets.QHBoxLayout(quantity_row)
+        quantity_layout.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
+        quantity_layout.setSpacing(8)
+        for check in self.quantity_checks:
+            quantity_layout.addWidget(check)
+        quantity_layout.addStretch(1)
+        layout.addWidget(quantity_row)
+        element_label = QtWidgets.QLabel("MM elements", self)
+        element_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(element_label)
+        for check in self.element_checks:
+            row = QtWidgets.QWidget(self)
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
+            row_layout.setSpacing(0)
+            row_layout.addWidget(check)
+            row_layout.addStretch(1)
+            row.setMinimumHeight(check.sizeHint().height())
+            layout.addWidget(row)
+            self.element_rows.append(row)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 - Qt override name
+        super().paintEvent(event)
+        if not self.element_rows:
+            return
+        margins = self.layout().contentsMargins()
+        branch_x = margins.left() + self._BRANCH_OFFSET
+        label = next(
+            (item for item in self.findChildren(QtWidgets.QLabel) if item.text() == "MM elements"),
+            None,
+        )
+        if label is None:
+            return
+        root_y = label.geometry().center().y()
+        painter = QtGui.QPainter(self)
+        color = self.palette().color(QtGui.QPalette.ColorRole.Mid)
+        color.setAlpha(180)
+        painter.setPen(QtGui.QPen(color, 1))
+        centres = [(row.geometry().left() + row.layout().contentsMargins().left(), row.geometry().center().y()) for row in self.element_rows]
+        painter.drawLine(branch_x, root_y, branch_x, centres[-1][1])
+        for child_x, child_y in centres:
             painter.drawLine(branch_x, child_y, child_x, child_y)
 
 
@@ -246,6 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.ensure_full_scope()
         self.project_scans: dict[str, scanner.ProjectScan] = {}
         self.dashboard_figures: dict[str, list[DashboardFigure]] = {}
+        self._mm_catalog_by_project: dict[str, Any] = {}
         self._fault_types_by_project: dict[str, dict[tuple[str, int], str]] = {}
         self._high_voltage_groups_by_project: dict[
             str,
@@ -374,6 +444,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._add_top_bar_divider(layout, bar)
         layout.addWidget(make_section_label("Analysis:", bar))
+        self.rms_checkbox = QtWidgets.QCheckBox(bar)
+        self.rms_checkbox.setToolTip("Enable project-specific RMS voltage analysis.")
+        self.rms_checkbox.toggled.connect(self._on_global_selection_changed)
+        layout.addWidget(self.rms_checkbox)
+        self.rms_button = QtWidgets.QPushButton("RMS", bar)
+        self.rms_button.setMinimumWidth(52)
+        apply_secondary_button_style(self.rms_button)
+        self.rms_button.setToolTip("Select RMS quantity and MM elements for the current project.")
+        self.rms_menu = QtWidgets.QMenu(self.rms_button)
+        self.rms_button.setMenu(self.rms_menu)
+        self.rms_quantity_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.rms_element_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.rms_popup_content: _RMSPopupContent | None = None
+        self.rms_popup_scroll: QtWidgets.QScrollArea | None = None
+        layout.addWidget(self.rms_button)
         resonance_short_labels = {
             "Post_Event_Stress": "Stress",
             "Late_Growth": "Late",
@@ -855,6 +940,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reload_project_tree()
             self._reload_scope_list()
             self._reload_project_exclusions()
+            self._load_project_analysis_options(self._current_project_path())
         finally:
             self._loading = was_loading
 
@@ -920,6 +1006,164 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._loading:
             self._sync_global_selections_from_ui()
 
+    def _load_project_analysis_options(self, project_path: str | None) -> None:
+        """Load project-scoped analysis and RMS choices without changing legacy sessions."""
+        selected_analysis = set(self._analysis_selection_for_project(project_path))
+        has_project_selection = bool(
+            project_path and project_path in self.session.analysis_enabled_by_project
+        )
+        was_loading = self._loading
+        self._loading = True
+        try:
+            for check_name, check in self.resonance_checkboxes.items():
+                check.setChecked(check_name in selected_analysis)
+            self.sustained_sdpf_checkbox.setChecked("Sustained_SDPF" in selected_analysis)
+            self._set_rms_options(project_path)
+            rms_settings = rms_analysis.normalize_rms_settings(
+                self.session.rms_settings_by_project.get(project_path or "")
+            )
+            self.rms_checkbox.setChecked(
+                bool(rms_settings["enabled"]) and bool(rms_settings["elements"])
+            )
+            for quantity, check in self.rms_quantity_checks.items():
+                check.setChecked(quantity in rms_settings["quantities"])
+            selected_elements = {item.casefold() for item in rms_settings["elements"]}
+            for element, check in self.rms_element_checks.items():
+                check.setChecked(element.casefold() in selected_elements)
+            self._update_rms_selector_state()
+            if has_project_selection:
+                self.session.resonance_enabled_checks = [
+                    check_name
+                    for check_name in DEFAULT_RESONANCE_CHECKS
+                    if check_name in selected_analysis
+                ]
+                self.session.sustained_sdpf_enabled = (
+                    "Sustained_SDPF" in selected_analysis
+                )
+        finally:
+            self._loading = was_loading
+
+    def _analysis_selection_for_project(self, project_path: str | None) -> list[str]:
+        if project_path and project_path in self.session.analysis_enabled_by_project:
+            return list(self.session.analysis_enabled_by_project[project_path])
+        return [
+            *self.session.resonance_enabled_checks,
+            *(("Sustained_SDPF",) if self.session.sustained_sdpf_enabled else ()),
+            *(("RMS",) if self.session.rms_settings_by_project.get(project_path or "", {}).get("enabled") else ()),
+        ]
+
+    def _analysis_settings_by_project(
+        self,
+        project_paths: Iterable[str],
+    ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+        """Build the shared numeric settings with project-specific enables."""
+        base_resonance = self._resonance_settings()
+        base_sustained = self._sustained_sdpf_settings()
+        resonance_by_project: dict[str, dict[str, object]] = {}
+        sustained_by_project: dict[str, dict[str, object]] = {}
+        for raw_path in project_paths:
+            project_path = str(Path(raw_path).resolve())
+            selected = set(self._analysis_selection_for_project(project_path))
+            resonance = dict(base_resonance)
+            resonance["enabled_checks"] = [
+                check_name
+                for check_name in DEFAULT_RESONANCE_CHECKS
+                if check_name in selected
+            ]
+            sustained = dict(base_sustained)
+            sustained["enabled"] = "Sustained_SDPF" in selected
+            resonance_by_project[project_path] = resonance
+            sustained_by_project[project_path] = sustained
+        return resonance_by_project, sustained_by_project
+
+    def _set_rms_options(self, project_path: str | None) -> None:
+        self.rms_menu.clear()
+        self.rms_quantity_checks = {}
+        self.rms_element_checks = {}
+        self.rms_popup_content = None
+        self.rms_popup_scroll = None
+        elements: list[str] = []
+        if project_path:
+            try:
+                elements = rms_analysis.available_elements(
+                    self._load_mm_catalog_for_project(project_path).mm_results
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                self.log(f"RMS MM catalog unavailable for {Path(project_path).name}: {exc}")
+        quantity_checks = []
+        for quantity in rms_analysis.RMS_QUANTITIES:
+            check = QtWidgets.QCheckBox(quantity)
+            check.toggled.connect(self._on_global_selection_changed)
+            self.rms_quantity_checks[quantity] = check
+            quantity_checks.append(check)
+        for element in elements:
+            check = QtWidgets.QCheckBox(element)
+            check.toggled.connect(self._on_global_selection_changed)
+            self.rms_element_checks[element] = check
+        self.rms_popup_content = _RMSPopupContent(
+            quantity_checks,
+            self.rms_element_checks.values(),
+        )
+        self.rms_popup_scroll = QtWidgets.QScrollArea(self.rms_menu)
+        self.rms_popup_scroll.setObjectName("rmsPopupScroll")
+        self.rms_popup_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.rms_popup_scroll.setWidgetResizable(True)
+        self.rms_popup_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.rms_popup_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.rms_popup_scroll.setFixedWidth(260)
+        self.rms_popup_scroll.setMaximumHeight(320)
+        self.rms_popup_scroll.setWidget(self.rms_popup_content)
+        popup_height = self.rms_popup_content.sizeHint().height() + 2
+        self.rms_popup_scroll.setFixedHeight(min(320, max(1, popup_height)))
+        popup_action = QtWidgets.QWidgetAction(self.rms_menu)
+        popup_action.setDefaultWidget(self.rms_popup_scroll)
+        self.rms_menu.addAction(popup_action)
+
+    def _load_mm_catalog_for_project(self, project_path: str):
+        normalized = str(Path(project_path).resolve())
+        catalog = self._mm_catalog_by_project.get(normalized)
+        if catalog is not None:
+            return catalog
+        from pscad_plotter_app_v3.services.project import (
+            CatalogCache,
+            ProjectDiscoveryService,
+            ResultsCatalogService,
+            RunAvailabilityService,
+        )
+
+        context = ProjectDiscoveryService().discover(normalized)
+        context.state_dir.mkdir(parents=True, exist_ok=True)
+        cache = CatalogCache(context.state_dir)
+        try:
+            run_index = RunAvailabilityService().build_index(context)
+            catalog = ResultsCatalogService().build_base_catalog(context, run_index, cache)
+        finally:
+            cache.close()
+        self._mm_catalog_by_project[normalized] = catalog
+        return catalog
+
+    def _update_rms_selector_state(self) -> None:
+        project_path = self._current_project_path()
+        selected_project_paths = {
+            project.path for project in self.session.projects if project.selected
+        }
+        available = bool(
+            project_path
+            and project_path in selected_project_paths
+            and self.rms_element_checks
+        )
+        self.rms_checkbox.setEnabled(available)
+        self.rms_button.setEnabled(available)
+        if not available:
+            blocker = QtCore.QSignalBlocker(self.rms_checkbox)
+            self.rms_checkbox.setChecked(False)
+            del blocker
+        self.rms_button.setToolTip(
+            "Select RMS quantity and MM elements for the current project."
+            if available
+            else "Select a project with MM measurement elements to configure RMS."
+        )
+
     def _sorted_voltages(self, voltages: Iterable[str]) -> list[str]:
         unique = {str(voltage).strip() for voltage in voltages if str(voltage).strip()}
         return sorted(unique, key=self._voltage_sort_key)
@@ -978,6 +1222,27 @@ class MainWindow(QtWidgets.QMainWindow):
             if check.isChecked()
         ]
         self.session.sustained_sdpf_enabled = self.sustained_sdpf_checkbox.isChecked()
+        project_path = self._current_project_path()
+        if project_path:
+            selected_analysis = list(self.session.resonance_enabled_checks)
+            if self.sustained_sdpf_checkbox.isChecked():
+                selected_analysis.append("Sustained_SDPF")
+            if self.rms_checkbox.isChecked():
+                selected_analysis.append("RMS")
+            self.session.analysis_enabled_by_project[project_path] = selected_analysis
+            self.session.rms_settings_by_project[project_path] = {
+                "enabled": self.rms_checkbox.isChecked(),
+                "quantities": [
+                    quantity
+                    for quantity, check in self.rms_quantity_checks.items()
+                    if check.isChecked()
+                ],
+                "elements": [
+                    element
+                    for element, check in self.rms_element_checks.items()
+                    if check.isChecked()
+                ],
+            }
         self._save_current_project_exclusions()
         self._update_voltage_selector_state()
 
@@ -1248,11 +1513,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if project_paths is None:
             self._fault_types_by_project.clear()
             self._high_voltage_groups_by_project.clear()
+            self._mm_catalog_by_project.clear()
             return
         for project_path in project_paths:
             normalized = str(Path(project_path).resolve())
             self._fault_types_by_project.pop(normalized, None)
             self._high_voltage_groups_by_project.pop(normalized, None)
+            self._mm_catalog_by_project.pop(normalized, None)
 
     def _set_high_voltage_ui_visible(self, visible: bool) -> None:
         index = self.exclusion_tabs.indexOf(self.high_voltage_tab)
@@ -1665,6 +1932,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 project.selected = item.checkState(0) == QtCore.Qt.CheckState.Checked
                 break
         self._update_voltage_options_from_scans()
+        if path == self._current_project_path():
+            self._load_project_analysis_options(path)
+        self._update_rms_selector_state()
         self.autosave()
         self.update_preview()
 
@@ -1680,9 +1950,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if current is None:
             self._load_dashboard_figure_list(None)
             self._reload_project_exclusions(None)
+            self._load_project_analysis_options(None)
             return
         self._load_dashboard_figure_list(project_path)
         self._reload_project_exclusions(project_path)
+        self._load_project_analysis_options(project_path)
         self.update_preview()
 
     def _update_project_selection_visual(
@@ -1926,6 +2198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for path in paths:
             self.project_scans.pop(path, None)
             self.dashboard_figures.pop(path, None)
+            self._mm_catalog_by_project.pop(str(Path(path).resolve()), None)
         try:
             project_scan_cache.remove_projects(paths)
         except OSError as exc:
@@ -2066,6 +2339,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session = AppSession.default()
         self.project_scans.clear()
         self.dashboard_figures.clear()
+        self._mm_catalog_by_project.clear()
         self._autosave_timer.stop()
         storage.clear_autosave()
         try:
@@ -2616,7 +2890,12 @@ class MainWindow(QtWidgets.QMainWindow):
             project_path: self._dashboard_figure_ids_for_project(project_path)
             for project_path in projects
         }
+        resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         envelope_kwargs = self._envelope_build_kwargs(projects)
+        envelope_kwargs["resonance_settings_by_project"] = resonance_settings_by_project
+        envelope_kwargs["sustained_sdpf_settings_by_project"] = sustained_settings_by_project
         envelope_kwargs["sustained_sdpf_heatmap_settings_by_project"] = dict(
             self.session.sustained_sdpf_heatmap_settings_by_project
         )
@@ -2635,6 +2914,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 events,
                 dashboard_figure_ids_by_project=dashboard_figure_ids_by_project,
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
+                rms_settings_by_project={
+                    path: rms_analysis.normalize_rms_settings(
+                        self.session.rms_settings_by_project.get(path)
+                    )
+                    for path in projects
+                },
                 **envelope_kwargs,
                 log=prompt_log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2662,7 +2947,12 @@ class MainWindow(QtWidgets.QMainWindow):
         voltages = list(self.session.voltages)
         if not self._ensure_voltage_um(projects, voltages):
             return
+        resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         envelope_kwargs = self._envelope_build_kwargs(projects)
+        envelope_kwargs["resonance_settings_by_project"] = resonance_settings_by_project
+        envelope_kwargs["sustained_sdpf_settings_by_project"] = sustained_settings_by_project
 
         def work(log, cancel):
             log("Envelope build started.")
@@ -2695,6 +2985,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         projects, scopes = selected
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        _resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
 
         def work(log, cancel):
@@ -2703,6 +2996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 projects,
                 scopes,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                sustained_sdpf_settings_by_project=sustained_settings_by_project,
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
                 event_times=dict(self.session.event_times),
                 log=log,
@@ -2818,6 +3112,9 @@ class MainWindow(QtWidgets.QMainWindow):
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
         ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
 
@@ -2831,8 +3128,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 dict(self.session.event_times),
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                resonance_settings_by_project=resonance_settings_by_project,
+                sustained_sdpf_settings_by_project=sustained_settings_by_project,
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
                 sustained_sdpf_ranking_settings_by_project=ranking_settings,
+                rms_settings_by_project={
+                    path: rms_analysis.normalize_rms_settings(
+                        self.session.rms_settings_by_project.get(path)
+                    )
+                    for path in projects
+                },
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2849,6 +3154,9 @@ class MainWindow(QtWidgets.QMainWindow):
         projects, scopes = selected
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
         ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
         limit_overrides = dict(self.session.sustained_sdpf_limit_overrides_by_project)
@@ -2861,11 +3169,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 (),
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                resonance_settings_by_project=resonance_settings_by_project,
+                sustained_sdpf_settings_by_project=sustained_settings_by_project,
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
                 sustained_sdpf_ranking_settings_by_project=ranking_settings,
                 event_times=dict(self.session.event_times),
                 sustained_sdpf_limit_overrides_by_project=limit_overrides,
                 sustained_voltage_keys=self.session.voltages,
+                rms_settings_by_project={
+                    path: rms_analysis.normalize_rms_settings(
+                        self.session.rms_settings_by_project.get(path)
+                    )
+                    for path in projects
+                },
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -2890,8 +3206,17 @@ class MainWindow(QtWidgets.QMainWindow):
         events = list(self.session.events)
         resonance_settings = self._resonance_settings()
         sustained_sdpf_settings = self._sustained_sdpf_settings()
+        resonance_settings_by_project, sustained_settings_by_project = (
+            self._analysis_settings_by_project(projects)
+        )
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
         ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
+        rms_settings = {
+            path: rms_analysis.normalize_rms_settings(
+                self.session.rms_settings_by_project.get(path)
+            )
+            for path in projects
+        }
 
         def work(log, cancel):
             log("Report rebuild started.")
@@ -2909,8 +3234,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 },
                 resonance_settings=resonance_settings,
                 sustained_sdpf_settings=sustained_sdpf_settings,
+                resonance_settings_by_project=resonance_settings_by_project,
+                sustained_sdpf_settings_by_project=sustained_settings_by_project,
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
                 sustained_sdpf_ranking_settings_by_project=ranking_settings,
+                rms_settings_by_project=rms_settings,
                 event_times=dict(self.session.event_times),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -3260,6 +3588,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for check in self.resonance_checkboxes.values():
             check.setEnabled(not busy)
         self.sustained_sdpf_checkbox.setEnabled(not busy)
+        rms_available = bool(self._current_project_path() and self.rms_element_checks)
+        self.rms_checkbox.setEnabled(not busy and rms_available)
+        self.rms_button.setEnabled(not busy and rms_available)
+        for check in self.rms_quantity_checks.values():
+            check.setEnabled(not busy)
+        for check in self.rms_element_checks.values():
+            check.setEnabled(not busy)
         self.busy_progress.setVisible(busy)
         self.stop_button.setEnabled(busy)
         self.set_status(status)

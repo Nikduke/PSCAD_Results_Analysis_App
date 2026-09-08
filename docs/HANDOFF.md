@@ -1,6 +1,6 @@
 # Codex handoff: PSCAD Results Analysis
 
-Last reviewed: 2026-09-07
+Last reviewed: 2026-09-08
 
 This is the short, current handoff for starting a new Codex chat in this
 project. It describes the implemented app and its contracts; the source code
@@ -48,8 +48,9 @@ results. It can:
 - add and cache one or more PSCAD result projects;
 - discover cases, runs, fault types, voltages, MM buses/elements, scopes, dashboards, and exclusions;
 - build LGp and LLp voltage-envelope workbooks and Excel charts;
-- run Stress, Late Growth, No-settle Growth, and peak-envelope Sustained SDPF checks;
-- create/render MM waveform plot batches and optional waveform Excel exports;
+- run Stress, Late Growth, No-settle Growth, peak-envelope Sustained SDPF, and project-specific RMS checks;
+- select RMS LG/LL quantities and alphabetized MM elements from the first analysis control;
+- create/render MM waveform plot batches and optional waveform Excel exports, including RMS max/min plots;
 - create Sustained SDPF incidence heatmaps; and
 - assemble DOCX reports from the generated outputs.
 
@@ -70,10 +71,10 @@ Treat the application as five related but distinct regimes:
    discover dashboard figures, and optionally refresh Excel dashboards.
 3. **Envelope/check** - apply exclusions, read raw PSCAD waveforms, build
    voltage envelopes, perform the all-case High Voltage gate, and run the
-   selected Stress/Late/No-settle/Sustained SDPF checks.
+   selected Stress/Late/No-settle/Sustained SDPF/RMS checks.
 4. **Batch/render/report** - create plot batches, render MM plots and optional
-   waveform workbooks, render Sustained SDPF heatmaps, and assemble DOCX
-   reports.
+   waveform workbooks, render RMS plots and Sustained SDPF heatmaps, and
+   assemble DOCX reports.
 5. **Rebuild-only** - rebuild charts, heatmaps, or reports from valid saved
    artifacts without repeating unrelated waveform work.
 
@@ -96,7 +97,7 @@ or recatalog saved dashboard figures.
 | Scanning | `scanner.py`, `project_scan_runner.py`, `project_scan_cache.py`, `project_config.py` | Project discovery, metadata cache, timing/frequency/voltage inputs, fault map, proposals |
 | Exclusions | `exclusions.py` | Manual, NonConv, High Voltage normalization and matching |
 | Envelopes | `voltage_envelope.py`, `envelope_chart.py`, `envelope_rows.py` | Raw reads, exclusions, envelopes, Excel workbooks/charts, shared nearest-time selection |
-| Checks | `resonance_checks.py`, `sustained_sdpf.py` | Existing envelope checks and project-defined Sustained SDPF persistence |
+| Checks | `resonance_checks.py`, `sustained_sdpf.py`, `rms_analysis.py` | Existing envelope checks, project-defined Sustained SDPF persistence, and RMS selection from the shared MM catalog |
 | Heatmaps | `sustained_sdpf_heatmap.py` | Persisted Run x MM aggregation and heatmap rendering |
 | Plot bridge | `analysis_engine.py`, `src/pscad_plotter_app_v3/` | Batch creation, MM plotting, process execution, and waveform Excel export |
 | Plotter conventions | `pscad_plotter_app_v3/services/project_conventions.py` | Case/run filename parsing, statistic-file selection, fault-label normalization, and statistic-row parsing |
@@ -126,8 +127,8 @@ every selected project.
 
 Current source versions are: project scan cache **7**, project analysis cache
 **1**, voltage-envelope manifest **3**, Sustained result JSON **19**, Sustained
-summary workbook **4**, plot-batch manifest **2**, and report/report-layout
-manifests **2/3**. The embedded plotter's SQLite/MM caches are **2/1**.
+summary workbook **4**, plot-batch manifest **3**, and report/report-layout
+manifests **2/3**. The embedded plotter's SQLite/MM caches are **3/2**.
 Obsolete or incomplete artifacts are rebuilt; they are not treated as valid
 empty results. The app deliberately does not persist a processed-waveform
 cache.
@@ -198,7 +199,10 @@ covered by plotting tests.
    settings, exclusions, and include overrides to the functions in `actions.py`.
    Voltage levels are selected through the `Voltages` popup: `All voltages`
    is the tri-state master checkbox and the entries below it are the individual
-   levels.
+   levels. RMS is the first Analysis control; its popup is project-specific and
+   lists LG/LL quantities plus alphabetized MM elements. It is enabled only
+   when the highlighted project is checked and its shared MM-results catalog
+   contains elements.
 4. **Build envelopes/checks.** `voltage_envelope.build_voltage_envelopes`
    loads `Statistic*.out` tables through the NumPy fast path (with the legacy
    pandas fallback), using one process below 1,000 files and a separate pool
@@ -233,7 +237,10 @@ covered by plotting tests.
    repeatedly; standalone actions still validate their saved data locally.
    Active parallel plot workers are terminated promptly on Stop.
 5. **Post-processing.** The selected action builds combined Excel charts, plot
-   batches, rendered plots, heatmaps, and reports. `Rebuild heatmaps` uses the
+   batches, rendered RMS max/min plots, Sustained heatmaps, and reports. RMS
+   reads the already parsed/cached `Results/MM results.csv` rows and writes
+   separate `RMS/LG` and `RMS/LL` outputs; it does not add a second raw
+   waveform read. `Rebuild heatmaps` uses the
    saved Sustained SDPF JSON only; it does not reread waveforms. If validation
    reports a stale or mismatched Sustained cache, rerun `Build envelope
    data/checks`; the report log identifies the exact reason instead of
@@ -285,6 +292,27 @@ covered by plotting tests.
   same gate and ranks by `(sigma, positive fraction, longest positive-growth
   window, growth ratio, end p95 / Vlim, area)`. Top N is selected independently
   for each check, voltage, and LGp/LLp measurement type.
+
+### RMS analysis
+
+- RMS is the first analysis section in each voltage report, immediately after
+  the selected SFO/TOV/SA event sections and before Sustained SDPF and resonance
+  sections.
+- The control is project-specific. New projects keep RMS disabled by default;
+  the popup is enabled only for a checked project with discovered `MM_`
+  elements. The user selects LG, LL, or both quantities and any alphabetized
+  subset of the available MM elements. Analysis and RMS selections are restored
+  independently when the active project changes.
+- RMS consumes the shared parsed/cached `Results/MM results.csv` catalog, whose
+  bus names are already part of the scan/catalog. It does not reread raw
+  waveform `.out` files or create a binary waveform cache. For every selected
+  voltage and quantity, one maximum (`LGr`/`LLr`) and one minimum
+  (`LGrm`/`LLrm`, above 0.05 pu) are selected across the chosen elements. LG pu
+  values use `voltage / sqrt(3)`; LL pu values use `voltage`.
+- The selected rows create separate `RMS_LG` and `RMS_LL` batches. Both max and
+  min figures use the existing MM renderer and receive max/min annotations; no
+  new plotting engine is introduced. Outputs are kept in
+  `Plots/Generated/<scope>/RMS/LG|LL/`.
 
 ### Sustained SDPF method
 
@@ -416,7 +444,8 @@ report headings. A valid no-candidate cache may still render heatmaps through
 `Rebuild heatmaps`, but reports attach them only when the voltage has a
 governing Sustained candidate. The report's main hierarchy is one voltage assessment heading
 followed by concise sections such as `Voltage Envelope`, `SFO`, `TOV`,
-`Sustained SDPF`, and `Post-event Stress`.
+`SA`, `RMS`, `Sustained SDPF`, and `Post-event Stress`; RMS is always first
+among the analysis sections when it is enabled.
 
 ### Main output tree
 
@@ -542,7 +571,7 @@ $env:TEMP = "$PWD\.tmp"
 ```
 
 The latest recorded local source-level validation for this snapshot passed
-**248 tests**. Run the command and report its actual result rather than relying
+**257 tests**. Run the command and report its actual result rather than relying
 on the number. Also run the dependency import smoke check when packaging/setup
 is touched, and `Create_executable.bat` only when the executable itself is
 being validated.

@@ -17,7 +17,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
-from results_analysis_app import resonance_checks, storage, sustained_sdpf, sustained_sdpf_heatmap
+from results_analysis_app import resonance_checks, rms_analysis, storage, sustained_sdpf, sustained_sdpf_heatmap
 from results_analysis_app.common import (
     CancelFn,
     LogFn,
@@ -681,6 +681,7 @@ def _report_manifest_payload(
     render_heatmaps: bool,
     image_cache: dict[Path, list[Path]],
     sustained_cache_valid: bool | None = None,
+    rms_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_paths: set[Path] = set()
 
@@ -693,6 +694,9 @@ def _report_manifest_payload(
     add(envelope_dir / resonance_checks.WORKBOOK_NAME)
     add(sustained_sdpf.result_path(project_root, scope.folder))
     add(sustained_sdpf.summary_path(project_root, scope.folder))
+    parsed_rms = rms_analysis.normalize_rms_settings(rms_settings)
+    if parsed_rms["enabled"]:
+        add(project_root / "Results" / "MM results.csv")
 
     for event in selected_events:
         for image in _find_event_images(project_root, scope, event, voltage, image_cache):
@@ -705,6 +709,17 @@ def _report_manifest_payload(
                 scope,
                 check,
                 voltage_type,
+                voltage,
+                image_cache,
+            ):
+                add(image)
+
+    if parsed_rms["enabled"]:
+        for quantity in parsed_rms["quantities"]:
+            for image in _find_rms_images(
+                project_root,
+                scope,
+                quantity,
                 voltage,
                 image_cache,
             ):
@@ -748,12 +763,15 @@ def _report_manifest_payload(
         "sustained_ranking": parsed_sustained_ranking.to_mapping(),
         "sustained_heatmaps": sustained_heatmap_settings,
         "sustained_cache_valid": sustained_cache_valid,
+        "rms": parsed_rms,
         "render_heatmaps": bool(render_heatmaps),
         "sources": sorted(
             (_report_file_manifest_entry(project_root, path) for path in source_paths),
             key=lambda item: str(item["path"]).casefold(),
         ),
     }
+    if parsed_rms["enabled"]:
+        payload["rms_result_version"] = rms_analysis.RMS_RESULT_VERSION
     if parsed_sustained.enabled:
         payload["sustained_sdpf_result_version"] = sustained_sdpf.RESULT_VERSION
         payload["sustained_sdpf_report_layout_version"] = SUSTAINED_REPORT_LAYOUT_VERSION
@@ -892,6 +910,17 @@ def _find_resonance_images(
 ) -> list[Path]:
     folder, type_folder = resonance_checks.report_folder(check, voltage_type)
     event_dir = project_root / "Plots" / "Generated" / scope.folder / folder / type_folder
+    return _find_voltage_images(event_dir, voltage, image_cache)
+
+
+def _find_rms_images(
+    project_root: Path,
+    scope: ScopeEntry,
+    quantity: str,
+    voltage: str,
+    image_cache: dict[Path, list[Path]] | None = None,
+) -> list[Path]:
+    event_dir = rms_analysis.rms_output_dir(project_root, scope.folder, quantity)
     return _find_voltage_images(event_dir, voltage, image_cache)
 
 
@@ -1548,7 +1577,7 @@ def _plot_heading_from_image_path(path: Path) -> str:
         stem = stem.rsplit("_", 1)[0]
     # Group labels can contain underscores that must remain part of Element.
     match = re.match(
-        rf"(?P<case>.+?)_(?P<element>MM_\d+(?:\.\d+)?(?:_[^_]+)*?)(?:_(?P<fault>{PLOT_FAULT_LABEL_PATTERN}))?_(?P<run>\d{{3,}})_(?P<trace>LGp_LLp|LGp|LLp|[^_]+)(?:_|$)",
+        rf"(?P<case>.+?)_(?P<element>MM_\d+(?:\.\d+)?(?:_[^_]+)*?)(?:_(?P<fault>{PLOT_FAULT_LABEL_PATTERN}))?_(?P<run>\d{{3,}})_(?P<trace>LGp_LLp|LGr|LLr|LGp|LLp|[^_]+)(?:_|$)",
         stem,
         flags=re.IGNORECASE,
     )
@@ -1566,6 +1595,68 @@ def _plot_heading_from_image_path(path: Path) -> str:
             parts.append(f"Trace: {trace.replace('_', ' & ') if trace == 'LGp_LLp' else trace}")
         return " | ".join(parts)
     return path.stem
+
+
+def _rms_variant_from_image_path(path: Path) -> str:
+    match = re.search(r"_(max|min)(?:_3Ph)?$", path.stem, re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
+
+def _add_rms_report_content(
+    doc,
+    project_root: Path,
+    scope: ScopeEntry,
+    voltage: str,
+    rms_settings: Mapping[str, Any],
+    image_cache: dict[Path, list[Path]],
+    figure_registry: _FigureRegistry,
+    check_cancel: CancelFn | None = None,
+) -> int:
+    grouped: dict[str, list[Path]] = {}
+    for quantity in rms_analysis.RMS_QUANTITIES:
+        if quantity not in rms_settings.get("quantities", []):
+            continue
+        images = [
+            image
+            for image in _find_rms_images(project_root, scope, quantity, voltage, image_cache)
+            if _is_report_image(image)
+        ]
+        if images:
+            grouped[quantity] = sorted(images, key=lambda path: path.name.casefold())
+    if not grouped:
+        return 0
+    _add_report_heading(doc, "RMS", level=2)
+    doc.add_paragraph(
+        "Selected RMS voltage traces show the governing maximum and minimum values "
+        "for the configured MM elements.",
+        style="Body Text",
+    )
+    count = 0
+    for quantity in rms_analysis.RMS_QUANTITIES:
+        images = grouped.get(quantity, [])
+        if not images:
+            continue
+        _add_report_heading(doc, quantity, level=3)
+        for image_path in images:
+            _cancel(check_cancel)
+            variant = _rms_variant_from_image_path(image_path)
+            reference = figure_registry.allocate()
+            _add_unumbered_plot_heading(doc, _plot_heading_from_image_path(image_path))
+            label = f"{quantity} RMS {variant}".strip()
+            _add_figure_reference_sentence(
+                doc,
+                f"The selected {label} voltage trace at {voltage} kV is shown in the ",
+                reference,
+                ".",
+            )
+            _add_centered_report_image(doc, image_path)
+            figure_registry.add_caption(
+                doc,
+                reference,
+                f"{quantity} RMS {variant} maximum/minimum trace at {voltage} kV",
+            )
+            count += 1
+    return count
 
 
 def _heatmap_plot_heading_from_image_path(
@@ -1940,6 +2031,9 @@ def build_reports_from_existing_plots(
     sustained_cache_validations_by_project_scope: Mapping[
         str, Mapping[str, sustained_sdpf.SustainedSDPFCacheValidation]
     ] | None = None,
+    rms_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
+    resonance_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
+    sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -1949,10 +2043,12 @@ def build_reports_from_existing_plots(
 
     written: list[Path] = []
     selected_scopes = list(scopes)
-    selected_events = list(events)
+    selected_events = [
+        str(event)
+        for event in events
+        if str(event) not in rms_analysis.RMS_BATCH_EVENTS.values()
+    ]
     selected_voltages = list(voltages)
-    parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(resonance_settings)
-    parsed_sustained = sustained_sdpf.SustainedSDPFSettings.from_mapping(sustained_sdpf_settings)
     parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings()
     _cancel(check_cancel)
 
@@ -1981,11 +2077,20 @@ def build_reports_from_existing_plots(
         for project_root in project_roots:
             _cancel(check_cancel)
             root = Path(project_root).resolve()
+            parsed_resonance = resonance_checks.ResonanceSettings.from_mapping(
+                (resonance_settings_by_project or {}).get(str(root), resonance_settings)
+            )
+            parsed_sustained = sustained_sdpf.SustainedSDPFSettings.from_mapping(
+                (sustained_sdpf_settings_by_project or {}).get(str(root), sustained_sdpf_settings)
+            )
             selected_dashboard_figure_ids = list(
                 (dashboard_figure_ids_by_project or {}).get(str(root), ())
             )
             parsed_sustained_ranking = sustained_sdpf.SustainedSDPFRankingSettings.from_mapping(
                 (sustained_sdpf_ranking_settings_by_project or {}).get(str(root))
+            )
+            parsed_rms = rms_analysis.normalize_rms_settings(
+                (rms_settings_by_project or {}).get(str(root))
             )
             for scope in selected_scopes:
                 _cancel(check_cancel)
@@ -2061,6 +2166,7 @@ def build_reports_from_existing_plots(
                             if sustained_cache_validation is not None
                             else None
                         ),
+                        rms_settings=parsed_rms,
                     )
                     report_signature = _report_signature(report_payload)
                     output_path = report_dir / f"Voltage_{voltage}_kV.docx"
@@ -2217,6 +2323,18 @@ def build_reports_from_existing_plots(
                                 _time_domain_figure_caption(event, str(voltage)),
                             )
                             plot_count += 1
+
+                    if parsed_rms["enabled"]:
+                        plot_count += _add_rms_report_content(
+                            doc,
+                            root,
+                            scope,
+                            str(voltage),
+                            parsed_rms,
+                            image_cache,
+                            figure_registry,
+                            check_cancel,
+                        )
 
                     if parsed_sustained.enabled:
                         plot_count += _add_sustained_report_content(

@@ -44,6 +44,9 @@ class BatchExcelService:
         "limits",
         "legends_left",
         "excel_export",
+        "annotate_max",
+        "annotate_min",
+        "plot_variant",
         *TIME_RANGE_HEADERS,
     ]
     SHEET_DEFINITIONS = {MM_SHEET: (PlotMode.MM, MM_HEADERS)}
@@ -111,6 +114,9 @@ class BatchExcelService:
             show_limits=self._parse_bool(row.get("limits", ""), default=True),
             legends_left=self._parse_bool(row.get("legends_left", ""), default=False),
             excel_export=self._parse_bool(row.get("excel_export", ""), default=False),
+            annotate_max=self._parse_bool(row.get("annotate_max", ""), default=False),
+            annotate_min=self._parse_bool(row.get("annotate_min", ""), default=False),
+            plot_variant=(row.get("plot_variant", "").strip() or None),
             **self._time_range_kwargs(row),
         )
 
@@ -154,7 +160,11 @@ class BatchExcelService:
             return "LGp"
         if normalized == "llp":
             return "LLp"
-        raise ValueError(f"Invalid MM trace '{value}'. Use Both, LGp, or LLp.")
+        if normalized == "lgr":
+            return "LGr"
+        if normalized == "llr":
+            return "LLr"
+        raise ValueError(f"Invalid MM trace '{value}'. Use Both, LGp, LLp, LGr, or LLr.")
 
     @staticmethod
     def _parse_bool(value: str, *, default: bool) -> bool:

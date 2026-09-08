@@ -1,6 +1,6 @@
 # Current Context
 
-Snapshot date: 2026-09-07.
+Snapshot date: 2026-09-08.
 
 This folder is the active app root for PSCAD Results Analysis. The parent folder keeps reference examples, backup material, and the existing dedicated conda environment.
 
@@ -21,6 +21,7 @@ Desktop app for PSCAD result analysis:
 - generate DOCX reports;
 - run optional Stress, Late, and No-settle checks using existing chronological envelope data;
 - run optional Sustained SDPF stress on fixed chronological LG phases and LL pairs.
+- run optional project-specific RMS maximum/minimum analysis from the shared MM-results catalog.
 
 ## Operating regimes
 
@@ -33,8 +34,8 @@ The UI and workflow are organized into these regimes:
    and refresh dashboards when requested.
 3. **Envelope/check** - apply exclusions, read raw results, build envelopes,
    run the authoritative High Voltage gate, and calculate the selected checks.
-4. **Batch/render/report** - create and render MM plot batches, render
-   Sustained SDPF heatmaps, and build DOCX reports.
+4. **Batch/render/report** - create and render MM plot batches, render RMS
+   plots and Sustained SDPF heatmaps, and build DOCX reports.
 5. **Rebuild-only** - rebuild charts, heatmaps, or reports from valid saved
    artifacts without repeating unrelated raw waveform work.
 
@@ -65,6 +66,7 @@ discovers saved dashboard figure catalogs.
 - `src/results_analysis_app/voltage_envelope.py` - envelope data build.
 - `src/results_analysis_app/envelope_chart.py` - Excel envelope chart generation.
 - `src/results_analysis_app/resonance_checks.py` - Stress/Late/No-settle checks and check chart workbook output.
+- `src/results_analysis_app/rms_analysis.py` - project-specific RMS selection from cached MM results and RMS batch rows.
 - `src/results_analysis_app/sustained_sdpf.py` - Sustained SDPF phase/pair analysis, ranked summary workbook, and compact JSON result metadata.
 - `src/results_analysis_app/reporting.py` - DOCX report generation and dashboard figure insertion.
 - `src/results_analysis_app/scanner.py` - project scan, dashboard scan, exclusions, high-voltage log scan.
@@ -73,7 +75,7 @@ discovers saved dashboard figure catalogs.
 - `src/pscad_plotter_app_v3/` - MM-only embedded plotting, Excel-export, and process execution engine used by report batches.
 - `docs/ANALYSIS_METHODS.md` - code-level description of inputs, exclusions, envelope construction, checks, charts, plots, and reports.
 - `docs/HANDOFF.md` - concise new-chat architecture, data flow, output contracts, and safe-change checklist.
-- `tests/test_plotting.py`, `tests/test_reporting.py`, `tests/test_scanning.py`, `tests/test_envelope.py`, `tests/test_ui_models.py`, `tests/test_resonance.py`, `tests/test_sustained_sdpf.py`, and `tests/test_sustained_sdpf_heatmap.py` - focused contract tests.
+- `tests/test_plotting.py`, `tests/test_reporting.py`, `tests/test_rms_analysis.py`, `tests/test_scanning.py`, `tests/test_envelope.py`, `tests/test_ui_models.py`, `tests/test_resonance.py`, `tests/test_sustained_sdpf.py`, and `tests/test_sustained_sdpf_heatmap.py` - focused contract tests.
 - `AGENTS.md` - project-specific development and validation rules.
 - `STARTER_PROMPT.md` - onboarding prompt for a new machine or clean task.
 
@@ -133,9 +135,9 @@ Current source versions that govern invalidation are:
 | Voltage-envelope manifest | 3 | `voltage_envelope.py` |
 | Sustained SDPF result JSON | 19 | `sustained_sdpf.py` |
 | Sustained SDPF summary workbook | 4 | `sustained_sdpf.py` |
-| Plot batch manifest | 2 | `analysis_engine.py` |
+| Plot batch manifest | 3 | `analysis_engine.py` |
 | Report/report-layout manifests | 2 / 3 | `reporting.py` |
-| Embedded plotter SQLite/MM cache | 2 / 1 | `pscad_plotter_app_v3/services/project.py` |
+| Embedded plotter SQLite/MM cache | 3 / 2 | `pscad_plotter_app_v3/services/project.py` |
 
 The app rebuilds obsolete or incomplete artifacts. It does not persist a
 processed-waveform cache; project and analysis caches contain compact metadata,
@@ -210,9 +212,11 @@ Envelope workflow:
 
 Analysis checks:
 
-- Top-bar analysis checkboxes are `Stress`, `Late`, `No-settle`, and `Sustained SDPF`.
+- Top-bar analysis controls place project-specific `RMS` first, followed by `Stress`, `Late`, `No-settle`, and `Sustained SDPF`.
+- New projects enable Stress, Late, No-settle, and Sustained SDPF by default. RMS is disabled until the checked active project has selected MM elements; its popup selects LG/LL quantities and alphabetized elements per project.
 - Checks use chronological envelope data produced during envelope build.
 - Raw PSCAD `.out` files are not reread for Stress/Late/No-settle; Sustained SDPF evaluates the raw arrays already loaded by the envelope worker.
+- RMS reads the already parsed/cached `Results/MM results.csv` catalog, selects one maximum and one valid minimum per selected voltage and quantity, and writes separate `RMS/LG` and `RMS/LL` plot outputs through the existing renderer.
 - LGp and LLp are evaluated separately for ranking.
 - `Vlim` for analysis checks uses nominal voltage level times the configured resonance limit multiplier, not `Um`.
 - Stress keeps positive post-start area findings and ranks them by `A_post`; Late Growth ranks gated positive-slope findings by `(sigma, growth ratio, positive fraction, tail p95 / Vlim)`; No-settle ranks gated no-release findings by `(sigma, positive fraction, longest positive-growth window, growth ratio, end p95 / Vlim, area)`.
@@ -232,7 +236,7 @@ Analysis checks:
 - Plot batches and report envelope summaries use the same nearest-time helper; midpoint ties select the earlier source row.
 - Heading numbering and envelope bullets use separate Word numbering definitions and list IDs, emitted in Word's required definition-before-instance order so both lists render correctly.
 - DOCX report contains headers and plots for selected checks. Report styling is embedded in code so generation does not require a real report template: A4 layout, green numbered chapter headings, an unnumbered green plot-heading style, justified body text, green italic captions, report header, and page-number footer.
-- DOCX voltage reports use numbered Word headings and field-based figure captions plus clickable cross-references for dashboard, envelope, time-domain, and analysis figures. Sustained SDPF sections also use numbered table captions/cross-references and compact selected-case tables. Cached field values are written into the document and automatic field updating is disabled to avoid Word's external-field update prompt; fields can be refreshed manually with `Ctrl+A`, `F9` after editing. When both sections exist, the envelope is section 1.1 and dashboard figures are section 1.2. Initial-condition dashboard charts appear as `Initial voltages`, `Initial Reactive Power`, then `Initial Active Power`. Reports add a short selected SFO/TOV/SA value list with the reference report's green hollow-circle bullets before each exported envelope figure. SFO and TOV values come from the matching `MM_<voltage>.xlsx` envelope workbook `LLp` sheet, SA comes from `LGp` when SA is selected, and TOV/SA show calculated RMS values with Word-subscripted peak/RMS units. SA time-domain report text uses the line-ground TOV RMS value and the fixed 300 ms duration text for surge arrester selection. RMS overvoltage dashboard titles use `voltage rise`; RMS `dip` and `drop` titles remain unchanged.
+- DOCX voltage reports use numbered Word headings and field-based figure captions plus clickable cross-references for dashboard, envelope, time-domain, RMS, and analysis figures. Sustained SDPF sections also use numbered table captions/cross-references and compact selected-case tables. Cached field values are written into the document and automatic field updating is disabled to avoid Word's external-field update prompt; fields can be refreshed manually with `Ctrl+A`, `F9` after editing. When both sections exist, the envelope is section 1.1 and dashboard figures are section 1.2. Initial-condition dashboard charts appear as `Initial voltages`, `Initial Reactive Power`, then `Initial Active Power`. Reports add a short selected SFO/TOV/SA value list with the reference report's green hollow-circle bullets before each exported envelope figure. SFO and TOV values come from the matching `MM_<voltage>.xlsx` envelope workbook `LLp` sheet, SA comes from `LGp` when SA is selected, and TOV/SA show calculated RMS values with Word-subscripted peak/RMS units. SA time-domain report text uses the line-ground TOV RMS value and the fixed 300 ms duration text for surge arrester selection. RMS overvoltage dashboard titles use `voltage rise`; RMS `dip` and `drop` titles remain unchanged. Per voltage, the report writes selected SFO/TOV/SA event sections first, then the `RMS` section, then Sustained SDPF and resonance sections.
 - Dashboard figures titled `Initial voltages`, `Initial Active Power`, and `Initial Reactive Power` are exported with the dashboard's saved slicer state for every report voltage. The reactive-power caption is `Initial reactive power at the POC`. Other dashboard figures use the report-voltage slicer filter.
 - Generated time-domain and analysis plot figures in DOCX reports get green, unnumbered third-level navigation headings with copyable Case, Run, Element, Fault, and Trace text before the cross-reference sentence. Known fault labels are separated from the element; faultless element labels such as `MM_161_TPC1` remain intact. Envelope figures and dashboard figures are excluded from this plot-heading rule.
 - Report image directories are indexed once per project/scope report pass and filtered for each selected voltage.
@@ -281,7 +285,7 @@ Plotting:
 
 ## Current validation state
 
-- Latest recorded full source-level test run: **248 passed**. The test command
+- Latest recorded full source-level test run: **257 passed**. The test command
   uses `.tmp/` for pytest output and does not touch user project data.
 - Contract tests cover peak-envelope Sustained SDPF qualification, short boundary-crossing episode protection, strict heatmap flags, standard TOV-window batch markers, centered case-label coverage, compact context-aware case-label coverage, ranked-summary workbook coverage, stale-summary invalidation coverage, selected-column/group-frame reuse, complete-stage and centralized-cache skipping, compact Sustained source fingerprints including the Windows build-to-validation-to-batch round trip, manual plot-limit propagation, waveform-cache bounds, and process-plot fallback coverage.
 - Automatic project-opening HV scan on `../Original_examples/03_Test_project_case`: 300 cached case/run/bus maxima and 92 proposals at factor 5; the measured persistent-cache timings were about 7.8 seconds cold, 0.48 seconds warm, and 7.5 seconds forced on the development machine. Warm validation avoids waveform parsing.

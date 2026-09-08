@@ -367,6 +367,10 @@ def test_top_bar_uses_envelope_and_sdpf_labels_with_dividers(monkeypatch) -> Non
         assert window.all_voltages_check.checkState() == QtCore.Qt.CheckState.PartiallyChecked
         assert window.sustained_sdpf_checkbox.text() == "SDPF"
         assert window.sustained_sdpf_checkbox.toolTip() == "Sustained SDPF Stress"
+        assert window.rms_checkbox.text() == ""
+        assert window.rms_button.text() == "RMS"
+        assert not window.rms_checkbox.isEnabled()
+        assert not window.rms_button.isEnabled()
 
         dividers = window.findChildren(QtWidgets.QFrame, "topBarDivider")
         assert len(dividers) == 2

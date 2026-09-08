@@ -77,6 +77,8 @@ class ExcelExporter:
         time_token = time_range_filename_token(job.time_start_s, job.time_end_s)
         if time_token:
             parts.append(time_token)
+        if job.plot_variant:
+            parts.append(job.plot_variant)
         safe_parts = [self._sanitize_filename_part(part) for part in parts if part]
         return "_".join(safe_parts) + ".xlsx"
 

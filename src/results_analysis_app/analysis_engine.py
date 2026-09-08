@@ -17,7 +17,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from results_analysis_app import resonance_checks, storage, sustained_sdpf, sustained_sdpf_heatmap
+from results_analysis_app import resonance_checks, rms_analysis, storage, sustained_sdpf, sustained_sdpf_heatmap
 from results_analysis_app.background import OperationCancelled
 from results_analysis_app.common import (
     CancelFn,
@@ -36,7 +36,7 @@ from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
 LEGACY_PLOT_MANIFEST_FILENAME = ".plot_manifest.json"
 # Kept only as the name of the legacy per-folder file that is removed when a
 # folder is next rendered. New stage metadata lives in the project cache.
-PLOT_MANIFEST_VERSION = 2
+PLOT_MANIFEST_VERSION = 3
 _DIRECTORY_REPLACE_ATTEMPTS = 3
 _DIRECTORY_REPLACE_DELAY_S = 0.05
 
@@ -273,6 +273,16 @@ def _clear_sustained_outputs(project_root: Path, scope_folder: str) -> None:
     sustained_sdpf_heatmap.clear_heatmaps(project_root, scope_folder)
 
 
+def _clear_rms_outputs(project_root: Path, scope_folder: str, quantity: str) -> None:
+    output_dir = rms_analysis.rms_output_dir(project_root, scope_folder, quantity)
+    _clear_plot_cache_entry(project_root, output_dir)
+    _remove_generated_directory(
+        output_dir,
+        project_root / "Plots" / "Generated" / scope_folder,
+    )
+    rms_analysis.rms_batch_path(project_root, scope_folder, quantity).unlink(missing_ok=True)
+
+
 def _voltage_key(value: Any) -> str:
     return sustained_sdpf.normalized_voltage_key(value)
 
@@ -417,14 +427,38 @@ def create_plot_batches(
     sustained_cache_validations_by_scope: Mapping[
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
+    rms_settings: Mapping[str, Any] | None = None,
 ) -> list[Path]:
     outputs: list[Path] = []
-    selected_events = list(events)
+    selected_events = [
+        str(event)
+        for event in events
+        if str(event) not in rms_analysis.RMS_BATCH_EVENTS.values()
+    ]
     selected_voltages = list(voltages)
     selected_event_times = {
         event: float((event_times or {}).get(event, DEFAULT_EVENT_TIMES[event]))
         for event in selected_events
     }
+    parsed_rms = rms_analysis.normalize_rms_settings(rms_settings) if rms_settings is not None else None
+    rms_batch_rows_by_event: dict[str, list[dict[str, object]]] | None = None
+    if parsed_rms is not None:
+        if parsed_rms["enabled"]:
+            catalog = _load_rms_catalog(project_root)
+            selections = rms_analysis.select_rms_rows(
+                catalog.mm_results,
+                selected_elements=parsed_rms["elements"],
+                selected_quantities=parsed_rms["quantities"],
+                selected_voltages=selected_voltages,
+            )
+            rms_batch_rows_by_event = rms_analysis.rms_batch_rows(
+                selections,
+                excel_export=excel_waveform_exports_enabled,
+            )
+        else:
+            rms_batch_rows_by_event = {
+                event: [] for event in rms_analysis.RMS_BATCH_EVENTS.values()
+            }
     for scope in scopes:
         scenario_dir = project_root / "Voltage_envelope" / scope.folder
         rows_by_event: dict[str, list[dict[str, Any]]] = {
@@ -460,6 +494,33 @@ def create_plot_batches(
             _create_batch_workbook(output_path, mm_rows)
             outputs.append(output_path)
             _log(log, f"Wrote batch: {output_path.name} | MM rows={len(mm_rows)}")
+
+        # RMS is explicitly project-specific.  ``None`` means this action did
+        # not request RMS work (for example, event-only batch creation), while
+        # a mapping, including a disabled mapping, reconciles stale RMS files.
+        if parsed_rms is not None:
+            for quantity in rms_analysis.RMS_QUANTITIES:
+                event_name = rms_analysis.RMS_BATCH_EVENTS[quantity]
+                batch_path = rms_analysis.rms_batch_path(project_root, scope.folder, quantity)
+                quantity_enabled = quantity in parsed_rms.get("quantities", [])
+                rows = (
+                    rms_batch_rows_by_event.get(event_name, [])
+                    if parsed_rms["enabled"] and quantity_enabled and rms_batch_rows_by_event is not None
+                    else []
+                )
+                if rows:
+                    _create_batch_workbook(batch_path, rows)
+                    outputs.append(batch_path)
+                    _log(log, f"Wrote RMS batch: {batch_path.name} | MM rows={len(rows)}")
+                else:
+                    _clear_rms_outputs(project_root, scope.folder, quantity)
+                    # _clear_rms_outputs removes the batch itself; leave an
+                    # empty workbook only when there are no selected elements
+                    # if the user explicitly enabled RMS quantities.
+                    if parsed_rms["enabled"] and quantity_enabled:
+                        _create_batch_workbook(batch_path, [])
+                        outputs.append(batch_path)
+                        _log(log, f"Wrote empty RMS batch: {batch_path.name}")
 
         # ``None`` means this action did not request Sustained SDPF work.  In
         # particular, event-only batch creation must not delete a valid
@@ -611,6 +672,25 @@ def _load_embedded_plotter_session(
         cache.close()
 
 
+def _load_rms_catalog(project_root: Path):
+    """Load the shared MM catalog without constructing a renderer."""
+    from pscad_plotter_app_v3.services.project import (
+        CatalogCache,
+        ProjectDiscoveryService,
+        ResultsCatalogService,
+        RunAvailabilityService,
+    )
+
+    context = ProjectDiscoveryService().discover(project_root)
+    context.state_dir.mkdir(parents=True, exist_ok=True)
+    cache = CatalogCache(context.state_dir)
+    try:
+        run_index = RunAvailabilityService().build_index(context)
+        return ResultsCatalogService().build_base_catalog(context, run_index, cache)
+    finally:
+        cache.close()
+
+
 def _apply_sustained_sdpf_plot_limit_overrides(
     limits: dict[str, Any],
     overrides: dict[str, dict[str, float]] | None,
@@ -644,12 +724,13 @@ def _apply_sustained_sdpf_plot_limit_overrides(
     return adjusted
 
 
-def _plot_job_sort_key(job: Any) -> tuple[str, int, str, str, str, str, str]:
+def _plot_job_sort_key(job: Any) -> tuple[str, int, str, str, str, str, str, str]:
     return (
         str(getattr(job, "case_name", "")).casefold(),
         int(getattr(job, "run_number", 0)),
         str(getattr(job, "group_label", "")).casefold(),
         str(getattr(job, "trace_type", "") or "").casefold(),
+        str(getattr(job, "plot_variant", "") or "").casefold(),
         str(getattr(job, "time_start_s", "")),
         str(getattr(job, "time_end_s", "")),
         str(getattr(job, "output_dir", "")),
@@ -715,6 +796,9 @@ _PLOT_JOB_MANIFEST_FIELDS = (
     "time_end_s",
     "voltage_kv",
     "limits",
+    "annotate_max",
+    "annotate_min",
+    "plot_variant",
 )
 
 
@@ -1202,10 +1286,20 @@ def _render_plot_batches_direct(
     sustained_cache_validations_by_scope: Mapping[
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
+    rms_settings: Mapping[str, Any] | None = None,
 ) -> None:
     _cancel(check_cancel)
     selected_scopes = list(scopes)
     selected_events = list(events)
+    parsed_rms = rms_analysis.normalize_rms_settings(rms_settings) if rms_settings is not None else None
+    if parsed_rms is not None and parsed_rms["enabled"]:
+        for event_name in rms_analysis.RMS_BATCH_EVENTS.values():
+            if event_name not in selected_events:
+                selected_events.append(event_name)
+    elif parsed_rms is not None:
+        for scope in selected_scopes:
+            for quantity in rms_analysis.RMS_QUANTITIES:
+                _clear_rms_outputs(project_root, scope.folder, quantity)
     catalog, limits, renderer, exporter = _load_embedded_plotter_session(
         project_root,
         log,
@@ -1417,6 +1511,9 @@ def _remove_generated_directory(output_dir: Path, scope_root: Path) -> None:
 def _desired_output_dir(project_root: Path, scope_folder: str, event_name: str) -> Path:
     if event_name == sustained_sdpf.SUSTAINED_SDPF:
         return project_root / "Plots" / "Generated" / scope_folder / sustained_sdpf.SUSTAINED_SDPF
+    for quantity, rms_event in rms_analysis.RMS_BATCH_EVENTS.items():
+        if event_name == rms_event:
+            return rms_analysis.rms_output_dir(project_root, scope_folder, quantity)
     resonance_dir = resonance_checks.output_dir_for_event(project_root, scope_folder, event_name)
     if resonance_dir is not None:
         return resonance_dir
@@ -1440,9 +1537,16 @@ def render_plot_batches(
     sustained_cache_validations_by_scope: Mapping[
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
+    rms_settings: Mapping[str, Any] | None = None,
 ) -> None:
     selected_scopes = list(scopes)
     selected_events = list(events)
+    if rms_settings is not None and rms_analysis.normalize_rms_settings(rms_settings)["enabled"]:
+        selected_events.extend(
+            event
+            for event in rms_analysis.RMS_BATCH_EVENTS.values()
+            if event not in selected_events
+        )
     _render_plot_batches_direct(
         project_root,
         selected_scopes,
@@ -1456,6 +1560,7 @@ def render_plot_batches(
         sustained_voltage_keys=sustained_voltage_keys,
         excel_waveform_exports_enabled=excel_waveform_exports_enabled,
         sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
+        rms_settings=rms_settings,
     )
     if sustained_sdpf_settings is not None or sustained_sdpf.SUSTAINED_SDPF in selected_events:
         render_sustained_heatmaps(

@@ -85,6 +85,9 @@ class PlotRequest:
     time_start_s: float | None = None
     time_end_s: float | None = None
     output_dir: str = ""
+    annotate_max: bool = False
+    annotate_min: bool = False
+    plot_variant: str | None = None
 
 
 @dataclass(slots=True)
@@ -106,9 +109,13 @@ class PlotJob:
     time_end_s: float | None = None
     voltage_kv: float | None = None
     limits: VoltageLimitSet | None = None
+    annotate_max: bool = False
+    annotate_min: bool = False
+    plot_variant: str | None = None
 
 
 @dataclass(slots=True)
 class ProjectCatalog:
     mm_elements: list[MMElementRecord] = field(default_factory=list)
     runs_by_case: dict[str, list[int]] = field(default_factory=dict)
+    mm_results: list[dict[str, object]] = field(default_factory=list)

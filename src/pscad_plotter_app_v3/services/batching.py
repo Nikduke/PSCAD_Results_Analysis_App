@@ -29,6 +29,9 @@ def build_mm_jobs(
             time_end_s=request.time_end_s,
             voltage_kv=request.voltage_kv,
             limits=limits,
+            annotate_max=request.annotate_max,
+            annotate_min=request.annotate_min,
+            plot_variant=request.plot_variant,
         )
         for element_name in request.elements
         for run_number in request.run_numbers

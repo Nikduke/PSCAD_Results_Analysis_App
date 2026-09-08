@@ -221,7 +221,7 @@ class CatalogCache:
     """SQLite cache for expensive project-open catalog parsing."""
 
     FILENAME = "catalog_cache.sqlite"
-    CACHE_VERSION = 2
+    CACHE_VERSION = 3
 
     def __init__(self, state_dir: Path) -> None:
         self.path = state_dir / self.FILENAME
@@ -264,26 +264,41 @@ class CatalogCache:
             conn.execute("DELETE FROM mm_results WHERE path = ?", (source[0],))
             conn.executemany(
                 """
-                INSERT INTO mm_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO mm_results (
+                    path, row_index, unique_id, case_name, run_number, voltage_kv,
+                    bus_name, lgp, lgr, lgrm, lgr_pu, lgrm_pu, llp, llr, llrm,
+                    llr_pu, llrm_pu, tov, peak_lg, peak_ll, fault_label, fault_raw,
+                    event_time, tswitch_a, tswitch_b, tswitch_c
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
                         source[0],
                         index,
+                        row.get("Unique ID"),
                         row.get("Case name"),
                         row.get("Run#"),
                         row.get("Bus voltage [kV]"),
                         row.get("Bus name"),
                         row.get("LGp [kV]"),
                         row.get("LGr [kV]"),
+                        row.get("LGrm [kV]"),
+                        row.get("LGr [pu]"),
+                        row.get("LGrm [pu]"),
                         row.get("LLp [kV]"),
                         row.get("LLr [kV]"),
+                        row.get("LLrm [kV]"),
+                        row.get("LLr [pu]"),
+                        row.get("LLrm [pu]"),
                         row.get("TOV_dur [s]"),
                         row.get("PeakLG"),
                         row.get("PeakLL"),
                         row.get("FaultLabel"),
                         row.get("FaultRaw"),
                         row.get("EventTime"),
+                        row.get("Tswitch_a [s]"),
+                        row.get("Tswitch_b [s]"),
+                        row.get("Tswitch_c [s]"),
                     )
                     for index, row in enumerate(rows)
                 ),
@@ -327,24 +342,81 @@ class CatalogCache:
             CREATE TABLE IF NOT EXISTS mm_results (
                 path TEXT NOT NULL,
                 row_index INTEGER NOT NULL,
+                unique_id TEXT,
                 case_name TEXT NOT NULL,
                 run_number INTEGER NOT NULL,
                 voltage_kv REAL NOT NULL,
                 bus_name TEXT NOT NULL,
                 lgp REAL,
                 lgr REAL,
+                lgrm REAL,
+                lgr_pu REAL,
+                lgrm_pu REAL,
                 llp REAL,
                 llr REAL,
+                llrm REAL,
+                llr_pu REAL,
+                llrm_pu REAL,
                 tov REAL,
                 peak_lg REAL,
                 peak_ll REAL,
                 fault_label TEXT,
                 fault_raw TEXT,
                 event_time REAL,
+                tswitch_a REAL,
+                tswitch_b REAL,
+                tswitch_c REAL,
                 PRIMARY KEY (path, row_index)
             );
             """
         )
+        expected_columns = {
+            "unique_id", "lgrm", "lgr_pu", "lgrm_pu", "llrm", "llr_pu",
+            "llrm_pu", "tswitch_a", "tswitch_b", "tswitch_c",
+        }
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(mm_results)")
+        }
+        if not expected_columns <= columns:
+            # Older app versions had a narrower table.  The cache is only an
+            # acceleration layer, so rebuilding this one table is safe and
+            # forces the shared CSV parser to repopulate the extended fields.
+            self._conn.execute("DROP TABLE IF EXISTS mm_results")
+            self._conn.execute("DELETE FROM sources WHERE kind = 'mm_csv'")
+            self._conn.executescript(
+                """
+                CREATE TABLE mm_results (
+                    path TEXT NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    unique_id TEXT,
+                    case_name TEXT NOT NULL,
+                    run_number INTEGER NOT NULL,
+                    voltage_kv REAL NOT NULL,
+                    bus_name TEXT NOT NULL,
+                    lgp REAL,
+                    lgr REAL,
+                    lgrm REAL,
+                    lgr_pu REAL,
+                    lgrm_pu REAL,
+                    llp REAL,
+                    llr REAL,
+                    llrm REAL,
+                    llr_pu REAL,
+                    llrm_pu REAL,
+                    tov REAL,
+                    peak_lg REAL,
+                    peak_ll REAL,
+                    fault_label TEXT,
+                    fault_raw TEXT,
+                    event_time REAL,
+                    tswitch_a REAL,
+                    tswitch_b REAL,
+                    tswitch_c REAL,
+                    PRIMARY KEY (path, row_index)
+                );
+                """
+            )
 
     def _source_valid(self, kind: str, source: tuple[str, int, int], parser_version: int) -> bool:
         conn = self._conn
@@ -392,17 +464,37 @@ class CatalogCache:
     @staticmethod
     def _mm_row_from_cache(row: sqlite3.Row) -> dict[str, object]:
         return {
+            "Unique ID": row["unique_id"],
             "Case name": row["case_name"],
             "Run#": int(row["run_number"]),
             "Bus voltage [kV]": float(row["voltage_kv"]),
             "Bus name": row["bus_name"],
+            "LGp [kV]": row["lgp"],
+            "LGr [kV]": row["lgr"],
+            "LGrm [kV]": row["lgrm"],
+            "LGr [pu]": row["lgr_pu"],
+            "LGrm [pu]": row["lgrm_pu"],
+            "LLp [kV]": row["llp"],
+            "LLr [kV]": row["llr"],
+            "LLrm [kV]": row["llrm"],
+            "LLr [pu]": row["llr_pu"],
+            "LLrm [pu]": row["llrm_pu"],
+            "TOV_dur [s]": row["tov"],
+            "PeakLG": row["peak_lg"],
+            "PeakLL": row["peak_ll"],
+            "FaultLabel": row["fault_label"],
+            "FaultRaw": row["fault_raw"],
+            "EventTime": row["event_time"],
+            "Tswitch_a [s]": row["tswitch_a"],
+            "Tswitch_b [s]": row["tswitch_b"],
+            "Tswitch_c [s]": row["tswitch_c"],
         }
 
 class ResultsCatalogService:
     """Load the MM element catalog used by report plot batches."""
 
     MM_FILENAME = "MM results.csv"
-    MM_CSV_CACHE_VERSION = 1
+    MM_CSV_CACHE_VERSION = 2
 
     def build_base_catalog(
         self,
@@ -422,6 +514,7 @@ class ResultsCatalogService:
                     cache.store_mm_results(mm_path, self.MM_CSV_CACHE_VERSION, mm_rows)
             else:
                 mm_rows = cached_mm
+            catalog.mm_results = list(mm_rows)
             catalog.mm_elements = self._build_mm_elements(mm_rows, run_index)
 
         return catalog
@@ -446,12 +539,36 @@ class ResultsCatalogService:
         bus_name = str(source.get("Bus name", "") or "").strip()
         if run_number is None or voltage_kv is None or not case_name or not bus_name:
             return None
-        return {
+        row = {
+            "Unique ID": str(source.get("Unique ID", "") or "").strip(),
             "Case name": case_name,
             "Run#": int(run_number),
             "Bus voltage [kV]": float(voltage_kv),
             "Bus name": bus_name,
         }
+        numeric_columns = (
+            "LGp [kV]", "LGr [kV]", "LGrm [kV]", "LGr [pu]", "LGrm [pu]",
+            "LLp [kV]", "LLr [kV]", "LLrm [kV]", "LLr [pu]", "LLrm [pu]",
+            "TOV_dur [s]", "PeakLG", "PeakLL", "EventTime",
+            "Tswitch_a [s]", "Tswitch_b [s]", "Tswitch_c [s]",
+        )
+        for column in numeric_columns:
+            row[column] = safe_float(source.get(column))
+        row["FaultLabel"] = str(source.get("Fault_type", source.get("FaultLabel", "")) or "").strip()
+        row["FaultRaw"] = str(source.get("FaultRaw", source.get("Fault_type", "")) or "").strip()
+        # Some result writers omit pu columns.  Preserve their values when
+        # present and derive the RMS base-unit ratio using the same nominal
+        # LG/LL references used by the legacy selection script.
+        for kv_column, pu_column, divisor in (
+            ("LGr [kV]", "LGr [pu]", 3 ** 0.5),
+            ("LGrm [kV]", "LGrm [pu]", 3 ** 0.5),
+            ("LLr [kV]", "LLr [pu]", 1.0),
+            ("LLrm [kV]", "LLrm [pu]", 1.0),
+        ):
+            if row[pu_column] is None and row[kv_column] is not None:
+                reference = float(voltage_kv) / divisor
+                row[pu_column] = row[kv_column] / reference if reference else None
+        return row
 
     def _build_mm_elements(self, rows: list[dict[str, object]], run_index: dict[str, dict[int, Path]]) -> list[MMElementRecord]:
         if not rows:

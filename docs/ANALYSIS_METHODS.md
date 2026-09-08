@@ -1,6 +1,6 @@
 # PSCAD Results Analysis Methods
 
-Last reviewed: 2026-09-07
+Last reviewed: 2026-09-08
 
 This document describes the methods implemented by the current app. It is a code-level description of the data flow and calculations, not a replacement for the PSCAD model specification or an engineering acceptance standard.
 
@@ -10,6 +10,7 @@ The main implementation modules are:
 - `src/results_analysis_app/scanner.py` - project discovery, NonConv proposals, and PSCAD-log high-voltage proposals.
 - `src/results_analysis_app/voltage_envelope.py` - raw waveform reads, high-voltage checks, per-run envelopes, and envelope workbook data.
 - `src/results_analysis_app/resonance_checks.py` - Stress, Late Growth, and No-settle Growth checks.
+- `src/results_analysis_app/rms_analysis.py` - project-specific RMS selection from the shared MM-results catalog and RMS batch rows.
 - `src/results_analysis_app/sustained_sdpf.py` - chronological Sustained SDPF stress assessment, rank-sorted manual-plot summary, and compact result persistence.
 - `src/results_analysis_app/sustained_sdpf_heatmap.py` - project-specific incidence aggregation and report-ready heatmap rendering from persisted Sustained SDPF observations.
 - `src/results_analysis_app/common.py` - shared cancellation, logging, boolean normalization, and atomic workbook helpers used by workflow stages.
@@ -31,7 +32,7 @@ interchangeable:
    envelopes, performs the High Voltage gate, and calculates the selected
    checks.
 4. **Batch/render/report** converts selected results into MM plot batches,
-   rendered plots/exports, Sustained heatmaps, and DOCX reports.
+   rendered plots/exports, RMS plots, Sustained heatmaps, and DOCX reports.
 5. **Rebuild-only** recreates charts, heatmaps, or reports from valid saved
    artifacts without rerunning unrelated waveform analysis.
 
@@ -47,8 +48,9 @@ files. `Run analysis` and report rebuilding do not refresh dashboard data.
 The source code and focused tests are authoritative. The compact cache
 versions currently governing invalidation are: project scan **7**, project
 analysis **1**, envelope manifest **3**, Sustained result JSON **19**, Sustained
-summary workbook **4**, plot batch manifest **2**, and report/report-layout
-manifests **2/3**. No processed waveform arrays are persisted.
+summary workbook **4**, plot batch manifest **3**, report/report-layout
+manifests **2/3**, and embedded plotter SQLite/MM caches **3/2**. No processed
+waveform arrays are persisted.
 
 ## 1. End-to-end method
 
@@ -59,7 +61,7 @@ For each selected project, scope, and voltage, the app follows this sequence:
 3. Apply the selected Manual and NonConv exclusions before submitting waveform work. High Voltage rows are checked against raw waveforms during the build itself; an unchecked High Voltage row creates an exact include override.
 4. Read the selected raw `.out` channels, check high voltage, and create a chronological rolling envelope for every surviving case/run/bus and measurement type.
 5. Merge the per-run phase candidates into the base `MM_<voltage>.xlsx` workbook, preserving the source Case, Run, fault type, and MM name for each phase and for the overall maximum.
-6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. If Sustained SDPF is enabled, assess each raw fixed phase/pair from the same loaded worker data; no separate `.out` read is performed.
+6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. If Sustained SDPF is enabled, assess each raw fixed phase/pair from the same loaded worker data; no separate `.out` read is performed. If RMS is enabled, select its project-specific MM elements and LG/LL quantities from the already parsed/cached `Results/MM results.csv` catalog; it does not reread raw `.out` files.
 7. Write the base workbook, resonance workbook, combined Excel charts, compact Sustained SDPF JSON metadata, rank-sorted Sustained SDPF summary workbook, plot batches, rendered waveform plots, and DOCX reports through the selected workflow steps. Automatically generated waveform plot batches request Excel exports by default; the Settings option `Create automatic Excel waveform exports` can disable those `.xlsx` writes without changing the PNG plots or analysis results.
 
 The selected voltage levels submit their raw-read jobs concurrently through one shared bounded process pool. The pool cap is shared across voltages, so concurrency does not multiply the configured worker count. The automatic worker setting selects the ceiling of 80% of detected logical CPUs, capped at 60 and reduced when fewer runs exist. A positive manual value remains available when a machine or workload needs a different balance. This scheduling change does not alter envelope, resonance, exclusion, or Sustained SDPF calculations.
@@ -73,6 +75,7 @@ The app has several distinct analysis paths. Their inputs, qualification rules, 
 | High Voltage | Every finite raw LG and LL phase/pair sample against `high-voltage factor × Um × sqrt(2)` | Any exceeding phase excludes the complete Case/Run/MM bus from both measurements; this is an exclusion gate, not a severity ranking | Detailed exclusions in the envelope workbook and consolidated UI rows |
 | Representative envelope | Per-phase centered half-cycle rolling absolute envelopes, then the ranked cross-case representative rows | Source phase rows are ranked by magnitude and aligned by rank; the merged maximum keeps its source provenance | `MM_<voltage>.xlsx` and combined Excel envelope charts |
 | TOV, SFO, and SA event selection | The representative envelope workbook at one configured event time | Select the nearest valid row within `0.001 s` (`LLp` for TOV/SFO, `LGp` for SA); this is plot/report row selection, not a new compliance test | Event batch rows, envelope values, waveform plots, and report text |
+| RMS | Shared parsed/cached `Results/MM results.csv` rows for the selected project, voltage, MM elements, and LG/LL quantities | For each selected voltage and quantity, choose one maximum (`LGr`/`LLr`) and one minimum (`LGrm`/`LLrm`) after excluding minimums at or below `0.05 pu`; LG pu uses `voltage / sqrt(3)`, LL pu uses `voltage` | Separate `RMS_LG`/`RMS_LL` batches and max/min annotated plots under `Plots/Generated/<scope>/RMS/LG|LL/`; report section immediately after event sections |
 | Post-event Stress | Chronological per-run envelope `E(t)` after release/manual start | Keep positive-area findings and rank by `A_post = integral(max(E - Vlim, 0))` | Top N per `(check, voltage, measurement)` in `Resonance_Checks.xlsx` |
 | Late Growth | Smoothed chronological envelope after release/manual start | Positive-slope and relevance gates, then rank by `(sigma, growth ratio, positive fraction, tail p95 / Vlim)` | Top N per `(check, voltage, measurement)` and result plots |
 | No-settle Growth | Smoothed post-guard envelope when automatic release is not found | Positive-slope and relevance gates, then rank by `(sigma, positive fraction, longest positive-growth window, growth ratio, end p95 / Vlim, area)` | Top N per `(check, voltage, measurement)` and result plots |
@@ -324,6 +327,38 @@ Voltage_envelope/<scope>/Resonance_Checks.xlsx
 It contains `Settings`, result tabs only for checks/voltage types with findings, and one chart-data sheet per result. If there are no findings, `Settings` is retained without empty result tabs.
 
 Resonance charts use the same chart x-axis settings as envelope charts and are capped by each result's actual data end. A chart displaying `0.5 s` can therefore be a chart-axis setting even when the underlying analysis data extend farther; changing the chart x maximum does not rebuild envelope data.
+
+### 5.7 RMS voltage analysis
+
+RMS is a project-specific, optional analysis path. New projects enable the
+existing Stress, Late, No-settle, and Sustained SDPF checks by default but keep
+RMS disabled until the user selects MM elements. The first Analysis control is
+an RMS checkbox plus popup: it is enabled only when the highlighted project is
+also checked for the run and its catalog contains MM elements. The popup lists
+the available elements alphabetically, with independent LG and LL quantity
+checkboxes. A project can select any subset of elements and either quantity;
+the choice is restored by canonical project path when the active project
+changes.
+
+The source is the already parsed/cached `Results/MM results.csv` catalog. The
+bus name is the catalog's existing MM identity, so RMS does not rescan the
+input workbook or reread raw waveform `.out` files. For each selected voltage
+and enabled quantity, the selector ranks the selected rows and retains one
+maximum (`LGr [kV]` or `LLr [kV]`) and one minimum (`LGrm [kV]` or `LLrm [kV]`).
+Minimum candidates with a reported or derived value at or below `0.05 pu` are
+ignored. When a pu column is missing, LG uses `value / (voltage / sqrt(3))` and
+LL uses `value / voltage`. Voltage levels are filtered explicitly; an empty
+selection produces no RMS rows.
+
+The selected maximum and minimum rows become separate `RMS_LG` and `RMS_LL`
+batch rows using the existing MM renderer. Their plots request the `LGr` or
+`LLr` trace and show both global max/min markers; no new plotting engine or
+binary waveform format is introduced. Generated files are kept in
+`Plots/Generated/<scope>/RMS/LG/` and `RMS/LL/`, with the corresponding batch
+workbooks under `Plots/Plot_batch/`. The report writes one `RMS` heading after
+the selected SFO/TOV/SA event sections and before Sustained SDPF and resonance
+sections. RMS is a diagnostic voltage study; it does not qualify Sustained SDPF
+events or alter envelope, exclusion, or resonance calculations.
 
 ## 6. Sustained SDPF stress
 

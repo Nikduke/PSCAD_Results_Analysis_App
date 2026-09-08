@@ -74,6 +74,34 @@ def test_plot_execution_combines_png_and_requested_excel_export(tmp_path) -> Non
     assert exporter.calls == 1
 
 
+def test_rms_excel_exports_keep_max_and_min_filenames_distinct() -> None:
+    from pscad_plotter_app_v3.models import PlotJob, PlotMode
+    from pscad_plotter_app_v3.services.exporter import ExcelExporter
+
+    exporter = ExcelExporter(None)
+    max_job = PlotJob(
+        mode=PlotMode.MM,
+        case_name="C1",
+        run_number=1,
+        group_label="MM_161_A",
+        output_dir=".",
+        trace_type="LGr",
+        plot_variant="max",
+    )
+    min_job = PlotJob(
+        mode=PlotMode.MM,
+        case_name="C1",
+        run_number=1,
+        group_label="MM_161_A",
+        output_dir=".",
+        trace_type="LGr",
+        plot_variant="min",
+    )
+
+    assert exporter._filename(max_job) == "C1_MM_161_A_001_LGr_max.xlsx"
+    assert exporter._filename(min_job) == "C1_MM_161_A_001_LGr_min.xlsx"
+
+
 def test_automatic_plot_worker_count_uses_threshold_and_cap(monkeypatch) -> None:
     from pscad_plotter_app_v3.services import plot_execution
 

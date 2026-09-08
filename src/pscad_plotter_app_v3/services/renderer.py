@@ -236,6 +236,7 @@ class MatplotlibRenderer:
             self._configure_axes(ax_top, data, ylim, policy, legends_left=job.legends_left)
             if limits_pack:
                 self._add_limits_if_applicable(ax_top, limits_pack, legends_left=job.legends_left)
+            self._render_rms_annotations_if_enabled(ax_top, data, job, policy)
 
             for index in range(3):
                 axis = plt.subplot(gs[1, index])
@@ -252,6 +253,7 @@ class MatplotlibRenderer:
         self._configure_axes(axis, data, ylim, policy, legends_left=job.legends_left)
         if limits_pack:
             self._add_limits_if_applicable(axis, limits_pack, legends_left=job.legends_left)
+        self._render_rms_annotations_if_enabled(axis, data, job, policy)
 
     def _process_finder(
         self,
@@ -278,6 +280,9 @@ class MatplotlibRenderer:
         analysis = self._analyze_data(data, type_tag, policy, job.limits, show_limits, tov_window_s, job.tov_window_count)
         basename, title = self._make_labels(job.case_name, group_label, job.run_number, finder, event_info)
         basename = self._basename_with_time_range(job, basename)
+        basename = self._basename_with_plot_variant(job, basename)
+        if job.plot_variant:
+            title = f"{title} | RMS {job.plot_variant}"
         return {
             "df": data,
             "finder": finder,
@@ -446,7 +451,7 @@ class MatplotlibRenderer:
     def _filter_signals(self, desc_df: list[InfDescriptor], group_label: str) -> dict[str, list[InfDescriptor]]:
         sub = [row for row in desc_df if row.Group == group_label]
         idx_map: dict[str, list[InfDescriptor]] = {}
-        for tag in ("LGp", "LLp"):
+        for tag in ("LGp", "LLp", "LGr", "LLr"):
             pattern = rf"(?:^|[_:]){re.escape(tag)}(?:$|[_:])"
             rows = [row for row in sub if re.search(pattern, str(row.Description))]
             if rows:
@@ -567,6 +572,10 @@ class MatplotlibRenderer:
         token = time_range_filename_token(job.time_start_s, job.time_end_s)
         return f"{basename}_{token}" if token else basename
 
+    def _basename_with_plot_variant(self, job: PlotJob, basename: str) -> str:
+        token = self._sanitize_filename_token(str(job.plot_variant or ""))
+        return f"{basename}_{token}" if job.plot_variant else basename
+
     def _window_peak_centered(self, t_peak: float, tov_window_s: float, tov_window_count: int) -> tuple[float, float]:
         width = float(tov_window_s) * max(1, int(tov_window_count)) * self.WINDOW_MULTIPLIER
         return t_peak - width, t_peak + width
@@ -672,6 +681,70 @@ class MatplotlibRenderer:
             f"{y_peak:.1f}{unit} @ {t_peak:.3f} s",
             xy=(t_peak, y_peak),
             xytext=(t_peak + self.ANNO_X_OFFSET, y_text),
+            textcoords="data",
+            color=color,
+            fontsize=self.FONTSIZE_ANNO,
+            ha="right",
+            va=vertical_align,
+        )
+
+    def _render_rms_annotations_if_enabled(
+        self,
+        ax: plt.Axes,
+        data: WaveformFrame,
+        job: PlotJob,
+        policy: dict[str, Any],
+    ) -> None:
+        if not (job.annotate_max or job.annotate_min) or data.values.shape[1] < 2:
+            return
+        values = data.values[:, 1:]
+        finite = np.isfinite(values)
+        if job.annotate_max and np.any(finite):
+            masked = np.where(finite, values, -np.inf)
+            row_index, phase_index = np.unravel_index(int(np.argmax(masked)), masked.shape)
+            self._render_extreme_annotation(
+                ax,
+                float(data.values[row_index, 0]),
+                float(values[row_index, phase_index]),
+                policy.get("unit_suffix", ""),
+                "RMS max",
+                "darkred",
+            )
+        if job.annotate_min and np.any(finite):
+            masked = np.where(finite, values, np.inf)
+            row_index, phase_index = np.unravel_index(int(np.argmin(masked)), masked.shape)
+            self._render_extreme_annotation(
+                ax,
+                float(data.values[row_index, 0]),
+                float(values[row_index, phase_index]),
+                policy.get("unit_suffix", ""),
+                "RMS min",
+                "navy",
+            )
+
+    def _render_extreme_annotation(
+        self,
+        ax: plt.Axes,
+        time_s: float,
+        value: float,
+        unit_suffix: str,
+        label: str,
+        color: str,
+    ) -> None:
+        if not (math.isfinite(time_s) and math.isfinite(value)):
+            return
+        ax.plot([time_s], [value], marker="o", markersize=4, color=color, linestyle="None", zorder=5)
+        ylim = ax.get_ylim()
+        y_range = max(ylim[1] - ylim[0], 1e-9)
+        offset = self.ANNO_Y_OFFSET * y_range if value >= 0 else -self.ANNO_Y_OFFSET * y_range
+        y_text = value + offset
+        vertical_align = "bottom" if value >= 0 else "top"
+        self._expand_ylim_for_peak_annotation(ax, y_text, vertical_align, y_range)
+        unit = f" {unit_suffix}" if unit_suffix else ""
+        ax.annotate(
+            f"{label}: {value:.1f}{unit} @ {time_s:.3f} s",
+            xy=(time_s, value),
+            xytext=(time_s + self.ANNO_X_OFFSET, y_text),
             textcoords="data",
             color=color,
             fontsize=self.FONTSIZE_ANNO,
