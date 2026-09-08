@@ -197,7 +197,10 @@ covered by plotting tests.
 3. **Select work.** The UI passes selected projects, scopes, voltages, events,
    settings, exclusions, and include overrides to the functions in `actions.py`.
 4. **Build envelopes/checks.** `voltage_envelope.build_voltage_envelopes`
-   applies Manual and NonConv rules, reads voltage-specific raw `.out` data,
+   loads `Statistic*.out` tables through the NumPy fast path (with the legacy
+   pandas fallback), using one process below 1,000 files and a separate pool
+   capped at four workers for larger sets. It applies Manual and NonConv rules,
+   reads voltage-specific raw `.out` data,
    performs the authoritative high-voltage check, creates per-run chronological
    envelope data, merges the selected runs, and writes the base workbook. A
    processed envelope data exists only during the current build, and the
@@ -239,7 +242,10 @@ covered by plotting tests.
 ### Exclusions and envelopes
 
 - Manual rules use `Case`, `Run`, and `Bus`; blank fields are wildcards and a
-  completely blank row is ignored.
+  completely blank row is ignored. Run and Bus cells accept comma-, semicolon-,
+  or newline-separated values; normalization expands them into individual exact
+  rules, using the Cartesian product when both cells contain lists. Run ranges
+  are not inferred.
 - The `Scopes` list is intentionally global. A selected token filter is applied
   to every selected project; this is separate from project-specific scans,
   exclusions, settings, output state, and status, which are never shared by
@@ -492,7 +498,10 @@ Sustained SDPF duration needs the corresponding data/check build.
   changed in a way that size/mtime validation cannot detect.
 - Raw waveform reading is the dominant cost. Do not add lazy settings scans,
   repeated project scans, or a second Sustained SDPF waveform read without a
-  benchmark and an explicit design reason.
+  benchmark and an explicit design reason. Warm project validation uses one
+  `os.scandir`/`DirEntry.stat()` walk for the targeted case files, and envelope
+  source manifests reuse an indexed directory listing plus binary-searched
+  output prefixes; these changes add no persistent files or dependencies.
 - Plot process workers do not receive Qt objects or the parent renderer. They
   rebuild process-local renderer/exporter state from the simple run index;
   each renderer loads only requested waveform columns, reuses standardized
@@ -530,7 +539,7 @@ $env:TEMP = "$PWD\.tmp"
 ```
 
 The latest recorded local source-level validation for this snapshot passed
-**242 tests**. Run the command and report its actual result rather than relying
+**248 tests**. Run the command and report its actual result rather than relying
 on the number. Also run the dependency import smoke check when packaging/setup
 is touched, and `Create_executable.bat` only when the executable itself is
 being validated.

@@ -754,6 +754,29 @@ def test_envelope_source_inventory_matches_per_file_manifest(tmp_path) -> None:
     )
 
 
+def test_envelope_source_inventory_indexes_case_prefix_outputs(tmp_path) -> None:
+    from results_analysis_app import voltage_envelope
+
+    project_root = tmp_path / "Project"
+    source_dir = project_root / "Case_folder" / "C1.1"
+    source_dir.mkdir(parents=True)
+    inf_path = source_dir / "C1_r00001.inf"
+    inf_path.write_text("descriptor", encoding="utf-8")
+    expected = {
+        "C1_r00001.out",
+        "C1_r00001_01.out",
+        "C1_r000010_extra.out",
+    }
+    for name in expected | {"C1_r00002_01.out"}:
+        (source_dir / name).write_text("waveform", encoding="utf-8")
+
+    inventory = voltage_envelope._source_file_inventory(project_root, [inf_path])
+
+    assert {
+        path.name for path in inventory.output_paths(source_dir, inf_path.stem)
+    } == expected
+
+
 def test_sustained_cache_signature_tracks_summary_workbook_version() -> None:
     from results_analysis_app import sustained_sdpf, voltage_envelope
 
@@ -832,7 +855,11 @@ def test_envelope_build_reuses_shared_run_executor(tmp_path, monkeypatch) -> Non
     inf_path = project / "Case_folder" / "C1_r00001.inf"
     inf_path.write_text("", encoding="utf-8")
 
-    monkeypatch.setattr(voltage_envelope, "_read_stat_files", lambda _root: pd.DataFrame())
+    monkeypatch.setattr(
+        voltage_envelope,
+        "_read_stat_files",
+        lambda _root, **_kwargs: pd.DataFrame(),
+    )
     monkeypatch.setattr(voltage_envelope, "_find_non_convergent_cases", lambda *_args, **_kwargs: pd.DataFrame())
     monkeypatch.setattr(voltage_envelope, "_selected_inf_paths", lambda *_args: [inf_path])
     monkeypatch.setattr(voltage_envelope, "_read_inf_descriptor_cache", lambda *_args: {})
@@ -851,14 +878,20 @@ def test_envelope_build_reuses_shared_run_executor(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(voltage_envelope, "_build_voltage_workbooks", fake_build)
 
+    logs = []
     voltage_envelope.build_voltage_envelopes(
         project,
         [ScopeEntry.full()],
         ["66", "161"],
         envelope_workers=4,
         build_charts=False,
+        log=logs.append,
     )
 
+    assert any(
+        "logical CPUs=" in message and "shared run-read pool=4" in message
+        for message in logs
+    )
     assert sorted(call[0] for call in calls) == ["161", "66"]
     assert [call[1] for call in calls] == [2.5, 2.5]
     assert [call[2] for call in calls] == [4, 4]

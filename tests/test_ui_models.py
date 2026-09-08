@@ -922,6 +922,25 @@ def test_exclusion_normalizers_drop_invalid_values() -> None:
         ExclusionRule(bus="MM_66_StA"),
         ExclusionRule(apply=False, case="C3"),
     ]
+    assert normalize_exclusion_rules(
+        [
+            {
+                "case": "C4",
+                "run": "1, r00004; 7",
+                "bus": "MM_230_A, MM_230_B\nMM_230_A",
+            }
+        ]
+    ) == [
+        ExclusionRule(case="C4", run=1, bus="MM_230_A"),
+        ExclusionRule(case="C4", run=1, bus="MM_230_B"),
+        ExclusionRule(case="C4", run=4, bus="MM_230_A"),
+        ExclusionRule(case="C4", run=4, bus="MM_230_B"),
+        ExclusionRule(case="C4", run=7, bus="MM_230_A"),
+        ExclusionRule(case="C4", run=7, bus="MM_230_B"),
+    ]
+    assert normalize_exclusion_rules(
+        [{"case": "C5", "run": "1, bad", "bus": "MM_230_A"}]
+    ) == []
 
     matcher = ExclusionMatcher(
         [
@@ -1037,6 +1056,37 @@ def test_exclusion_table_is_universal_and_supports_tsv_paste(monkeypatch) -> Non
         ):
             labels = {button.text() for button in tab.findChildren(QtWidgets.QPushButton)}
             assert {"Apply all", "Apply none"} <= labels
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_manual_exclusion_cells_expand_delimited_runs_and_buses(monkeypatch) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.exclusions import ExclusionRule
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    monkeypatch.setattr(storage, "load_autosave", AppSession.default)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        row = window._append_manual_exclusion_row()
+        window.manual_exclusion_table.item(row, 1).setText("C4")
+        window.manual_exclusion_table.item(row, 2).setText("1, r00004; 7")
+        window.manual_exclusion_table.item(row, 3).setText("MM_230_A, MM_230_B")
+
+        assert window._manual_exclusion_rows() == [
+            ExclusionRule(case="C4", run=1, bus="MM_230_A"),
+            ExclusionRule(case="C4", run=1, bus="MM_230_B"),
+            ExclusionRule(case="C4", run=4, bus="MM_230_A"),
+            ExclusionRule(case="C4", run=4, bus="MM_230_B"),
+            ExclusionRule(case="C4", run=7, bus="MM_230_A"),
+            ExclusionRule(case="C4", run=7, bus="MM_230_B"),
+        ]
     finally:
         window.close()
         app.processEvents()

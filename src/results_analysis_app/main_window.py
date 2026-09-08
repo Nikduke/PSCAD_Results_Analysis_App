@@ -454,6 +454,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ["Apply", "Case", "Run", "Bus"],
             editable=True,
         )
+        self.manual_exclusion_table.horizontalHeaderItem(2).setToolTip(
+            "One run or a comma-, semicolon-, or newline-separated run list."
+        )
+        self.manual_exclusion_table.horizontalHeaderItem(3).setToolTip(
+            "One bus or a comma-, semicolon-, or newline-separated bus list."
+        )
         manual_header = self.manual_exclusion_table.horizontalHeader()
         manual_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         manual_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)

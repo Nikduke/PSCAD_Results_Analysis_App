@@ -295,6 +295,64 @@ def test_project_fault_types_read_one_statistic_file(tmp_path, monkeypatch) -> N
     assert calls == [statistic]
 
 
+def test_numpy_statistic_parser_matches_legacy_parser(tmp_path) -> None:
+    import pandas as pd
+
+    from results_analysis_app import voltage_envelope
+
+    case_root = tmp_path / "Project" / "Case_folder" / "C1.if18"
+    case_root.mkdir(parents=True)
+    statistic = case_root / "Statistic_0001.out"
+    statistic.write_text(
+        " Multiple Run Output File\n"
+        "  Run #               T_sw         FLT_type          Tswitch       Fault_type       Fault_time\n"
+        "    1          10.20000000         1             10.20000000         1             10.10000000\n"
+        "    2          10.20083300         4             10.20083300         4             10.10083300\n"
+        "Statistical Summary Based on     2 Runs:\n"
+        "  summary text is ignored\n",
+        encoding="utf-8",
+    )
+
+    expected = voltage_envelope._read_stat_file_legacy(statistic)
+    actual = voltage_envelope._read_stat_file_numpy(statistic)
+
+    assert actual is not None
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_statistic_parser_falls_back_for_non_numeric_rows(tmp_path) -> None:
+    import pandas as pd
+
+    from results_analysis_app import voltage_envelope
+
+    case_root = tmp_path / "Project" / "Case_folder" / "C1.if18"
+    case_root.mkdir(parents=True)
+    statistic = case_root / "Statistic_0001.out"
+    statistic.write_text(
+        " Multiple Run Output File\n"
+        "  Run #               T_sw         FLT_type          Tswitch       Fault_type       Fault_time\n"
+        "    1          10.20000000         invalid         10.20000000         1             10.10000000\n",
+        encoding="utf-8",
+    )
+
+    assert voltage_envelope._read_stat_file_numpy(statistic) is None
+    pd.testing.assert_frame_equal(
+        voltage_envelope._read_stat_file(statistic),
+        voltage_envelope._read_stat_file_legacy(statistic),
+    )
+
+
+def test_statistic_parser_worker_count_is_capped_and_adaptive(monkeypatch) -> None:
+    from results_analysis_app import voltage_envelope
+
+    monkeypatch.setattr(voltage_envelope, "detected_logical_cpu_count", lambda: 64)
+    assert voltage_envelope._statistic_worker_count(999) == 1
+    assert voltage_envelope._statistic_worker_count(1000) == 4
+
+    monkeypatch.setattr(voltage_envelope, "detected_logical_cpu_count", lambda: 2)
+    assert voltage_envelope._statistic_worker_count(1000) == 2
+
+
 def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs(tmp_path) -> None:
     import json
 

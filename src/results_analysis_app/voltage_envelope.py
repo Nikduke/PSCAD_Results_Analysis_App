@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Callable, Iterable
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 import hashlib
 import json
+import re
 import shutil
+import warnings
 from pathlib import Path
 from typing import Any
 import math
@@ -42,6 +45,7 @@ from results_analysis_app.models import (
     DEFAULT_NONCONV_CB_IIR_LIMIT,
     ScopeEntry,
     automatic_worker_count,
+    detected_logical_cpu_count,
     normalize_positive_float,
 )
 from results_analysis_app.project_config import (
@@ -72,6 +76,13 @@ NONCONV_CB_IIR_LIMIT = DEFAULT_NONCONV_CB_IIR_LIMIT
 TIME_STEP = DEFAULT_ENVELOPE_TIME_STEP
 TIME_END = DEFAULT_ENVELOPE_TIME_END
 MAX_WORKERS_ENV = "RESULTS_ANALYSIS_ENVELOPE_WORKERS"
+# Statistic files are small in the normal case, so process-pool startup is
+# only worthwhile for a large project.  Keep this parser pool separate from
+# the raw waveform pool; the latter is intentionally sized for waveform work.
+STATISTIC_POOL_THRESHOLD = 1000
+MAX_STATISTIC_WORKERS = 4
+_STATISTIC_OUTPUT_SEPARATOR = re.compile(r" +Output+ ")
+_STATISTIC_INTEGER_TOKEN = re.compile(r"[+-]?\d+$")
 # A stale envelope entry is an optimization failure, not a source-data
 # failure.  The entry is kept with the project's other stage fingerprints and
 # contains no processed waveform data.
@@ -163,6 +174,8 @@ class _SourceFileInventory:
 
     records: dict[str, dict[str, Any]]
     paths_by_directory: dict[str, tuple[Path, ...]]
+    output_paths_by_directory: dict[str, tuple[Path, ...]] = field(default_factory=dict)
+    output_names_by_directory: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @staticmethod
     def _key(path: Path) -> str:
@@ -171,14 +184,58 @@ class _SourceFileInventory:
         except (OSError, RuntimeError):
             return str(path).casefold()
 
+    @staticmethod
+    def _direct_key(path: Path) -> str:
+        """Return a normalized absolute key without resolving the filesystem path."""
+        return os.path.normcase(os.path.abspath(os.fspath(path))).casefold()
+
     def record(self, path: Path, project_root: Path) -> dict[str, Any]:
-        record = self.records.get(self._key(path))
+        record = self.records.get(self._direct_key(path))
+        if record is None:
+            # Keep the resolved lookup for inventories constructed with the
+            # former canonical-key shape; ordinary hits use the direct key.
+            record = self.records.get(self._key(path))
         if record is not None:
             return dict(record)
         return _file_manifest_entry(project_root, path)
 
     def directory_paths(self, directory: Path) -> tuple[Path, ...]:
+        paths = self.paths_by_directory.get(self._direct_key(directory))
+        if paths is not None:
+            return paths
         return self.paths_by_directory.get(self._key(directory), ())
+
+    def output_paths(self, directory: Path, stem: str) -> tuple[Path, ...]:
+        """Return output files whose names start with an `.inf` stem.
+
+        Output names are sorted once during inventory construction.  A binary
+        search narrows the candidate range, avoiding a full directory scan for
+        every `.inf` manifest while preserving the former prefix rule.
+        """
+        key = self._direct_key(directory)
+        names = self.output_names_by_directory.get(key)
+        paths = self.output_paths_by_directory.get(key)
+        if names is None or paths is None:
+            key = self._key(directory)
+            names = self.output_names_by_directory.get(key)
+            paths = self.output_paths_by_directory.get(key)
+        if names is None or paths is None:
+            # Keep inventories constructed with the old two-field shape
+            # correct; new inventories always take the indexed path above.
+            folded_stem = stem.casefold()
+            return tuple(
+                path
+                for path in self.directory_paths(directory)
+                if path.suffix.casefold() == ".out"
+                and path.name.casefold().startswith(folded_stem)
+            )
+        folded_stem = stem.casefold()
+        first = bisect_left(names, folded_stem)
+        return tuple(
+            path
+            for name, path in zip(names[first:], paths[first:])
+            if name.startswith(folded_stem)
+        )
 
 
 def _source_file_inventory(
@@ -197,6 +254,8 @@ def _source_file_inventory(
     directories = list(dict.fromkeys(Path(path).parent for path in inf_paths))
     records: dict[str, dict[str, Any]] = {}
     paths_by_directory: dict[str, tuple[Path, ...]] = {}
+    output_paths_by_directory: dict[str, tuple[Path, ...]] = {}
+    output_names_by_directory: dict[str, tuple[str, ...]] = {}
 
     def relative_path(path: Path) -> str:
         try:
@@ -205,7 +264,7 @@ def _source_file_inventory(
             return str(path.resolve(strict=False))
 
     def add_path(path: Path, stat_result: os.stat_result | None = None) -> None:
-        key = _SourceFileInventory._key(path)
+        key = _SourceFileInventory._direct_key(path)
         if key in records:
             return
         if stat_result is None:
@@ -236,13 +295,23 @@ def _source_file_inventory(
                         add_path(path)
         except OSError:
             pass
-        paths_by_directory[_SourceFileInventory._key(directory)] = tuple(
-            sorted(found, key=lambda path: path.name.casefold())
+        directory_key = _SourceFileInventory._direct_key(directory)
+        sorted_found = tuple(sorted(found, key=lambda path: path.name.casefold()))
+        paths_by_directory[directory_key] = sorted_found
+        outputs = tuple(path for path in sorted_found if path.suffix.casefold() == ".out")
+        output_paths_by_directory[directory_key] = outputs
+        output_names_by_directory[directory_key] = tuple(
+            path.name.casefold() for path in outputs
         )
 
     for path in extra_paths:
         add_path(Path(path))
-    return _SourceFileInventory(records, paths_by_directory)
+    return _SourceFileInventory(
+        records,
+        paths_by_directory,
+        output_paths_by_directory,
+        output_names_by_directory,
+    )
 
 
 def _remove_legacy_envelope_cache(project_root: Path) -> None:
@@ -268,11 +337,7 @@ def _run_source_manifest(
         return [_file_manifest_entry(project_root, path) for path in dict.fromkeys(candidates)]
 
     stem = inf_path.stem.casefold()
-    candidates.extend(
-        path
-        for path in source_inventory.directory_paths(inf_path.parent)
-        if path.suffix.casefold() == ".out" and path.name.casefold().startswith(stem)
-    )
+    candidates.extend(source_inventory.output_paths(inf_path.parent, stem))
     return [
         source_inventory.record(path, project_root)
         for path in dict.fromkeys(candidates)
@@ -649,7 +714,7 @@ def build_voltage_envelopes(
     total_workers = _configured_worker_count(envelope_workers)
     _log(log, f"Reading statistic and convergence data: {project_root.name}")
     stat_started = time.perf_counter()
-    df_stat = _read_stat_files(project_root)
+    df_stat = _read_stat_files(project_root, log=log)
     cb_iip_limit = normalize_positive_float(nonconv_cb_iip_limit, NONCONV_CB_IIP_LIMIT)
     cb_iir_limit = normalize_positive_float(nonconv_cb_iir_limit, NONCONV_CB_IIR_LIMIT)
     nonconv_warnings: list[str] = []
@@ -915,7 +980,12 @@ def build_voltage_envelopes(
     sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = {}
     sustained_observations: dict[tuple[str, str], list[sustained_sdpf.SustainedSDPFResult]] = {}
     sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = {}
-    _log(log, f"Envelope worker plan: shared run-read pool={total_workers}; voltage reads concurrent")
+    _log(
+        log,
+        "Envelope worker plan: "
+        f"logical CPUs={detected_logical_cpu_count()}; "
+        f"shared run-read pool={total_workers}; voltage reads concurrent",
+    )
 
     def build_voltage(voltage_key: str) -> _VoltageBuildResult:
         return _build_voltage_workbooks(
@@ -2335,7 +2405,7 @@ def _statistic_files(project_root: Path) -> list[Path]:
     return sorted((project_root / "Case_folder").rglob("Statistic*.out"))
 
 
-def _read_stat_file(path: Path) -> pd.DataFrame:
+def _read_stat_file_legacy(path: Path) -> pd.DataFrame:
     case_name = path.parent.name.split(".")[0]
     raw = pd.read_csv(path, skiprows=[0], header=None, sep=" +Output+ ", engine="python")
     raw.reset_index(drop=True, inplace=True)
@@ -2352,8 +2422,105 @@ def _read_stat_file(path: Path) -> pd.DataFrame:
     return _map_faults(df_stat)
 
 
-def _read_stat_files(project_root: Path) -> pd.DataFrame:
-    all_dfs = [_read_stat_file(path) for path in _statistic_files(project_root)]
+def _statistic_line_field(line: str) -> str:
+    if "Output" in line:
+        line = _STATISTIC_OUTPUT_SEPARATOR.split(line, maxsplit=1)[0]
+    return line.replace("Run #", "Run#")
+
+
+def _read_stat_file_numpy(path: Path) -> pd.DataFrame | None:
+    """Read a standard PSCAD statistic table through NumPy's text parser.
+
+    ``None`` means that the file does not match the normal numeric table
+    shape.  The caller then uses the legacy pandas parser, preserving support
+    for older or unusual PSCAD output variants.
+    """
+    case_name = path.parent.name.split(".")[0]
+    try:
+        with path.open("r") as handle:
+            next(handle, None)
+            header_line = next(handle, None)
+            if header_line is None:
+                return None
+            header = _statistic_line_field(header_line).split()
+            if (
+                not header
+                or len(set(header)) != len(header)
+                or "Run#" not in header
+                or "Fault_type" not in header
+            ):
+                return None
+
+            integer_flags = [True] * len(header)
+
+            def numeric_lines():
+                for line in handle:
+                    field = _statistic_line_field(line)
+                    if field.startswith("Statistical Summary"):
+                        break
+                    if not field.strip():
+                        continue
+                    # The legacy ``str.split(" +")`` parser does not treat
+                    # tabs as separators.  Delegate such files to pandas so
+                    # their existing behavior remains unchanged.
+                    if "\t" in field:
+                        raise ValueError("unsupported tab-separated statistic row")
+                    tokens = field.split()
+                    if len(tokens) != len(header):
+                        raise ValueError("inconsistent statistic row width")
+                    for index, token in enumerate(tokens):
+                        if not _STATISTIC_INTEGER_TOKEN.fullmatch(token):
+                            integer_flags[index] = False
+                    yield field
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                values = np.loadtxt(numeric_lines(), dtype=np.float64, ndmin=2)
+    except (OSError, UnicodeError, TypeError, ValueError, IndexError):
+        return None
+
+    if values.size == 0 or values.shape[1] != len(header):
+        return None
+
+    df_stat = pd.DataFrame(values, columns=header)
+    # Preserve the column-index metadata produced by the legacy split-based
+    # parser so downstream equality and serialization behavior stay stable.
+    df_stat.columns.name = 0
+    int_info = np.iinfo(np.int64)
+    for index, column in enumerate(header):
+        values_for_column = values[:, index]
+        if (
+            integer_flags[index]
+            and np.isfinite(values_for_column).all()
+            and (values_for_column >= int_info.min).all()
+            and (values_for_column <= int_info.max).all()
+        ):
+            df_stat[column] = values_for_column.astype(np.int64)
+    df_stat.dropna(subset=["Run#"], inplace=True)
+    df_stat.insert(0, "Case", case_name)
+    return _map_faults(df_stat)
+
+
+def _read_stat_file(path: Path) -> pd.DataFrame:
+    parsed = _read_stat_file_numpy(path)
+    return parsed if parsed is not None else _read_stat_file_legacy(path)
+
+
+def _statistic_worker_count(file_count: int) -> int:
+    if file_count < STATISTIC_POOL_THRESHOLD:
+        return 1
+    return max(1, min(MAX_STATISTIC_WORKERS, file_count, detected_logical_cpu_count()))
+
+
+def _read_stat_files(project_root: Path, log: LogFn | None = None) -> pd.DataFrame:
+    paths = _statistic_files(project_root)
+    workers = _statistic_worker_count(len(paths))
+    _log(log, f"Statistic parser plan: files={len(paths)}; workers={workers}")
+    if workers == 1:
+        all_dfs = [_read_stat_file(path) for path in paths]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            all_dfs = list(executor.map(_read_stat_file, paths))
     if not all_dfs:
         return pd.DataFrame(columns=["Case", "Run#", "Fault_type"])
     return pd.concat(all_dfs, ignore_index=True)

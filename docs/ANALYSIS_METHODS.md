@@ -109,7 +109,7 @@ If a project configuration is incomplete, voltage prefixes can still be discover
 
 ### 2.3 Fault type mapping
 
-`Statistic*.out` files are read once per build. Their `Case` and `Run#` rows are joined to envelope provenance. The current numeric fault mapping is:
+`Statistic*.out` files are read once per build. Standard numeric tables are parsed through NumPy's text reader; files that do not match that shape use the legacy pandas parser. Parsing is sequential below 1,000 statistic files and uses a separate four-worker maximum pool for larger sets. Their `Case` and `Run#` rows are joined to envelope provenance. The current numeric fault mapping is:
 
 | Statistic value | Displayed fault type |
 |---:|---|
@@ -126,7 +126,7 @@ Unknown or missing mappings remain blank rather than being guessed.
 
 ### 3.1 Manual and NonConv exclusions
 
-Manual rules are Case/Run/Bus matchers. Blank fields are wildcards; a completely blank row is ignored. NonConv proposals come from `CB_*.out` summary files:
+Manual rules are Case/Run/Bus matchers. Blank fields are wildcards; a completely blank row is ignored. The editable `Run` and `Bus` cells accept comma-, semicolon-, or newline-separated values. The normalizer expands the listed runs and buses into individual exact rules (the Cartesian product when both fields contain lists), deduplicates them, and keeps the matcher scalar. Run ranges are not inferred. NonConv proposals come from `CB_*.out` summary files:
 
 - `CB_IIp` is flagged when `abs(value) > 400` by default.
 - `CB_IIr` is flagged when `abs(value) > 200` by default.

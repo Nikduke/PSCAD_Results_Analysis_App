@@ -198,6 +198,15 @@ def normalize_worker_count(value: Any) -> int:
         return DEFAULT_ENVELOPE_WORKERS
 
 
+def detected_logical_cpu_count() -> int:
+    """Return the logical CPU count available to the current process."""
+    cpu_counter = getattr(os, "process_cpu_count", None)
+    cpu_count = cpu_counter() if callable(cpu_counter) else None
+    if cpu_count is None:
+        cpu_count = os.cpu_count()
+    return max(1, int(cpu_count or 1))
+
+
 def automatic_worker_count() -> int:
     """Choose a bounded waveform pool from 80% of detected logical CPUs.
 
@@ -206,11 +215,7 @@ def automatic_worker_count() -> int:
     the operating system while allowing the SSD-backed read stage to use the
     parallelism it can sustain.
     """
-    cpu_counter = getattr(os, "process_cpu_count", None)
-    cpu_count = cpu_counter() if callable(cpu_counter) else None
-    if cpu_count is None:
-        cpu_count = os.cpu_count()
-    detected_cpus = max(1, int(cpu_count or 1))
+    detected_cpus = detected_logical_cpu_count()
     worker_target = math.ceil(detected_cpus * 0.8)
     return max(1, min(MAX_ENVELOPE_WORKERS, worker_target))
 

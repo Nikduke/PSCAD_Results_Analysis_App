@@ -58,21 +58,19 @@ def normalize_exclusion_rules(value: Any) -> list[ExclusionRule]:
     output: list[ExclusionRule] = []
     positions: dict[tuple[str, int | None, str, str], int] = {}
     for item in value:
-        rule = _normalize_exclusion_rule(item)
-        if rule is None:
-            continue
-        key = (
-            rule.case.casefold(),
-            rule.run,
-            rule.bus.casefold(),
-            rule.voltage,
-        )
-        position = positions.get(key)
-        if position is None:
-            positions[key] = len(output)
-            output.append(rule)
-        elif rule.apply and not output[position].apply:
-            output[position] = rule
+        for rule in _normalize_exclusion_rule_variants(item):
+            key = (
+                rule.case.casefold(),
+                rule.run,
+                rule.bus.casefold(),
+                rule.voltage,
+            )
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(output)
+                output.append(rule)
+            elif rule.apply and not output[position].apply:
+                output[position] = rule
     return output
 
 
@@ -184,30 +182,83 @@ def normalize_project_high_voltage_exclusions(
     return output
 
 
-def _normalize_exclusion_rule(value: Any) -> ExclusionRule | None:
+def _normalize_exclusion_rule_variants(value: Any) -> list[ExclusionRule]:
     if isinstance(value, ExclusionRule):
         raw = value.to_dict()
     elif isinstance(value, dict):
         raw = value
     else:
-        return None
+        return []
 
     case = str(raw.get("case", "")).strip()
-    bus = str(raw.get("bus", raw.get("MM_name", ""))).strip()
+    bus_values = _bus_values(raw.get("bus", raw.get("MM_name", "")))
+    if bus_values is None:
+        return []
     voltage = normalize_voltage(raw.get("voltage", ""))
-    run_raw = raw.get("run")
-    run = _optional_run(run_raw)
-    if run_raw is not None and str(run_raw).strip() and run is None:
+    run_values = _run_values(raw.get("run"))
+    if run_values is None:
+        return []
+    if not case and all(run is None for run in run_values) and not any(bus_values):
+        return []
+    apply = _apply_value(raw.get("apply", True))
+    return [
+        ExclusionRule(
+            apply=apply,
+            case=case,
+            run=run,
+            bus=bus,
+            voltage=voltage,
+        )
+        for run in run_values
+        for bus in bus_values
+    ]
+
+
+_EXCLUSION_VALUE_SEPARATOR = re.compile(r"[,;\r\n]+")
+
+
+def _split_exclusion_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_values = [str(item) for item in value]
+    else:
+        raw_values = _EXCLUSION_VALUE_SEPARATOR.split(
+            "" if value is None else str(value)
+        )
+    return [item.strip() for item in raw_values if item.strip()]
+
+
+def _bus_values(value: Any) -> list[str] | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return [""]
+    values = _split_exclusion_values(value)
+    if not values:
         return None
-    if not case and run is None and not bus:
+    output: list[str] = []
+    seen: set[str] = set()
+    for bus in values:
+        key = bus.casefold()
+        if key not in seen:
+            seen.add(key)
+            output.append(bus)
+    return output
+
+
+def _run_values(value: Any) -> list[int | None] | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return [None]
+    values = _split_exclusion_values(value)
+    if not values:
         return None
-    return ExclusionRule(
-        apply=_apply_value(raw.get("apply", True)),
-        case=case,
-        run=run,
-        bus=bus,
-        voltage=voltage,
-    )
+    output: list[int] = []
+    seen: set[int] = set()
+    for token in values:
+        run = _optional_run(token)
+        if run is None:
+            return None
+        if run not in seen:
+            seen.add(run)
+            output.append(run)
+    return output
 
 
 def _optional_run(value: Any) -> int | None:

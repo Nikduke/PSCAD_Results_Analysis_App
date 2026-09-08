@@ -273,24 +273,68 @@ def project_scan_manifest(project_root: str | Path) -> dict[str, Any]:
 
     case_root = root / "Case_folder"
     if case_root.is_dir():
-        for directory, _subdirs, names in os.walk(case_root):
-            directory_path = Path(directory)
-            inf_names = [name for name in names if not name.startswith("~$") and name.casefold().endswith(".inf")]
+        # `project_scan_manifest` is called for every cached project opening.
+        # DirEntry.stat() avoids constructing a Path and issuing a second path
+        # lookup for each raw file while retaining the same inclusion rules as
+        # the former os.walk implementation.
+        pending_directories = [case_root]
+        while pending_directories:
+            directory_path = pending_directories.pop()
+            try:
+                with os.scandir(directory_path) as entries:
+                    directory_entries = []
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending_directories.append(Path(entry.path))
+                                continue
+                            # os.walk places symlinked directories in its
+                            # directory list even when it does not follow them.
+                            if entry.is_symlink() and entry.is_dir():
+                                continue
+                        except OSError:
+                            continue
+                        directory_entries.append(entry)
+            except OSError:
+                continue
+
+            inf_entries = [
+                entry
+                for entry in directory_entries
+                if not entry.name.startswith("~$")
+                and entry.name.casefold().endswith(".inf")
+            ]
             matching_stems: list[str] = []
-            for name in inf_names:
-                path = directory_path / name
-                add_file(path)
+
+            def add_entry(entry, target=files) -> None:
+                try:
+                    stat = entry.stat()
+                    relative_path = Path(entry.path).relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    return
+                target.append(
+                    {
+                        "path": relative_path,
+                        "size": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
+                )
+
+            for entry in inf_entries:
+                add_entry(entry)
+                path = Path(entry.path)
                 if log_cases and _case_name_from_inf(path).casefold() in log_cases:
                     matching_stems.append(path.stem.casefold())
-            for name in names:
+
+            for entry in directory_entries:
+                name = entry.name
                 if name.startswith("~$") or not name.casefold().endswith(".out"):
                     continue
                 folded = name.casefold()
-                path = directory_path / name
                 if folded.startswith("statistic") or folded.startswith("cb_"):
-                    add_file(path)
+                    add_entry(entry)
                 elif any(folded.startswith(f"{stem}_") for stem in matching_stems):
-                    add_file(path, high_voltage_files)
+                    add_entry(entry, high_voltage_files)
     for path in root.glob("Input_Data_PSCAD*.xlsx"):
         if not path.name.startswith("~$"):
             add_file(path)
