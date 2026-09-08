@@ -308,6 +308,77 @@ def test_session_default_envelope_workers_use_automatic_selection() -> None:
     assert AppSession.default().excel_waveform_exports_enabled is True
 
 
+def test_top_bar_uses_envelope_and_sdpf_labels_with_dividers(monkeypatch) -> None:
+    from PySide6 import QtCore, QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = AppSession.default()
+    session.voltages = ["66", "161", "230"]
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(storage, "save_autosave", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        section_labels = {
+            label.text()
+            for label in window.findChildren(QtWidgets.QLabel)
+            if label.property("labelRole") == "section"
+        }
+        assert "Envelopes:" in section_labels
+        assert "Analysis:" in section_labels
+        assert "Envelopes" not in section_labels
+        assert "Events" not in section_labels
+        assert window.voltage_button.text() == "Voltages (all)"
+        assert window.voltage_button.menu() is window.voltage_menu
+        assert len(window.voltage_menu.actions()) == 1
+        assert window.voltage_menu.actions()[0].defaultWidget() is window.voltage_popup_scroll
+        assert window.voltage_popup_content.all_voltages_check is window.all_voltages_check
+        assert window.all_voltages_check.text() == "All voltages"
+        assert [check.text() for check in window.voltage_checks.values()] == ["66", "161", "230"]
+        assert all(
+            row.layout().contentsMargins().left() == 20
+            for row in window.voltage_popup_content.child_rows
+        )
+        assert all(check.isChecked() for check in window.voltage_checks.values())
+        assert window.all_voltages_check.checkState() == QtCore.Qt.CheckState.Checked
+        window.voltage_checks["161"].setChecked(False)
+        app.processEvents()
+        assert window.session.voltages == ["66", "230"]
+        assert window.voltage_button.text() == "Voltages (2/3)"
+        assert window.all_voltages_check.checkState() == QtCore.Qt.CheckState.PartiallyChecked
+        window.all_voltages_check.setChecked(False)
+        app.processEvents()
+        assert window.session.voltages == []
+        assert window.voltage_button.text() == "Voltages (none)"
+        assert window.all_voltages_check.checkState() == QtCore.Qt.CheckState.Unchecked
+        window.all_voltages_check.setChecked(True)
+        app.processEvents()
+        assert window.session.voltages == ["66", "161", "230"]
+        assert window.voltage_button.text() == "Voltages (all)"
+        window._set_voltage_options(["330", "230"], ["330"])
+        app.processEvents()
+        assert list(window.voltage_checks) == ["230", "330"]
+        assert window.session.voltages == ["330"]
+        assert window.voltage_button.text() == "Voltages (1/2)"
+        assert window.all_voltages_check.checkState() == QtCore.Qt.CheckState.PartiallyChecked
+        assert window.sustained_sdpf_checkbox.text() == "SDPF"
+        assert window.sustained_sdpf_checkbox.toolTip() == "Sustained SDPF Stress"
+
+        dividers = window.findChildren(QtWidgets.QFrame, "topBarDivider")
+        assert len(dividers) == 2
+        assert all(
+            divider.frameShape() == QtWidgets.QFrame.Shape.VLine
+            for divider in dividers
+        )
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_chart_axis_settings_use_project_duration_and_per_project_overrides() -> None:
     from pathlib import Path
     from types import SimpleNamespace

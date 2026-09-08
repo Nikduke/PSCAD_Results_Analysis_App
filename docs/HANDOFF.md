@@ -194,8 +194,11 @@ covered by plotting tests.
    factor or `Um` reclassifies cached maxima; it does not reread those files.
    A changed log or matching raw input refreshes the targeted cache. No log does
    not trigger a full raw-results scan.
-3. **Select work.** The UI passes selected projects, scopes, voltages, events,
+3. **Select work.** The UI passes selected projects, scopes, voltages, envelopes,
    settings, exclusions, and include overrides to the functions in `actions.py`.
+   Voltage levels are selected through the `Voltages` popup: `All voltages`
+   is the tri-state master checkbox and the entries below it are the individual
+   levels.
 4. **Build envelopes/checks.** `voltage_envelope.build_voltage_envelopes`
    loads `Statistic*.out` tables through the NumPy fast path (with the legacy
    pandas fallback), using one process below 1,000 files and a separate pool

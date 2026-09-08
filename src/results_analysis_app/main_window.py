@@ -52,6 +52,60 @@ USER_ROLE_SCOPE_FOLDER = QtCore.Qt.ItemDataRole.UserRole + 1
 USER_ROLE_FIGURE_ID = QtCore.Qt.ItemDataRole.UserRole + 2
 
 
+class _VoltagePopupContent(QtWidgets.QWidget):
+    """Display the voltage master checkbox and indented child selections."""
+
+    _CHILD_INDENT = 20
+    _BRANCH_OFFSET = 8
+
+    def __init__(
+        self,
+        all_voltages_check: QtWidgets.QCheckBox,
+        voltage_checks: Iterable[QtWidgets.QCheckBox],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.all_voltages_check = all_voltages_check
+        self.voltage_checks = list(voltage_checks)
+        self.child_rows: list[QtWidgets.QWidget] = []
+        self.setMinimumWidth(150)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 2, 8, 2)
+        layout.setSpacing(0)
+        layout.addWidget(all_voltages_check)
+        for check in self.voltage_checks:
+            row = QtWidgets.QWidget(self)
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
+            row_layout.setSpacing(0)
+            row_layout.addWidget(check)
+            row_layout.addStretch(1)
+            row.setMinimumHeight(check.sizeHint().height())
+            layout.addWidget(row)
+            self.child_rows.append(row)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 - Qt override name
+        super().paintEvent(event)
+        if not self.child_rows:
+            return
+        margins = self.layout().contentsMargins()
+        branch_x = margins.left() + self._BRANCH_OFFSET
+        root_y = self.all_voltages_check.geometry().center().y()
+        painter = QtGui.QPainter(self)
+        color = self.palette().color(QtGui.QPalette.ColorRole.Mid)
+        color.setAlpha(180)
+        painter.setPen(QtGui.QPen(color, 1))
+        child_centres: list[tuple[int, int]] = []
+        for row, check in zip(self.child_rows, self.voltage_checks):
+            child_y = row.geometry().center().y()
+            child_x = row.geometry().left() + check.geometry().left()
+            child_centres.append((child_x, child_y))
+        painter.drawLine(branch_x, root_y, branch_x, child_centres[-1][1])
+        for child_x, child_y in child_centres:
+            painter.drawLine(branch_x, child_y, child_x, child_y)
+
+
 def _append_unique_csv(target: list[str], value: object) -> None:
     for part in (item.strip() for item in str(value).split(",")):
         if part and part not in target:
@@ -267,6 +321,22 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.setObjectName("panel")
         return panel
 
+    def _add_top_bar_divider(
+        self,
+        layout: QtWidgets.QHBoxLayout,
+        parent: QtWidgets.QWidget,
+    ) -> None:
+        layout.addSpacing(6)
+        divider = QtWidgets.QFrame(parent)
+        divider.setObjectName("topBarDivider")
+        divider.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        divider.setLineWidth(1)
+        divider.setMidLineWidth(0)
+        divider.setFixedHeight(20)
+        layout.addWidget(divider)
+        layout.addSpacing(6)
+
     def _build_top_bar(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
         bar = self._panel(parent)
         layout = QtWidgets.QHBoxLayout(bar)
@@ -281,16 +351,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.settings_button)
 
         layout.addSpacing(12)
-        layout.addWidget(make_section_label("Voltages", bar))
         self.voltage_checks: dict[str, QtWidgets.QCheckBox] = {}
-        self.voltage_widget = QtWidgets.QWidget(bar)
-        self.voltage_layout = QtWidgets.QHBoxLayout(self.voltage_widget)
-        self.voltage_layout.setContentsMargins(0, 0, 0, 0)
-        self.voltage_layout.setSpacing(6)
-        layout.addWidget(self.voltage_widget)
+        self.all_voltages_check: QtWidgets.QCheckBox | None = None
+        self.voltage_button = QtWidgets.QPushButton("Voltages", bar)
+        self.voltage_button.setMinimumWidth(96)
+        apply_secondary_button_style(self.voltage_button)
+        self.voltage_button.setToolTip(
+            "Select voltage levels. All available levels are selected by default."
+        )
+        self.voltage_menu = QtWidgets.QMenu(self.voltage_button)
+        self.voltage_button.setMenu(self.voltage_menu)
+        layout.addWidget(self.voltage_button)
 
-        layout.addSpacing(12)
-        layout.addWidget(make_section_label("Events", bar))
+        self._add_top_bar_divider(layout, bar)
+        layout.addWidget(make_section_label("Envelopes:", bar))
         self.event_checks: dict[str, QtWidgets.QCheckBox] = {}
         for event in DEFAULT_EVENTS:
             check = QtWidgets.QCheckBox(event, bar)
@@ -298,8 +372,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.event_checks[event] = check
             layout.addWidget(check)
 
-        layout.addSpacing(12)
-        layout.addWidget(make_section_label("Analysis", bar))
+        self._add_top_bar_divider(layout, bar)
+        layout.addWidget(make_section_label("Analysis:", bar))
         resonance_short_labels = {
             "Post_Event_Stress": "Stress",
             "Late_Growth": "Late",
@@ -312,7 +386,7 @@ class MainWindow(QtWidgets.QMainWindow):
             check.toggled.connect(self._on_global_selection_changed)
             self.resonance_checkboxes[check_name] = check
             layout.addWidget(check)
-        self.sustained_sdpf_checkbox = QtWidgets.QCheckBox("Sustained SDPF", bar)
+        self.sustained_sdpf_checkbox = QtWidgets.QCheckBox("SDPF", bar)
         self.sustained_sdpf_checkbox.setToolTip("Sustained SDPF Stress")
         self.sustained_sdpf_checkbox.toggled.connect(self._on_global_selection_changed)
         layout.addWidget(self.sustained_sdpf_checkbox)
@@ -805,18 +879,42 @@ class MainWindow(QtWidgets.QMainWindow):
         was_loading = self._loading
         self._loading = True
         try:
-            while self.voltage_layout.count():
-                item = self.voltage_layout.takeAt(0)
-                widget = item.widget()
-                if widget is not None:
-                    widget.deleteLater()
+            self.voltage_menu.clear()
+            self.all_voltages_check = QtWidgets.QCheckBox("All voltages")
+            self.all_voltages_check.setTristate(True)
+            self.all_voltages_check.setToolTip(
+                "Select or clear all available voltage levels."
+            )
+            self.all_voltages_check.stateChanged.connect(self._on_all_voltages_changed)
             self.voltage_checks = {}
             for voltage in options:
-                check = QtWidgets.QCheckBox(voltage, self.voltage_widget)
+                check = QtWidgets.QCheckBox(voltage)
                 check.setChecked(voltage in selected_values)
                 check.toggled.connect(self._on_global_selection_changed)
                 self.voltage_checks[voltage] = check
-                self.voltage_layout.addWidget(check)
+            self.voltage_popup_content = _VoltagePopupContent(
+                self.all_voltages_check,
+                self.voltage_checks.values(),
+            )
+            self.voltage_popup_scroll = QtWidgets.QScrollArea(self.voltage_menu)
+            self.voltage_popup_scroll.setObjectName("voltagePopupScroll")
+            self.voltage_popup_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.voltage_popup_scroll.setWidgetResizable(True)
+            self.voltage_popup_scroll.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.voltage_popup_scroll.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            self.voltage_popup_scroll.setFixedWidth(170)
+            self.voltage_popup_scroll.setMaximumHeight(260)
+            self.voltage_popup_scroll.setWidget(self.voltage_popup_content)
+            popup_height = self.voltage_popup_content.sizeHint().height() + 2
+            self.voltage_popup_scroll.setFixedHeight(min(260, max(1, popup_height)))
+            popup_action = QtWidgets.QWidgetAction(self.voltage_menu)
+            popup_action.setDefaultWidget(self.voltage_popup_scroll)
+            self.voltage_menu.addAction(popup_action)
+            self._update_voltage_selector_state()
         finally:
             self._loading = was_loading
         if not self._loading:
@@ -881,6 +979,49 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         self.session.sustained_sdpf_enabled = self.sustained_sdpf_checkbox.isChecked()
         self._save_current_project_exclusions()
+        self._update_voltage_selector_state()
+
+    def _update_voltage_selector_state(self) -> None:
+        selected_count = sum(check.isChecked() for check in self.voltage_checks.values())
+        total_count = len(self.voltage_checks)
+        if self.all_voltages_check is not None:
+            if total_count and selected_count == total_count:
+                state = QtCore.Qt.CheckState.Checked
+            elif selected_count:
+                state = QtCore.Qt.CheckState.PartiallyChecked
+            else:
+                state = QtCore.Qt.CheckState.Unchecked
+            blocker = QtCore.QSignalBlocker(self.all_voltages_check)
+            self.all_voltages_check.setCheckState(state)
+            self.all_voltages_check.setEnabled(bool(total_count))
+            del blocker
+
+        if not total_count or not selected_count:
+            status = "none"
+        elif selected_count == total_count:
+            status = "all"
+        else:
+            status = f"{selected_count}/{total_count}"
+        self.voltage_button.setText(f"Voltages ({status})")
+
+    def _on_all_voltages_changed(self, state: int) -> None:
+        if self._loading:
+            return
+        check_state = QtCore.Qt.CheckState(state)
+        select_all = check_state in {
+            QtCore.Qt.CheckState.Checked,
+            QtCore.Qt.CheckState.PartiallyChecked,
+        }
+        was_loading = self._loading
+        self._loading = True
+        try:
+            for check in self.voltage_checks.values():
+                check.setChecked(select_all)
+        finally:
+            self._loading = was_loading
+        self._sync_global_selections_from_ui()
+        self.autosave()
+        self.update_preview()
 
     def _voltage_sort_key(self, value: str) -> tuple[int, float | str]:
         return (0, float(value)) if is_number(value) else (1, value)
@@ -3109,6 +3250,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rebuild_analysis_charts_button.setEnabled(not busy)
         self.create_analysis_batches_button.setEnabled(not busy)
         self.render_analysis_plots_button.setEnabled(not busy)
+        self.voltage_button.setEnabled(not busy)
+        if self.all_voltages_check is not None:
+            self.all_voltages_check.setEnabled(not busy and bool(self.voltage_checks))
         for check in self.voltage_checks.values():
             check.setEnabled(not busy)
         for check in self.event_checks.values():
