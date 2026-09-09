@@ -48,6 +48,7 @@ WORD_2012_NAMESPACE = "http://schemas.microsoft.com/office/word/2012/wordml"
 WORD_2016_CID_NAMESPACE = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
 REPORT_MANIFEST_VERSION = 2
 SUSTAINED_REPORT_LAYOUT_VERSION = 3
+RMS_REPORT_LAYOUT_VERSION = 2
 LEGACY_REPORT_MANIFEST_FILENAME = ".report_manifest.json"
 
 @dataclass(frozen=True)
@@ -772,6 +773,7 @@ def _report_manifest_payload(
     }
     if parsed_rms["enabled"]:
         payload["rms_result_version"] = rms_analysis.RMS_RESULT_VERSION
+        payload["rms_report_layout_version"] = RMS_REPORT_LAYOUT_VERSION
     if parsed_sustained.enabled:
         payload["sustained_sdpf_result_version"] = sustained_sdpf.RESULT_VERSION
         payload["sustained_sdpf_report_layout_version"] = SUSTAINED_REPORT_LAYOUT_VERSION
@@ -1602,6 +1604,40 @@ def _rms_variant_from_image_path(path: Path) -> str:
     return match.group(1).lower() if match else ""
 
 
+_RMS_REPORT_HEADINGS = {
+    ("LG", "max"): "Line-to-Ground RMS Voltage Rise",
+    ("LG", "min"): "Line-to-Ground RMS Voltage Dip",
+    ("LL", "max"): "Line-to-Line RMS Voltage Rise",
+    ("LL", "min"): "Line-to-Line RMS Voltage Dip",
+}
+
+
+def _rms_report_heading(quantity: str, variant: str) -> str:
+    return _RMS_REPORT_HEADINGS.get((quantity, variant), "RMS Voltage")
+
+
+def _rms_report_calculation(selection: rms_analysis.RMSSelection | None) -> str | None:
+    if selection is None:
+        return None
+    reference = rms_analysis.rms_reference_kv(selection)
+    change_percent = rms_analysis.rms_change_percent(selection)
+    if reference is None or change_percent is None:
+        return None
+    if selection.variant == "min":
+        value_word = "lowest"
+        change_word = "voltage dip"
+    elif selection.variant == "max":
+        value_word = "highest"
+        change_word = "voltage rise"
+    else:
+        return None
+    return (
+        f"The {value_word} {selection.quantity} RMS voltage is "
+        f"{_format_float(selection.value_kv, 1)} kV, corresponding to a "
+        f"{change_word} of {_format_float(change_percent, 1)}%."
+    )
+
+
 def _add_rms_report_content(
     doc,
     project_root: Path,
@@ -1611,6 +1647,7 @@ def _add_rms_report_content(
     image_cache: dict[Path, list[Path]],
     figure_registry: _FigureRegistry,
     check_cancel: CancelFn | None = None,
+    selections_by_key: Mapping[tuple[str, str, str], rms_analysis.RMSSelection] | None = None,
 ) -> int:
     grouped: dict[str, list[Path]] = {}
     for quantity in rms_analysis.RMS_QUANTITIES:
@@ -1632,20 +1669,36 @@ def _add_rms_report_content(
         style="Body Text",
     )
     count = 0
+    voltage_key = rms_analysis.normalize_voltage(voltage)
     for quantity in rms_analysis.RMS_QUANTITIES:
         images = grouped.get(quantity, [])
         if not images:
             continue
-        _add_report_heading(doc, quantity, level=3)
-        for image_path in images:
+        image_order = {
+            _rms_variant_from_image_path(image_path): image_path
+            for image_path in images
+        }
+        ordered_variants = [
+            variant for variant in rms_analysis.RMS_REPORT_VARIANT_ORDER
+            if variant in image_order
+        ]
+        ordered_variants.extend(
+            variant for variant in image_order
+            if variant not in ordered_variants
+        )
+        for variant in ordered_variants:
+            image_path = image_order[variant]
             _cancel(check_cancel)
-            variant = _rms_variant_from_image_path(image_path)
+            _add_report_heading(doc, _rms_report_heading(quantity, variant), level=3)
             reference = figure_registry.allocate()
             _add_unumbered_plot_heading(doc, _plot_heading_from_image_path(image_path))
-            label = f"{quantity} RMS {variant}".strip()
+            selection = (selections_by_key or {}).get((voltage_key, quantity, variant))
+            calculation = _rms_report_calculation(selection)
+            if calculation:
+                doc.add_paragraph(calculation, style="Body Text")
             _add_figure_reference_sentence(
                 doc,
-                f"The selected {label} voltage trace at {voltage} kV is shown in the ",
+                f"The selected {quantity} RMS voltage trace at {voltage} kV is shown in the ",
                 reference,
                 ".",
             )
@@ -1653,7 +1706,7 @@ def _add_rms_report_content(
             figure_registry.add_caption(
                 doc,
                 reference,
-                f"{quantity} RMS {variant} maximum/minimum trace at {voltage} kV",
+                f"{_rms_report_heading(quantity, variant)} at {voltage} kV",
             )
             count += 1
     return count
@@ -2092,6 +2145,24 @@ def build_reports_from_existing_plots(
             parsed_rms = rms_analysis.normalize_rms_settings(
                 (rms_settings_by_project or {}).get(str(root))
             )
+            rms_selections_by_key: dict[
+                tuple[str, str, str], rms_analysis.RMSSelection
+            ] = {}
+            if parsed_rms["enabled"]:
+                rms_rows = rms_analysis.load_mm_results(root)
+                rms_selections_by_key = {
+                    (
+                        selection.voltage_key,
+                        selection.quantity,
+                        selection.variant,
+                    ): selection
+                    for selection in rms_analysis.select_rms_rows(
+                        rms_rows,
+                        selected_elements=parsed_rms["elements"],
+                        selected_quantities=parsed_rms["quantities"],
+                        selected_voltages=selected_voltages,
+                    )
+                }
             for scope in selected_scopes:
                 _cancel(check_cancel)
                 report_dir = root / "Reports" / scope.folder
@@ -2334,6 +2405,7 @@ def build_reports_from_existing_plots(
                             image_cache,
                             figure_registry,
                             check_cancel,
+                            rms_selections_by_key,
                         )
 
                     if parsed_sustained.enabled:

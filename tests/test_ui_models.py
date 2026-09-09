@@ -323,6 +323,7 @@ def test_top_bar_uses_envelope_and_sdpf_labels_with_dividers(monkeypatch) -> Non
     monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
     window = MainWindow()
     try:
+        assert window.project_header.text() == "PSCAD Results Analysis"
         section_labels = {
             label.text()
             for label in window.findChildren(QtWidgets.QLabel)
@@ -590,6 +591,8 @@ def test_project_selection_is_visible_and_double_click_opens_settings(
 
         assert second_item.font(0).bold()
         assert not first_item.font(0).bold()
+        assert window.project_header.text() == "PSCAD Results Analysis — Project: Second"
+        assert window.project_header.toolTip() == str(second.resolve())
 
         opened_for: list[str | None] = []
         monkeypatch.setattr(
@@ -603,6 +606,7 @@ def test_project_selection_is_visible_and_double_click_opens_settings(
         assert window.project_tree.currentItem() is first_item
         assert first_item.font(0).bold()
         assert not second_item.font(0).bold()
+        assert window.project_header.text() == "PSCAD Results Analysis — Project: First"
 
         opened_folders: list[str] = []
         monkeypatch.setattr(

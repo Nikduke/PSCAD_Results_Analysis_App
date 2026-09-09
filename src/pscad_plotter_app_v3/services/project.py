@@ -267,9 +267,9 @@ class CatalogCache:
                 INSERT INTO mm_results (
                     path, row_index, unique_id, case_name, run_number, voltage_kv,
                     bus_name, lgp, lgr, lgrm, lgr_pu, lgrm_pu, llp, llr, llrm,
-                    llr_pu, llrm_pu, tov, peak_lg, peak_ll, fault_label, fault_raw,
+                    llr_pu, llrm_pu, lls, tov, peak_lg, peak_ll, fault_label, fault_raw,
                     event_time, tswitch_a, tswitch_b, tswitch_c
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
@@ -290,6 +290,7 @@ class CatalogCache:
                         row.get("LLrm [kV]"),
                         row.get("LLr [pu]"),
                         row.get("LLrm [pu]"),
+                        row.get("LLs [kV]"),
                         row.get("TOV_dur [s]"),
                         row.get("PeakLG"),
                         row.get("PeakLL"),
@@ -357,6 +358,7 @@ class CatalogCache:
                 llrm REAL,
                 llr_pu REAL,
                 llrm_pu REAL,
+                lls REAL,
                 tov REAL,
                 peak_lg REAL,
                 peak_ll REAL,
@@ -372,7 +374,7 @@ class CatalogCache:
         )
         expected_columns = {
             "unique_id", "lgrm", "lgr_pu", "lgrm_pu", "llrm", "llr_pu",
-            "llrm_pu", "tswitch_a", "tswitch_b", "tswitch_c",
+            "llrm_pu", "lls", "tswitch_a", "tswitch_b", "tswitch_c",
         }
         columns = {
             str(row["name"])
@@ -404,6 +406,7 @@ class CatalogCache:
                     llrm REAL,
                     llr_pu REAL,
                     llrm_pu REAL,
+                    lls REAL,
                     tov REAL,
                     peak_lg REAL,
                     peak_ll REAL,
@@ -479,6 +482,7 @@ class CatalogCache:
             "LLrm [kV]": row["llrm"],
             "LLr [pu]": row["llr_pu"],
             "LLrm [pu]": row["llrm_pu"],
+            "LLs [kV]": row["lls"],
             "TOV_dur [s]": row["tov"],
             "PeakLG": row["peak_lg"],
             "PeakLL": row["peak_ll"],
@@ -494,7 +498,7 @@ class ResultsCatalogService:
     """Load the MM element catalog used by report plot batches."""
 
     MM_FILENAME = "MM results.csv"
-    MM_CSV_CACHE_VERSION = 2
+    MM_CSV_CACHE_VERSION = 3
 
     def build_base_catalog(
         self,
@@ -548,7 +552,7 @@ class ResultsCatalogService:
         }
         numeric_columns = (
             "LGp [kV]", "LGr [kV]", "LGrm [kV]", "LGr [pu]", "LGrm [pu]",
-            "LLp [kV]", "LLr [kV]", "LLrm [kV]", "LLr [pu]", "LLrm [pu]",
+            "LLp [kV]", "LLr [kV]", "LLrm [kV]", "LLr [pu]", "LLrm [pu]", "LLs [kV]",
             "TOV_dur [s]", "PeakLG", "PeakLL", "EventTime",
             "Tswitch_a [s]", "Tswitch_b [s]", "Tswitch_c [s]",
         )

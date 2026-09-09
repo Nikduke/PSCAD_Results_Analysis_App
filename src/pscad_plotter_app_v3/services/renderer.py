@@ -54,6 +54,7 @@ class MatplotlibRenderer:
     FONTSIZE_TITLE = 13
     FONTSIZE_ANNO = 10
     FONTSIZE_LEGEND = 9
+    ANNOTATION_COLOUR = "#b04cff"
     PAD_YLIM = 0.07
     WINDOW_MULTIPLIER = 1
     ANNO_X_OFFSET = -0.002
@@ -281,8 +282,6 @@ class MatplotlibRenderer:
         basename, title = self._make_labels(job.case_name, group_label, job.run_number, finder, event_info)
         basename = self._basename_with_time_range(job, basename)
         basename = self._basename_with_plot_variant(job, basename)
-        if job.plot_variant:
-            title = f"{title} | RMS {job.plot_variant}"
         return {
             "df": data,
             "finder": finder,
@@ -695,62 +694,54 @@ class MatplotlibRenderer:
         job: PlotJob,
         policy: dict[str, Any],
     ) -> None:
-        if not (job.annotate_max or job.annotate_min) or data.values.shape[1] < 2:
+        if not (job.annotate_max or job.annotate_min):
             return
-        values = data.values[:, 1:]
-        finite = np.isfinite(values)
-        if job.annotate_max and np.any(finite):
-            masked = np.where(finite, values, -np.inf)
-            row_index, phase_index = np.unravel_index(int(np.argmax(masked)), masked.shape)
-            self._render_extreme_annotation(
-                ax,
-                float(data.values[row_index, 0]),
-                float(values[row_index, phase_index]),
-                policy.get("unit_suffix", ""),
-                "RMS max",
-                "darkred",
-            )
-        if job.annotate_min and np.any(finite):
-            masked = np.where(finite, values, np.inf)
-            row_index, phase_index = np.unravel_index(int(np.argmin(masked)), masked.shape)
-            self._render_extreme_annotation(
-                ax,
-                float(data.values[row_index, 0]),
-                float(values[row_index, phase_index]),
-                policy.get("unit_suffix", ""),
-                "RMS min",
-                "navy",
-            )
+        if job.show_three_phase_overview or job.trace_type not in {"LGr", "LLr"}:
+            return
+        if data.values.shape[1] < 2:
+            return
+        if job.annotate_max:
+            self._render_extreme_annotation(ax, data, policy, use_max=True)
+        if job.annotate_min:
+            self._render_extreme_annotation(ax, data, policy, use_max=False)
 
     def _render_extreme_annotation(
         self,
         ax: plt.Axes,
-        time_s: float,
-        value: float,
-        unit_suffix: str,
-        label: str,
-        color: str,
+        data: WaveformFrame,
+        policy: dict[str, Any],
+        *,
+        use_max: bool,
     ) -> None:
+        values = data.values[:, 1:]
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            return
+        masked = np.where(finite, values, -np.inf if use_max else np.inf)
+        flat_index = int(np.argmax(masked) if use_max else np.argmin(masked))
+        row_index, _phase_index = np.unravel_index(flat_index, masked.shape)
+        time_s = float(data.values[row_index, 0])
+        value = float(values[row_index, _phase_index])
         if not (math.isfinite(time_s) and math.isfinite(value)):
             return
-        ax.plot([time_s], [value], marker="o", markersize=4, color=color, linestyle="None", zorder=5)
-        ylim = ax.get_ylim()
-        y_range = max(ylim[1] - ylim[0], 1e-9)
-        offset = self.ANNO_Y_OFFSET * y_range if value >= 0 else -self.ANNO_Y_OFFSET * y_range
-        y_text = value + offset
-        vertical_align = "bottom" if value >= 0 else "top"
-        self._expand_ylim_for_peak_annotation(ax, y_text, vertical_align, y_range)
-        unit = f" {unit_suffix}" if unit_suffix else ""
+        vertical_offset = 10 if use_max else -14
+        vertical_align = "bottom" if use_max else "top"
         ax.annotate(
-            f"{label}: {value:.1f}{unit} @ {time_s:.3f} s",
+            self._format_value_with_unit(value, str(policy.get("unit_suffix", ""))),
             xy=(time_s, value),
-            xytext=(time_s + self.ANNO_X_OFFSET, y_text),
-            textcoords="data",
-            color=color,
+            xytext=(6, vertical_offset),
+            textcoords="offset points",
+            color=self.ANNOTATION_COLOUR,
             fontsize=self.FONTSIZE_ANNO,
-            ha="right",
+            ha="left",
             va=vertical_align,
         )
+
+    @staticmethod
+    def _format_value_with_unit(value: float, unit_suffix: str) -> str:
+        text = f"{value:.1f}".rstrip("0").rstrip(".")
+        unit = unit_suffix.strip()
+        return f"{text} [{unit}]" if unit else text
 
     def _expand_ylim_for_peak_annotation(self, ax: plt.Axes, y_text: float, vertical_align: str, y_range: float) -> None:
         bottom, top = ax.get_ylim()

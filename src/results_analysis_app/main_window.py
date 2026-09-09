@@ -346,6 +346,11 @@ class MainWindow(QtWidgets.QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 6)
         root_layout.setSpacing(6)
 
+        self.project_header = QtWidgets.QLabel(root)
+        self.project_header.setObjectName("projectHeader")
+        self.project_header.setFixedHeight(22)
+        self.project_header.setText("PSCAD Results Analysis")
+        root_layout.addWidget(self.project_header)
         root_layout.addWidget(self._build_top_bar(root))
 
         self.workspace_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, root)
@@ -941,6 +946,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reload_scope_list()
             self._reload_project_exclusions()
             self._load_project_analysis_options(self._current_project_path())
+            self._update_project_header()
         finally:
             self._loading = was_loading
 
@@ -1192,6 +1198,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_tree.setColumnWidth(1, 180)
         if self.project_tree.columnWidth(0) < 260:
             self.project_tree.setColumnWidth(0, 260)
+        self._update_project_header()
+
+    def _update_project_header(self) -> None:
+        project_path = self._current_project_path()
+        if project_path:
+            project_name = Path(project_path).name or project_path
+            self.project_header.setText(f"PSCAD Results Analysis — Project: {project_name}")
+            self.project_header.setToolTip(project_path)
+        else:
+            self.project_header.setText("PSCAD Results Analysis")
+            self.project_header.setToolTip("")
 
     def _reload_scope_list(self) -> None:
         self.scope_list.clear()
@@ -1946,6 +1963,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._loading:
             return
         project_path = self._project_path_from_item(current)
+        self._update_project_header()
         self._update_project_selection_visual(current)
         if current is None:
             self._load_dashboard_figure_list(None)

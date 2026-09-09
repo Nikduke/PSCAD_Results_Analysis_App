@@ -10,6 +10,12 @@ def build_mm_jobs(
     """Expand one supported MM request into concrete render jobs."""
     if request.mode is not PlotMode.MM:
         raise ValueError(f"Unsupported plot mode: {request.mode.value}")
+    plot_variant = request.plot_variant
+    if not plot_variant:
+        if request.annotate_max and not request.annotate_min:
+            plot_variant = "max"
+        elif request.annotate_min and not request.annotate_max:
+            plot_variant = "min"
     return [
         PlotJob(
             mode=PlotMode.MM,
@@ -31,7 +37,7 @@ def build_mm_jobs(
             limits=limits,
             annotate_max=request.annotate_max,
             annotate_min=request.annotate_min,
-            plot_variant=request.plot_variant,
+            plot_variant=plot_variant,
         )
         for element_name in request.elements
         for run_number in request.run_numbers

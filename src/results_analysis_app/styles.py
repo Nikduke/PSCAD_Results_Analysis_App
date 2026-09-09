@@ -310,6 +310,12 @@ QLabel[labelRole="section"] {{
 QLabel[labelRole="muted"] {{
     color: {theme.muted_text};
 }}
+QLabel#projectHeader {{
+    color: {theme.text};
+    font-size: 11pt;
+    font-weight: 600;
+    padding-left: 8px;
+}}
 QTableView, QTreeView, QListView {{
     background-color: {theme.base};
     alternate-background-color: {theme.alternate_base};

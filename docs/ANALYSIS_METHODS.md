@@ -75,7 +75,7 @@ The app has several distinct analysis paths. Their inputs, qualification rules, 
 | High Voltage | Every finite raw LG and LL phase/pair sample against `high-voltage factor × Um × sqrt(2)` | Any exceeding phase excludes the complete Case/Run/MM bus from both measurements; this is an exclusion gate, not a severity ranking | Detailed exclusions in the envelope workbook and consolidated UI rows |
 | Representative envelope | Per-phase centered half-cycle rolling absolute envelopes, then the ranked cross-case representative rows | Source phase rows are ranked by magnitude and aligned by rank; the merged maximum keeps its source provenance | `MM_<voltage>.xlsx` and combined Excel envelope charts |
 | TOV, SFO, and SA event selection | The representative envelope workbook at one configured event time | Select the nearest valid row within `0.001 s` (`LLp` for TOV/SFO, `LGp` for SA); this is plot/report row selection, not a new compliance test | Event batch rows, envelope values, waveform plots, and report text |
-| RMS | Shared parsed/cached `Results/MM results.csv` rows for the selected project, voltage, MM elements, and LG/LL quantities | For each selected voltage and quantity, choose one maximum (`LGr`/`LLr`) and one minimum (`LGrm`/`LLrm`) after excluding minimums at or below `0.05 pu`; LG pu uses `voltage / sqrt(3)`, LL pu uses `voltage` | Separate `RMS_LG`/`RMS_LL` batches and max/min annotated plots under `Plots/Generated/<scope>/RMS/LG|LL/`; report section immediately after event sections |
+| RMS | Shared parsed/cached `Results/MM results.csv` rows for the selected project, voltage, MM elements, and LG/LL quantities | For each selected voltage and quantity, choose one maximum (`LGr`/`LLr`) and one minimum (`LGrm`/`LLrm`) after excluding minimums at or below `0.05 pu`; LG pu uses `voltage / sqrt(3)`, LL pu uses `voltage` | Separate `RMS_LG`/`RMS_LL` batches and value-only `[kV]` annotations under `Plots/Generated/<scope>/RMS/LG|LL/`; report section immediately after event sections |
 | Post-event Stress | Chronological per-run envelope `E(t)` after release/manual start | Keep positive-area findings and rank by `A_post = integral(max(E - Vlim, 0))` | Top N per `(check, voltage, measurement)` in `Resonance_Checks.xlsx` |
 | Late Growth | Smoothed chronological envelope after release/manual start | Positive-slope and relevance gates, then rank by `(sigma, growth ratio, positive fraction, tail p95 / Vlim)` | Top N per `(check, voltage, measurement)` and result plots |
 | No-settle Growth | Smoothed post-guard envelope when automatic release is not found | Positive-slope and relevance gates, then rank by `(sigma, positive fraction, longest positive-growth window, growth ratio, end p95 / Vlim, area)` | Top N per `(check, voltage, measurement)` and result plots |
@@ -351,14 +351,26 @@ LL uses `value / voltage`. Voltage levels are filtered explicitly; an empty
 selection produces no RMS rows.
 
 The selected maximum and minimum rows become separate `RMS_LG` and `RMS_LL`
-batch rows using the existing MM renderer. Their plots request the `LGr` or
-`LLr` trace and show both global max/min markers; no new plotting engine or
-binary waveform format is introduced. Generated files are kept in
+batch rows using the existing MM renderer. Each row sets exactly one of the
+standard `annotate_max` or `annotate_min` flags; the renderer reports only the
+global value with its unit, for example `87.5 [kV]`, and does not add an RMS
+label, time, marker, or vertical line. No new plotting engine or binary
+waveform format is introduced. Generated files are kept in
 `Plots/Generated/<scope>/RMS/LG/` and `RMS/LL/`, with the corresponding batch
-workbooks under `Plots/Plot_batch/`. The report writes one `RMS` heading after
-the selected SFO/TOV/SA event sections and before Sustained SDPF and resonance
-sections. RMS is a diagnostic voltage study; it does not qualify Sustained SDPF
-events or alter envelope, exclusion, or resonance calculations.
+workbooks under `Plots/Plot_batch/`.
+
+The report writes one `RMS` heading after the selected SFO/TOV/SA event
+sections and before Sustained SDPF and resonance sections. Each selected
+quantity/variant gets its own semantic heading: `Line-to-Ground RMS Voltage
+Rise`, `Line-to-Ground RMS Voltage Dip`, `Line-to-Line RMS Voltage Rise`, or
+`Line-to-Line RMS Voltage Dip`; LG and LL are not grouped under separate
+subheadings. Before each figure, the report states the selected value and its
+percentage relative to the steady-state `LLs [kV]` value from the same MM CSV
+row. The LL reference is `LLs [kV]`; the LG reference is `LLs [kV] / sqrt(3)`.
+Rise is `(value - reference) / reference × 100`, and dip is
+`(reference - value) / reference × 100`. RMS is a diagnostic voltage study; it
+does not qualify Sustained SDPF events or alter envelope, exclusion, or
+resonance calculations.
 
 ## 6. Sustained SDPF stress
 

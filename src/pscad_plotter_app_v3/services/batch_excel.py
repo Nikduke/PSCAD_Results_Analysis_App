@@ -46,7 +46,6 @@ class BatchExcelService:
         "excel_export",
         "annotate_max",
         "annotate_min",
-        "plot_variant",
         *TIME_RANGE_HEADERS,
     ]
     SHEET_DEFINITIONS = {MM_SHEET: (PlotMode.MM, MM_HEADERS)}

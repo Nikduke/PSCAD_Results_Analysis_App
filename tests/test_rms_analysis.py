@@ -13,6 +13,7 @@ def _row(
     llrm: float | None = None,
     lgrm_pu: float | None = None,
     llrm_pu: float | None = None,
+    lls: float | None = None,
     unique_id: str = "",
 ) -> dict[str, object]:
     return {
@@ -21,6 +22,7 @@ def _row(
         "Run#": run,
         "Bus name": bus,
         "Bus voltage [kV]": voltage,
+        "LLs [kV]": voltage if lls is None else lls,
         "LGr [kV]": lgr,
         "LGrm [kV]": lgrm,
         "LGr [pu]": None if lgr is None else lgr / (voltage / 3**0.5),
@@ -105,9 +107,11 @@ def test_rms_batch_rows_use_separate_quantity_batches_and_variants() -> None:
     )
 
     assert [row["trace"] for row in rows["RMS_LG"]] == ["LGr", "LGr"]
-    assert [row["plot_variant"] for row in rows["RMS_LG"]] == ["max", "min"]
+    assert "plot_variant" not in rows["RMS_LG"][0]
     assert rows["RMS_LG"][0]["annotate_max"] is True
-    assert rows["RMS_LG"][0]["annotate_min"] is True
+    assert rows["RMS_LG"][0]["annotate_min"] is False
+    assert rows["RMS_LG"][1]["annotate_max"] is False
+    assert rows["RMS_LG"][1]["annotate_min"] is True
     assert rows["RMS_LG"][0]["excel_export"] is False
     assert rows["RMS_LL"][0]["trace"] == "LLr"
 
@@ -137,6 +141,7 @@ def test_catalog_cache_round_trips_rms_columns(tmp_path) -> None:
     assert loaded is not None
     assert loaded[0]["Unique ID"] == rows[0]["Unique ID"]
     assert loaded[0]["LGrm [kV]"] == 30
+    assert loaded[0]["LLs [kV]"] == rows[0]["LLs [kV]"]
     assert loaded[0]["LLrm [pu]"] == rows[0]["LLrm [pu]"]
 
 
@@ -153,13 +158,24 @@ def test_rms_annotation_marks_global_maximum_and_minimum() -> None:
         np.asarray([[0.0, 10.0, 8.0, 9.0], [0.1, 20.0, 7.0, 6.0]]),
         ["Time (s)", "V_a", "V_b", "V_c"],
     )
-    job = PlotJob(
+    max_job = PlotJob(
         mode=PlotMode.MM,
         case_name="C1",
         run_number=1,
         group_label="MM_161_A",
         output_dir=".",
+        trace_type="LGr",
+        show_three_phase_overview=False,
         annotate_max=True,
+    )
+    min_job = PlotJob(
+        mode=PlotMode.MM,
+        case_name="C1",
+        run_number=1,
+        group_label="MM_161_A",
+        output_dir=".",
+        trace_type="LGr",
+        show_three_phase_overview=False,
         annotate_min=True,
     )
     figure, axis = plt.subplots()
@@ -167,11 +183,30 @@ def test_rms_annotation_marks_global_maximum_and_minimum() -> None:
         renderer._render_rms_annotations_if_enabled(
             axis,
             frame,
-            job,
+            max_job,
             {"unit_suffix": "kV"},
         )
         labels = [text.get_text() for text in axis.texts]
-        assert any("RMS max: 20.0 kV @ 0.100 s" == label for label in labels)
-        assert any("RMS min: 6.0 kV @ 0.100 s" == label for label in labels)
+        assert labels == ["20 [kV]"]
+        axis.clear()
+        renderer._render_rms_annotations_if_enabled(
+            axis,
+            frame,
+            min_job,
+            {"unit_suffix": "kV"},
+        )
+        assert [text.get_text() for text in axis.texts] == ["6 [kV]"]
     finally:
         plt.close(figure)
+
+
+def test_rms_report_reference_uses_steady_state_lls() -> None:
+    from results_analysis_app.rms_analysis import RMSSelection, rms_change_percent, rms_reference_kv
+
+    lg = RMSSelection("LG", "min", "C1", 1, "MM_161_A", 161, 87.5, 0.0, {"LLs [kV]": 161.0})
+    ll = RMSSelection("LL", "max", "C1", 1, "MM_161_A", 161, 180.0, 0.0, {"LLs [kV]": 161.0})
+
+    assert rms_reference_kv(lg) == 161.0 / 3**0.5
+    assert rms_reference_kv(ll) == 161.0
+    assert rms_change_percent(lg) == (161.0 / 3**0.5 - 87.5) / (161.0 / 3**0.5) * 100.0
+    assert rms_change_percent(ll) == (180.0 - 161.0) / 161.0 * 100.0

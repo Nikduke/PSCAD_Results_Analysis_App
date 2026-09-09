@@ -50,7 +50,7 @@ results. It can:
 - build LGp and LLp voltage-envelope workbooks and Excel charts;
 - run Stress, Late Growth, No-settle Growth, peak-envelope Sustained SDPF, and project-specific RMS checks;
 - select RMS LG/LL quantities and alphabetized MM elements from the first analysis control;
-- create/render MM waveform plot batches and optional waveform Excel exports, including RMS max/min plots;
+- create/render MM waveform plot batches and optional waveform Excel exports, including RMS rise/dip plots;
 - create Sustained SDPF incidence heatmaps; and
 - assemble DOCX reports from the generated outputs.
 
@@ -237,7 +237,7 @@ covered by plotting tests.
    repeatedly; standalone actions still validate their saved data locally.
    Active parallel plot workers are terminated promptly on Stop.
 5. **Post-processing.** The selected action builds combined Excel charts, plot
-   batches, rendered RMS max/min plots, Sustained heatmaps, and reports. RMS
+   batches, rendered RMS rise/dip plots, Sustained heatmaps, and reports. RMS
    reads the already parsed/cached `Results/MM results.csv` rows and writes
    separate `RMS/LG` and `RMS/LL` outputs; it does not add a second raw
    waveform read. `Rebuild heatmaps` uses the
@@ -309,10 +309,17 @@ covered by plotting tests.
   voltage and quantity, one maximum (`LGr`/`LLr`) and one minimum
   (`LGrm`/`LLrm`, above 0.05 pu) are selected across the chosen elements. LG pu
   values use `voltage / sqrt(3)`; LL pu values use `voltage`.
-- The selected rows create separate `RMS_LG` and `RMS_LL` batches. Both max and
-  min figures use the existing MM renderer and receive max/min annotations; no
-  new plotting engine is introduced. Outputs are kept in
-  `Plots/Generated/<scope>/RMS/LG|LL/`.
+- The selected rows create separate `RMS_LG` and `RMS_LL` batches. Each max or
+  min row sets only its corresponding standard `annotate_max` or `annotate_min`
+  flag. The existing MM renderer adds only the global value and unit, such as
+  `87.5 [kV]`; it does not add an RMS label, time, marker, or vertical line.
+  Outputs are kept in `Plots/Generated/<scope>/RMS/LG|LL/`.
+- The report keeps one `RMS` section after the event sections, then writes a
+  separate semantic heading for each quantity and variant: Line-to-Ground or
+  Line-to-Line RMS Voltage Rise/Dip. The text before each figure calculates
+  rise as `(value - reference) / reference × 100` and dip as
+  `(reference - value) / reference × 100`, using `LLs [kV]` for LL and
+  `LLs [kV] / sqrt(3)` for LG from the selected MM CSV row.
 
 ### Sustained SDPF method
 

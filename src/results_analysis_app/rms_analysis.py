@@ -21,6 +21,7 @@ RMS_TRACE_TYPES = {"LG": "LGr", "LL": "LLr"}
 RMS_RESULT_VERSION = 1
 RMS_MIN_VALID_PU = 0.05
 VOLTAGE_EPSILON_KV = 1e-6
+RMS_REPORT_VARIANT_ORDER = ("max", "min")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,28 @@ def normalize_rms_settings(value: object) -> dict[str, Any]:
         "quantities": [quantity for quantity in RMS_QUANTITIES if quantity in quantities],
         "elements": sorted(elements, key=str.casefold),
     }
+
+
+def load_mm_results(project_root: str | Path) -> list[dict[str, object]]:
+    """Load the shared MM-results catalog, using the existing SQLite cache."""
+    from pscad_plotter_app_v3.services.project import CatalogCache, ResultsCatalogService
+
+    root = Path(project_root).resolve()
+    source_path = root / "Results" / ResultsCatalogService.MM_FILENAME
+    if not source_path.is_file():
+        return []
+
+    parser_version = ResultsCatalogService.MM_CSV_CACHE_VERSION
+    cache = CatalogCache(root / "Plots" / ".plottool_v3")
+    try:
+        cached = cache.load_mm_results(source_path, parser_version)
+        if cached is not None:
+            return cached
+        rows = ResultsCatalogService()._load_mm_results(source_path)
+        cache.store_mm_results(source_path, parser_version, rows)
+        return rows
+    finally:
+        cache.close()
 
 
 def available_elements(rows: Iterable[Mapping[str, object]]) -> list[str]:
@@ -174,14 +197,39 @@ def rms_batch_rows(
                 "limits": False,
                 "legends_left": False,
                 "excel_export": bool(excel_export),
-                "annotate_max": True,
-                "annotate_min": True,
-                "plot_variant": selection.variant,
+                "annotate_max": selection.variant == "max",
+                "annotate_min": selection.variant == "min",
             }
         )
     for event in rows:
-        rows[event].sort(key=lambda row: (str(row["element"]).casefold(), int(row["run"]), str(row["plot_variant"])))
+        rows[event].sort(
+            key=lambda row: (
+                str(row["element"]).casefold(),
+                int(row["run"]),
+                0 if row["annotate_max"] else 1,
+            )
+        )
     return rows
+
+
+def rms_reference_kv(selection: RMSSelection) -> float | None:
+    """Return the nominal RMS reference used for the report percentage."""
+    steady_state_ll = _finite_float(selection.source_row.get("LLs [kV]"))
+    if steady_state_ll is None or steady_state_ll <= 0:
+        return None
+    return steady_state_ll / math.sqrt(3.0) if selection.quantity == "LG" else steady_state_ll
+
+
+def rms_change_percent(selection: RMSSelection) -> float | None:
+    """Return rise/dip percentage relative to the MM steady-state reference."""
+    reference = rms_reference_kv(selection)
+    if reference is None or not math.isfinite(selection.value_kv):
+        return None
+    if selection.variant == "max":
+        return (selection.value_kv - reference) / reference * 100.0
+    if selection.variant == "min":
+        return (reference - selection.value_kv) / reference * 100.0
+    return None
 
 
 def rms_output_dir(project_root: Path, scope_folder: str, quantity: str) -> Path:

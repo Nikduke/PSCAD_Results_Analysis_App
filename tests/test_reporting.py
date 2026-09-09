@@ -471,6 +471,72 @@ def test_report_places_rms_first_after_event_sections(tmp_path, monkeypatch) -> 
     assert headings.index("RMS") < headings.index("Post-event stress - LGp")
 
 
+def test_report_writes_semantic_rms_headings_and_change_text(tmp_path, monkeypatch) -> None:
+    from docx import Document
+
+    from results_analysis_app import reporting
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    results = project / "Results"
+    results.mkdir(parents=True)
+    (results / "MM results.csv").write_text(
+        "Unique ID,Case name,Bus name,Bus voltage [kV],Run#,LLs [kV],LGr [kV],LGrm [kV],LLr [kV],LLrm [kV]\n"
+        "U1,C1,MM_161_A,161,1,161,210,87.5,180,120\n",
+        encoding="utf-8",
+    )
+    images = {
+        "LG_max": tmp_path / "C1_MM_161_A_001_LGr_max_3Ph.png",
+        "LG_min": tmp_path / "C1_MM_161_A_001_LGr_min_3Ph.png",
+        "LL_max": tmp_path / "C1_MM_161_A_001_LLr_max_3Ph.png",
+        "LL_min": tmp_path / "C1_MM_161_A_001_LLr_min_3Ph.png",
+    }
+    for image in images.values():
+        image.write_bytes(b"placeholder")
+
+    monkeypatch.setattr(reporting, "_is_report_image", lambda _path: True)
+    monkeypatch.setattr(reporting, "_add_centered_report_image", lambda *_args: None)
+
+    def find_rms_images(_root, _scope, quantity, _voltage, _cache):
+        return [images[f"{quantity}_max"], images[f"{quantity}_min"]]
+
+    monkeypatch.setattr(reporting, "_find_rms_images", find_rms_images)
+
+    outputs = reporting.build_reports_from_existing_plots(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        rms_settings_by_project={
+            str(project.resolve()): {
+                "enabled": True,
+                "quantities": ["LG", "LL"],
+                "elements": ["MM_161_A"],
+            }
+        },
+    )
+
+    document = Document(outputs[0])
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+    headings = [
+        paragraph.text
+        for paragraph in document.paragraphs
+        if paragraph.style.name == "Heading 3"
+    ]
+    assert headings == [
+        "Line-to-Ground RMS Voltage Rise",
+        "Line-to-Ground RMS Voltage Dip",
+        "Line-to-Line RMS Voltage Rise",
+        "Line-to-Line RMS Voltage Dip",
+    ]
+    assert "The highest LG RMS voltage is 210 kV, corresponding to a voltage rise of 125.9%." in paragraphs
+    assert "The lowest LG RMS voltage is 87.5 kV, corresponding to a voltage dip of 5.9%." in paragraphs
+    assert "The highest LL RMS voltage is 180 kV, corresponding to a voltage rise of 11.8%." in paragraphs
+    assert "The lowest LL RMS voltage is 120 kV, corresponding to a voltage dip of 25.5%." in paragraphs
+    assert "LG" not in headings
+    assert "LL" not in headings
+
+
 def test_report_dashboard_heading_precedes_cross_reference(tmp_path, monkeypatch) -> None:
     from docx import Document
 

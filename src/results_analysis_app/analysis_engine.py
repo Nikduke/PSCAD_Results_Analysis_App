@@ -674,21 +674,11 @@ def _load_embedded_plotter_session(
 
 def _load_rms_catalog(project_root: Path):
     """Load the shared MM catalog without constructing a renderer."""
-    from pscad_plotter_app_v3.services.project import (
-        CatalogCache,
-        ProjectDiscoveryService,
-        ResultsCatalogService,
-        RunAvailabilityService,
-    )
+    from pscad_plotter_app_v3.models import ProjectCatalog
 
-    context = ProjectDiscoveryService().discover(project_root)
-    context.state_dir.mkdir(parents=True, exist_ok=True)
-    cache = CatalogCache(context.state_dir)
-    try:
-        run_index = RunAvailabilityService().build_index(context)
-        return ResultsCatalogService().build_base_catalog(context, run_index, cache)
-    finally:
-        cache.close()
+    catalog = ProjectCatalog()
+    catalog.mm_results = rms_analysis.load_mm_results(project_root)
+    return catalog
 
 
 def _apply_sustained_sdpf_plot_limit_overrides(
