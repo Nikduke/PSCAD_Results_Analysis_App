@@ -7,9 +7,9 @@ App context:
 - This is a native Windows PySide6 post-processing tool for PSCAD simulation
   result projects. It discovers cases/runs/faults/voltages/MM elements and
   dashboards, builds voltage envelopes, applies exclusions and the
-  all-case High Voltage gate, runs optional Stress/Late/No-settle/Sustained
-  SDPF checks, renders MM plots, creates Sustained SDPF heatmaps, and assembles
-  DOCX reports.
+  all-case High Voltage gate, runs optional Stress, Late, No-settle, Sustained
+  SDPF, and RMS checks, renders MM plots, creates Sustained SDPF heatmaps, and
+  assembles DOCX reports.
 - The operating regimes are project/session, scan/catalog, envelope/check,
   batch/render/report, and rebuild-only. `Run analysis` connects the envelope,
   batch, render, and report stages; the step buttons are narrower operations.
@@ -67,13 +67,19 @@ Current output contract:
 - Sustained results: `Sustained_SDpf.json` and
   `Sustained_SDpf_summary.xlsx` in that scope folder.
 - Generated plots and heatmaps: `Plots/Generated/<scope>/`.
+- RMS batches and outputs: `Plots/Plot_batch/batch_paste_<scope>_RMS_LG.xlsx`,
+  `batch_paste_<scope>_RMS_LL.xlsx`, and `Plots/Generated/<scope>/RMS/LG|LL/`.
+  `Input_Data!B5` selects discrete switching-time checkboxes for `Sequential`/
+  `None`, or inclusive start/end fields for other switch types; all available
+  times are selected by default.
 - Reports: `Reports/<scope>/`.
 - Stage signatures/output metadata: the single project-local
   `.state/analysis_cache.json`.
 
-Current invalidation versions are project scan 7, project analysis 1,
-envelope manifest 2, Sustained result 17, Sustained summary workbook 2, plot
-batch 2, report/report-layout 2/2, and embedded plotter SQLite/MM cache 2/1.
+Current invalidation versions are project scan 8, project analysis 1,
+envelope manifest 3, RMS result selection 3, Sustained result 19, Sustained
+summary workbook 4, plot batch 3, report manifest 2, RMS report layout 2,
+Sustained report layout 3, and embedded plotter SQLite/MM caches 3/3.
 Obsolete or incomplete artifacts must be rebuilt rather than treated as a
 valid empty result.
 

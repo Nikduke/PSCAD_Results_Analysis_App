@@ -310,11 +310,10 @@ QLabel[labelRole="section"] {{
 QLabel[labelRole="muted"] {{
     color: {theme.muted_text};
 }}
-QLabel#projectHeader {{
+QGroupBox#projectControlsGroup::title {{
     color: {theme.text};
-    font-size: 11pt;
+    font-size: 9pt;
     font-weight: 600;
-    padding-left: 8px;
 }}
 QTableView, QTreeView, QListView {{
     background-color: {theme.base};

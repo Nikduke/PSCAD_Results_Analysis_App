@@ -1561,9 +1561,9 @@ def _add_sustained_sdpf_section(
             panel_heading = _heatmap_plot_heading_from_image_path(heatmap_path, heatmap_settings)
             if panel_heading:
                 _add_unumbered_plot_heading(doc, panel_heading)
-            _add_figure_reference_sentence(doc, "", reference, " shows Sustained SDPF incidence.")
+            _add_figure_reference_sentence(doc, "", reference, " shows SDPF threshold exceedance.")
             _add_centered_report_image(doc, heatmap_path)
-            caption = f"Sustained SDPF incidence — {report_set_name}"
+            caption = f"SDPF threshold exceedance — {report_set_name}"
             if panel_heading:
                 caption += f", {panel_heading}"
             figure_registry.add_caption(doc, reference, f"{caption} at {voltage} kV")
@@ -2087,6 +2087,10 @@ def build_reports_from_existing_plots(
     rms_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, Any]] | None = None,
+    rms_catalog_context_by_project: Mapping[str, Any] | None = None,
+    rms_selections_by_project: Mapping[
+        str, Iterable[rms_analysis.RMSSelection]
+    ] | None = None,
 ) -> list[Path]:
     """Build draft Word reports from already generated plot image files."""
     try:
@@ -2148,20 +2152,53 @@ def build_reports_from_existing_plots(
             rms_selections_by_key: dict[
                 tuple[str, str, str], rms_analysis.RMSSelection
             ] = {}
-            if parsed_rms["enabled"]:
-                rms_rows = rms_analysis.load_mm_results(root)
+            if parsed_rms["enabled"] and parsed_rms["elements"]:
+                provided_selections = (
+                    (rms_selections_by_project or {}).get(str(root))
+                    if rms_selections_by_project is not None
+                    else None
+                )
+                if provided_selections is None:
+                    catalog_context = (
+                        (rms_catalog_context_by_project or {}).get(str(root))
+                    )
+                    if catalog_context is None:
+                        from results_analysis_app import analysis_engine
+
+                        catalog_context = analysis_engine.load_plotter_catalog(
+                            root,
+                            log,
+                            check_cancel,
+                        )
+                    if catalog_context.run_index:
+                        provided_selections = rms_analysis.select_rms_rows_from_catalog(
+                            catalog_context.catalog,
+                            parsed_rms,
+                            selected_voltages,
+                        )
+                    else:
+                        # A report-only rebuild may be pointed at a project
+                        # that no longer has its raw .inf inventory.  Keep
+                        # existing plot/report metadata usable in that case;
+                        # batch creation and connected runs always have the
+                        # authoritative run index and use the strict path.
+                        provided_selections = rms_analysis.select_rms_rows(
+                            catalog_context.catalog.mm_results,
+                            selected_elements=parsed_rms["elements"],
+                            selected_quantities=parsed_rms["quantities"],
+                            selected_voltages=selected_voltages,
+                            switching_time_mode=parsed_rms["switching_time_mode"],
+                            selected_switching_times=parsed_rms["switching_times"],
+                            switching_time_start_s=parsed_rms["switching_time_start_s"],
+                            switching_time_end_s=parsed_rms["switching_time_end_s"],
+                        )
                 rms_selections_by_key = {
                     (
                         selection.voltage_key,
                         selection.quantity,
                         selection.variant,
                     ): selection
-                    for selection in rms_analysis.select_rms_rows(
-                        rms_rows,
-                        selected_elements=parsed_rms["elements"],
-                        selected_quantities=parsed_rms["quantities"],
-                        selected_voltages=selected_voltages,
-                    )
+                    for selection in provided_selections
                 }
             for scope in selected_scopes:
                 _cancel(check_cancel)

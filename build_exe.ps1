@@ -18,7 +18,19 @@ if (-not (Test-Path $exe)) {
     throw "One-file executable was not found: $exe"
 }
 
-& $exe --smoke
+$smokeProcess = Start-Process -FilePath $exe -ArgumentList @('--smoke') -PassThru
+try {
+    Wait-Process -Id $smokeProcess.Id -Timeout 30 -ErrorAction Stop | Out-Null
+}
+catch {
+    if (-not $smokeProcess.HasExited) {
+        Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+    throw "Executable smoke test timed out or failed to exit: $exe"
+}
+if ($smokeProcess.ExitCode -ne 0) {
+    throw "Executable smoke test failed with exit code $($smokeProcess.ExitCode): $exe"
+}
 
 Write-Host ""
 Write-Host "One-file executable created:"

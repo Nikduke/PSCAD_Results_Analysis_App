@@ -45,6 +45,7 @@ DEFAULT_ENVELOPE_CHART_Y_LIMITS = {
     "230": {"y_min": 150.0, "y_max": None, "y_major": None},
 }
 DEFAULT_ENVELOPE_CHART_SHOW_SA_LABEL = False
+DEFAULT_ENVELOPE_CHART_MOVE_LABELS = True
 DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR = 5.0
 DEFAULT_NONCONV_CB_IIP_LIMIT = 400.0
 DEFAULT_NONCONV_CB_IIR_LIMIT = 200.0
@@ -183,31 +184,16 @@ def normalize_project_analysis_enabled(value: Any) -> dict[str, list[str]]:
 def normalize_project_rms_settings(value: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         return {}
-    # Keep model loading independent from the UI and from the plotter package.
-    quantities_allowed = {"LG", "LL"}
+    # Keep model loading independent from the UI.  The RMS module only imports
+    # the lightweight project configuration at module load time, so this local
+    # import preserves that boundary while keeping one settings normalizer.
+    from results_analysis_app import rms_analysis
+
     output: dict[str, dict[str, Any]] = {}
     for project, raw in value.items():
         if not isinstance(raw, dict):
             continue
-        quantities: list[str] = []
-        raw_quantities = raw.get("quantities", ["LG", "LL"])
-        if isinstance(raw_quantities, (list, tuple, set)):
-            for item in raw_quantities:
-                quantity = str(item).strip().upper()
-                if quantity in quantities_allowed and quantity not in quantities:
-                    quantities.append(quantity)
-        elements: list[str] = []
-        raw_elements = raw.get("elements", [])
-        if isinstance(raw_elements, (list, tuple, set)):
-            for item in raw_elements:
-                element = str(item or "").strip()
-                if element and element.casefold() not in {value.casefold() for value in elements}:
-                    elements.append(element)
-        output[str(project)] = {
-            "enabled": bool(raw.get("enabled", False)),
-            "quantities": [item for item in ("LG", "LL") if item in quantities],
-            "elements": sorted(elements, key=str.casefold),
-        }
+        output[str(project)] = rms_analysis.normalize_rms_settings(raw)
     return output
 
 
@@ -464,6 +450,7 @@ class AppSession:
     envelope_chart_height: float = DEFAULT_ENVELOPE_CHART_HEIGHT
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] = field(default_factory=normalize_chart_y_limits)
     envelope_chart_show_sa_label: bool = DEFAULT_ENVELOPE_CHART_SHOW_SA_LABEL
+    envelope_chart_move_labels: bool = DEFAULT_ENVELOPE_CHART_MOVE_LABELS
     high_voltage_limit_factor: float = DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR
     nonconv_cb_iip_limit: float = DEFAULT_NONCONV_CB_IIP_LIMIT
     nonconv_cb_iir_limit: float = DEFAULT_NONCONV_CB_IIR_LIMIT
@@ -583,6 +570,7 @@ class AppSession:
             "envelope_chart_height": self.envelope_chart_height,
             "envelope_chart_y_limits_by_voltage": self.envelope_chart_y_limits_by_voltage,
             "envelope_chart_show_sa_label": self.envelope_chart_show_sa_label,
+            "envelope_chart_move_labels": self.envelope_chart_move_labels,
             "high_voltage_limit_factor": self.high_voltage_limit_factor,
             "nonconv_cb_iip_limit": self.nonconv_cb_iip_limit,
             "nonconv_cb_iir_limit": self.nonconv_cb_iir_limit,
@@ -777,6 +765,9 @@ class AppSession:
             ),
             envelope_chart_show_sa_label=bool(
                 data.get("envelope_chart_show_sa_label", DEFAULT_ENVELOPE_CHART_SHOW_SA_LABEL)
+            ),
+            envelope_chart_move_labels=bool(
+                data.get("envelope_chart_move_labels", DEFAULT_ENVELOPE_CHART_MOVE_LABELS)
             ),
             high_voltage_limit_factor=normalize_positive_float(
                 data.get("high_voltage_limit_factor", DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR),

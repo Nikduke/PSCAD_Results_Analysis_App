@@ -10,6 +10,7 @@ import re
 
 from results_analysis_app.common import as_float
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
+from results_analysis_app.envelope_label_placement import move_envelope_labels
 from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_HEIGHT,
     DEFAULT_ENVELOPE_CHART_WIDTH,
@@ -113,6 +114,7 @@ def create_combined_envelope_plot(
     axis_limits_by_voltage: dict | None = None,
     event_times: dict[str, float] | None = None,
     show_sa_label: bool = False,
+    move_labels: bool = True,
     chart_top_left_cell: str | None = None,
     chart_size: dict | None = None,
 ) -> Path:
@@ -125,21 +127,10 @@ def create_combined_envelope_plot(
     try:
         shutil.copy2(input_path, staged_path)
         series_definitions = _series_definitions(event_times, show_sa_label)
-        if excel is None:
-            with excel_app() as app:
-                _create_combined_envelope_plot_with_excel(
-                    app,
-                    input_path,
-                    staged_path,
-                    axis_limits_override,
-                    axis_limits_by_voltage,
-                    series_definitions,
-                    chart_top_left_cell,
-                    chart_size,
-                )
-        else:
+
+        def create_and_finalize(active_excel) -> None:
             _create_combined_envelope_plot_with_excel(
-                excel,
+                active_excel,
                 input_path,
                 staged_path,
                 axis_limits_override,
@@ -148,7 +139,18 @@ def create_combined_envelope_plot(
                 chart_top_left_cell,
                 chart_size,
             )
-        _patch_workbook_native_data_labels(staged_path, series_definitions)
+            # Always seed Excel with the established native positions.  The
+            # optional movement pass must start from those positions rather
+            # than from an artificial zero-offset layout.
+            _patch_workbook_native_data_labels(staged_path, series_definitions)
+            if move_labels:
+                move_envelope_labels(active_excel, staged_path, series_definitions)
+
+        if excel is None:
+            with excel_app() as app:
+                create_and_finalize(app)
+        else:
+            create_and_finalize(excel)
         staged_path.replace(output_path)
     except Exception:
         staged_path.unlink(missing_ok=True)
@@ -224,8 +226,18 @@ def _series_definitions(event_times: dict[str, float] | None, show_sa_label: boo
     if show_sa_label:
         lg_times.append(sa)
     return [
-        {"name": LL_SERIES_NAME, "sheet_name": LL_SHEET_NAME, "color": (79, 129, 189), "annotation_times": [sfo, tov]},
-        {"name": LG_SERIES_NAME, "sheet_name": LG_SHEET_NAME, "color": (192, 80, 77), "annotation_times": lg_times},
+        {
+            "name": LL_SERIES_NAME,
+            "sheet_name": LL_SHEET_NAME,
+            "color": (79, 129, 189),
+            "annotation_times": [sfo, tov],
+        },
+        {
+            "name": LG_SERIES_NAME,
+            "sheet_name": LG_SHEET_NAME,
+            "color": (192, 80, 77),
+            "annotation_times": lg_times,
+        },
     ]
 
 

@@ -14,6 +14,9 @@ def _row(
     lgrm_pu: float | None = None,
     llrm_pu: float | None = None,
     lls: float | None = None,
+    tswitch_a: float | None = None,
+    tswitch_b: float | None = None,
+    tswitch_c: float | None = None,
     unique_id: str = "",
 ) -> dict[str, object]:
     return {
@@ -35,6 +38,9 @@ def _row(
         "LLrm [pu]": llrm_pu if llrm_pu is not None else (
             None if llrm is None else llrm / voltage
         ),
+        "Tswitch_a [s]": tswitch_a,
+        "Tswitch_b [s]": tswitch_b,
+        "Tswitch_c [s]": tswitch_c,
     }
 
 
@@ -94,6 +100,148 @@ def test_rms_selection_honours_an_explicitly_empty_voltage_selection() -> None:
     ) == []
 
 
+def test_catalog_rms_selection_ignores_rows_without_available_waveforms() -> None:
+    from pscad_plotter_app_v3.models import MMElementRecord, ProjectCatalog
+    from results_analysis_app.rms_analysis import select_rms_rows_from_catalog
+
+    catalog = ProjectCatalog(
+        mm_elements=[MMElementRecord("C1", 161, "MM_161_A", [1])],
+        mm_results=[
+            # This row has a larger value but no matching .inf-backed run.
+            _row("Missing", 18, "MM_161_A", 161, lgr=500, lgrm=20),
+            _row("C1", 1, "MM_161_A", 161, lgr=210, lgrm=30),
+        ],
+    )
+
+    selections = select_rms_rows_from_catalog(
+        catalog,
+        {"enabled": True, "quantities": ["LG"], "elements": ["MM_161_A"]},
+        ["161"],
+    )
+
+    assert {(item.variant, item.case_name, item.run_number) for item in selections} == {
+        ("max", "C1", 1),
+        ("min", "C1", 1),
+    }
+
+
+def test_rms_switching_time_filters_support_discrete_values_and_inclusive_ranges() -> None:
+    from results_analysis_app.rms_analysis import (
+        RMS_SWITCHING_TIME_MODE_DISCRETE,
+        RMS_SWITCHING_TIME_MODE_RANGE,
+        select_rms_rows,
+    )
+
+    rows = [
+        _row("C1", 1, "MM_161_A", 161, lgr=180, lgrm=20, tswitch_a=1.0),
+        _row("C2", 1, "MM_161_A", 161, lgr=210, lgrm=30, tswitch_a=2.0),
+        _row("C3", 1, "MM_161_A", 161, lgr=230, lgrm=40, tswitch_a=3.0),
+    ]
+
+    discrete = select_rms_rows(
+        rows,
+        selected_elements=["MM_161_A"],
+        selected_quantities=["LG"],
+        switching_time_mode=RMS_SWITCHING_TIME_MODE_DISCRETE,
+        selected_switching_times=[2.0],
+    )
+    assert {(item.variant, item.case_name) for item in discrete} == {
+        ("max", "C2"),
+        ("min", "C2"),
+    }
+
+    inclusive = select_rms_rows(
+        rows,
+        selected_elements=["MM_161_A"],
+        selected_quantities=["LG"],
+        switching_time_mode=RMS_SWITCHING_TIME_MODE_RANGE,
+        switching_time_start_s=2.0,
+        switching_time_end_s=2.0,
+    )
+    assert {(item.variant, item.case_name) for item in inclusive} == {
+        ("max", "C2"),
+        ("min", "C2"),
+    }
+
+
+def test_rms_switching_time_range_uses_any_available_phase_time() -> None:
+    from results_analysis_app.rms_analysis import (
+        RMS_SWITCHING_TIME_MODE_RANGE,
+        row_matches_switching_time,
+    )
+
+    row = _row(
+        "C1",
+        1,
+        "MM_161_A",
+        161,
+        lgr=180,
+        lgrm=20,
+        tswitch_a=1.0,
+        tswitch_b=4.0,
+    )
+    assert row_matches_switching_time(
+        row,
+        mode=RMS_SWITCHING_TIME_MODE_RANGE,
+        start_s=3.0,
+        end_s=4.0,
+    )
+    assert not row_matches_switching_time(
+        row,
+        mode=RMS_SWITCHING_TIME_MODE_RANGE,
+        start_s=2.0,
+        end_s=3.0,
+    )
+
+
+def test_rms_switching_time_settings_normalize_legacy_and_new_shapes() -> None:
+    from results_analysis_app.rms_analysis import (
+        RMS_SWITCHING_TIME_MODE_ALL,
+        RMS_SWITCHING_TIME_MODE_DISCRETE,
+        RMS_SWITCHING_TIME_MODE_RANGE,
+        normalize_rms_settings,
+        switching_time_mode_for_type,
+    )
+
+    assert normalize_rms_settings(None)["switching_time_mode"] == RMS_SWITCHING_TIME_MODE_ALL
+    assert normalize_rms_settings(
+        {"switching_times": [2, "1", 2, "nan"]}
+    )["switching_time_mode"] == RMS_SWITCHING_TIME_MODE_DISCRETE
+    assert normalize_rms_settings(
+        {
+            "switching_time_mode": "range",
+            "switching_time_start_s": "1.5",
+            "switching_time_end_s": 4,
+        }
+    ) == {
+        "enabled": False,
+        "quantities": ["LG", "LL"],
+        "elements": [],
+        "switching_time_mode": RMS_SWITCHING_TIME_MODE_RANGE,
+        "switching_times": [],
+        "switching_time_start_s": 1.5,
+        "switching_time_end_s": 4.0,
+    }
+    assert switching_time_mode_for_type("Sequential") == RMS_SWITCHING_TIME_MODE_DISCRETE
+    assert switching_time_mode_for_type("None") == RMS_SWITCHING_TIME_MODE_DISCRETE
+    assert switching_time_mode_for_type("Random") == RMS_SWITCHING_TIME_MODE_RANGE
+
+
+def test_available_switching_times_are_unique_and_run_index_backed() -> None:
+    from pscad_plotter_app_v3.models import MMElementRecord
+    from results_analysis_app.rms_analysis import available_mm_row_keys, available_switching_times
+
+    rows = [
+        _row("C1", 1, "MM_161_A", 161, tswitch_a=2.0, tswitch_b=3.0),
+        _row("C1", 2, "MM_161_A", 161, tswitch_a=4.0),
+        _row("Missing", 1, "MM_161_A", 161, tswitch_a=9.0),
+    ]
+    keys = available_mm_row_keys(
+        [MMElementRecord("C1", 161, "MM_161_A", [1, 2])]
+    )
+    assert available_switching_times(rows, keys) == [2.0, 3.0, 4.0]
+
+
 def test_rms_batch_rows_use_separate_quantity_batches_and_variants() -> None:
     from results_analysis_app.rms_analysis import RMSSelection, rms_batch_rows
 
@@ -126,15 +274,16 @@ def test_rms_paths_keep_quantities_separate(tmp_path) -> None:
 
 
 def test_catalog_cache_round_trips_rms_columns(tmp_path) -> None:
-    from pscad_plotter_app_v3.services.project import CatalogCache
+    from pscad_plotter_app_v3.services.project import CatalogCache, ResultsCatalogService
 
     source = tmp_path / "MM results.csv"
     source.write_text("source\n", encoding="utf-8")
     rows = [_row("C1", 1, "MM_161_A", 161, lgr=210, lgrm=30, llr=230, llrm=40)]
     cache = CatalogCache(tmp_path / "state")
     try:
-        cache.store_mm_results(source, 2, rows)
-        loaded = cache.load_mm_results(source, 2)
+        parser_version = ResultsCatalogService.MM_CSV_CACHE_VERSION
+        cache.store_mm_results(source, parser_version, rows)
+        loaded = cache.load_mm_results(source, parser_version)
     finally:
         cache.close()
 

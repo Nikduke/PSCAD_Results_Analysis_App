@@ -14,6 +14,7 @@ def test_session_event_times_round_trip() -> None:
     from results_analysis_app.models import AppSession
 
     session = AppSession.default()
+    assert session.envelope_chart_move_labels is True
     session.event_times["SFO"] = 0.005
     session.envelope_workers = 32
     session.envelope_workers_auto = False
@@ -27,6 +28,7 @@ def test_session_event_times_round_trip() -> None:
     session.envelope_chart_height = 400.0
     session.envelope_chart_y_limits_by_voltage = {"330": {"y_min": 200.0, "y_max": 800.0, "y_major": 100.0}}
     session.envelope_chart_show_sa_label = True
+    session.envelope_chart_move_labels = False
     session.high_voltage_limit_factor = 4.5
     session.nonconv_cb_iip_limit = 450.0
     session.nonconv_cb_iir_limit = 250.0
@@ -95,6 +97,17 @@ def test_session_event_times_round_trip() -> None:
     ]
     session.dashboard_figure_shared_selection_initialized = True
     session.voltage_um_overrides_by_project = {project: {"330": 362.0}}
+    session.rms_settings_by_project = {
+        project: {
+            "enabled": True,
+            "quantities": ["LG"],
+            "elements": ["MM_161_A"],
+            "switching_time_mode": "range",
+            "switching_times": [],
+            "switching_time_start_s": 10.2,
+            "switching_time_end_s": 10.5,
+        }
+    }
 
     persisted = session.to_dict()
     persisted["high_voltage_exclusions_by_project"] = {
@@ -119,6 +132,7 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.envelope_chart_height == 400.0
     assert loaded.envelope_chart_y_limits_by_voltage["330"] == {"y_min": 200.0, "y_max": 800.0, "y_major": 100.0}
     assert loaded.envelope_chart_show_sa_label is True
+    assert loaded.envelope_chart_move_labels is False
     assert loaded.high_voltage_limit_factor == 4.5
     assert loaded.nonconv_cb_iip_limit == 450.0
     assert loaded.nonconv_cb_iir_limit == 250.0
@@ -161,6 +175,17 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.dashboard_figure_shared_selection_initialized is True
     assert "high_voltage_exclusions_by_project" not in loaded.to_dict()
     assert loaded.voltage_um_overrides_by_project == {project: {"330": 362.0}}
+    assert loaded.rms_settings_by_project == {
+        project: {
+            "enabled": True,
+            "quantities": ["LG"],
+            "elements": ["MM_161_A"],
+            "switching_time_mode": "range",
+            "switching_times": [],
+            "switching_time_start_s": 10.2,
+            "switching_time_end_s": 10.5,
+        }
+    }
     assert "bus_exclusions_by_project" not in loaded.to_dict()
     assert "manual_case_run_exclusions_by_project" not in loaded.to_dict()
 
@@ -323,7 +348,9 @@ def test_top_bar_uses_envelope_and_sdpf_labels_with_dividers(monkeypatch) -> Non
     monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
     window = MainWindow()
     try:
-        assert window.project_header.text() == "PSCAD Results Analysis"
+        assert window.windowTitle() == "PSCAD Results Analysis"
+        assert window.project_controls_group.title() == "Project: —"
+        assert window.action_group.title() == "Actions"
         section_labels = {
             label.text()
             for label in window.findChildren(QtWidgets.QLabel)
@@ -379,6 +406,84 @@ def test_top_bar_uses_envelope_and_sdpf_labels_with_dividers(monkeypatch) -> Non
             divider.frameShape() == QtWidgets.QFrame.Shape.VLine
             for divider in dividers
         )
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_rms_popup_switching_selector_follows_project_switch_type(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from PySide6 import QtCore, QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+    from results_analysis_app.scanner import ProjectScan
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = str(tmp_path.resolve())
+    session = AppSession.default()
+    session.add_project(project)
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(storage, "save_autosave", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        window.project_scans[project] = ProjectScan(
+            path=tmp_path,
+            exists=True,
+            switch_type="Random",
+        )
+        window._load_mm_catalog_for_project = lambda _path: SimpleNamespace(
+            mm_elements=[
+                SimpleNamespace(
+                    case_name="C1",
+                    voltage_kv=161.0,
+                    element_name="MM_161_A",
+                    available_runs=[1],
+                )
+            ],
+            mm_results=[
+                {
+                    "Case name": "C1",
+                    "Run#": 1,
+                    "Bus name": "MM_161_A",
+                    "Bus voltage [kV]": 161.0,
+                    "Tswitch_a [s]": 10.2,
+                    "Tswitch_b [s]": 10.4,
+                    "Tswitch_c [s]": None,
+                }
+            ],
+        )
+        window._select_project_path(project)
+        window._load_project_analysis_options(project, load_catalog=True)
+        app.processEvents()
+
+        assert window.rms_switching_time_mode == "range"
+        assert window.rms_switching_time_start_edit is not None
+        assert window.rms_switching_time_end_edit is not None
+        assert window.rms_switching_time_start_edit.text() == "10.2"
+        assert window.rms_switching_time_end_edit.text() == "10.4"
+
+        window.rms_switching_time_start_edit.setText("10.3")
+        window.rms_switching_time_end_edit.setText("10.4")
+        app.processEvents()
+        assert window.session.rms_settings_by_project[project]["switching_time_start_s"] == 10.3
+        assert window.session.rms_settings_by_project[project]["switching_time_end_s"] == 10.4
+
+        window.project_scans[project].switch_type = "Sequential"
+        window._load_project_analysis_options(project, load_catalog=True)
+        app.processEvents()
+        assert window.rms_switching_time_mode == "discrete"
+        assert [check.text() for check in window.rms_switching_time_checks.values()] == [
+            "10.2 s",
+            "10.4 s",
+        ]
+        assert all(check.checkState() == QtCore.Qt.CheckState.Checked for check in window.rms_switching_time_checks.values())
+        window.rms_switching_time_checks[10.4].setChecked(False)
+        app.processEvents()
+        assert window.session.rms_settings_by_project[project]["switching_times"] == [10.2]
     finally:
         window.close()
         app.processEvents()
@@ -587,12 +692,18 @@ def test_project_selection_is_visible_and_double_click_opens_settings(
     try:
         first_item = window.project_tree.topLevelItem(0)
         second_item = window.project_tree.topLevelItem(1)
+        assert window._current_project_path() == str(first.resolve())
+        assert window.project_controls_group.title() == "Project: First"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: First"
+        assert window.project_exclusion_label.text() == "First"
         window._select_project_path(str(second.resolve()))
 
         assert second_item.font(0).bold()
         assert not first_item.font(0).bold()
-        assert window.project_header.text() == "PSCAD Results Analysis — Project: Second"
-        assert window.project_header.toolTip() == str(second.resolve())
+        assert window.windowTitle() == "PSCAD Results Analysis"
+        assert window.project_controls_group.title() == "Project: Second"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: Second"
+        assert window.project_exclusion_label.text() == "Second"
 
         opened_for: list[str | None] = []
         monkeypatch.setattr(
@@ -606,7 +717,10 @@ def test_project_selection_is_visible_and_double_click_opens_settings(
         assert window.project_tree.currentItem() is first_item
         assert first_item.font(0).bold()
         assert not second_item.font(0).bold()
-        assert window.project_header.text() == "PSCAD Results Analysis — Project: First"
+        assert window.windowTitle() == "PSCAD Results Analysis"
+        assert window.project_controls_group.title() == "Project: First"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: First"
+        assert window.project_exclusion_label.text() == "First"
 
         opened_folders: list[str] = []
         monkeypatch.setattr(
@@ -619,6 +733,99 @@ def test_project_selection_is_visible_and_double_click_opens_settings(
         assert len(opened_folders) == 1
         assert Path(opened_folders[0]) == first.resolve()
         assert opened_for == [str(first.resolve())]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_project_selection_does_not_reprocess_font_changes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    first = tmp_path / "First"
+    second = tmp_path / "Second"
+    second_path = str(second.resolve())
+    session = AppSession.default()
+    session.add_project(str(first))
+    session.add_project(second_path)
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        app.processEvents()
+        analysis_calls: list[str | None] = []
+        preview_calls = 0
+        load_analysis = window._load_project_analysis_options
+        update_preview = window.update_preview
+
+        def counted_analysis(path: str | None, **kwargs) -> None:
+            analysis_calls.append(path)
+            load_analysis(path, **kwargs)
+
+        def counted_preview() -> None:
+            nonlocal preview_calls
+            preview_calls += 1
+            update_preview()
+
+        monkeypatch.setattr(window, "_load_project_analysis_options", counted_analysis)
+        monkeypatch.setattr(window, "update_preview", counted_preview)
+        window._select_project_path(second_path)
+        app.processEvents()
+
+        assert analysis_calls == [second_path]
+        assert preview_calls == 1
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_project_context_survives_scan_tree_rebuild(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import project_scan_cache, scanner, storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+    from results_analysis_app.project_scan_runner import ProjectScanBatch
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    first = tmp_path / "First"
+    second = tmp_path / "Second"
+    first_path = str(first.resolve())
+    second_path = str(second.resolve())
+    session = AppSession.default()
+    session.add_project(first_path)
+    session.add_project(second_path)
+    monkeypatch.setattr(storage, "load_autosave", lambda: session)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(project_scan_cache, "update_project_scans", lambda *_args, **_kwargs: None)
+    window = MainWindow()
+    try:
+        window._select_project_path(second_path)
+        window._project_scans_finished(
+            ProjectScanBatch(
+                current_path=second_path,
+                scans={
+                    first_path: scanner.ProjectScan(path=first, exists=True),
+                    second_path: scanner.ProjectScan(path=second, exists=True),
+                },
+            )
+        )
+        app.processEvents()
+
+        assert window._current_project_path() == second_path
+        assert window.project_controls_group.title() == "Project: Second"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: Second"
+        assert window.project_exclusion_label.text() == "Second"
     finally:
         window.close()
         app.processEvents()
@@ -672,23 +879,24 @@ def test_dashboard_figure_list_uses_shared_catalog_by_default_and_local_override
             ],
         }
 
-        window._select_project_path(first_path)
+        window._load_dashboard_figure_list(first_path)
         app.processEvents()
         assert window.dashboard_figure_apply_all_checkbox.isChecked()
         assert window.dashboard_figure_list.count() == 3
         assert window.dashboard_figure_list.item(0).checkState() == QtCore.Qt.CheckState.Checked
         assert window.dashboard_figure_list.item(1).checkState() == QtCore.Qt.CheckState.Unchecked
-        assert window.dashboard_figure_header.text() == "Dashboard Figures"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: O1"
 
         window._select_project_path(second_path)
         app.processEvents()
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: O2"
         assert window.dashboard_figure_list.count() == 3
         assert window.dashboard_figure_list.item(2).text().startswith("B.xlsx")
         assert window.dashboard_figure_list.item(0).checkState() == QtCore.Qt.CheckState.Checked
 
         window.dashboard_figure_apply_all_checkbox.setChecked(False)
         app.processEvents()
-        assert window.dashboard_figure_header.text() == "Dashboard Figures for Current Project"
+        assert window.dashboard_figure_header.text() == "Dashboard Figures: O2"
         assert window.dashboard_figure_list.count() == 1
         assert window.dashboard_figure_list.item(0).text().startswith("B.xlsx")
         assert window.dashboard_figure_list.item(0).checkState() == QtCore.Qt.CheckState.Unchecked

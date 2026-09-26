@@ -9,7 +9,7 @@ from results_analysis_app.common import as_float
 from results_analysis_app.project_config import VoltageConfig
 
 
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 
 
 def _empty_cache() -> dict[str, Any]:
@@ -113,6 +113,7 @@ def _serialize_scan(scan: scanner.ProjectScan, root: Path) -> dict[str, Any]:
         "sustained_sdpf_limit_warnings": list(scan.sustained_sdpf_limit_warnings),
         "project_frequency": scan.project_frequency,
         "final_duration": scan.final_duration,
+        "switch_type": scan.switch_type,
         "has_dashboards": scan.has_dashboards,
         "dashboard_figures": [
             {
@@ -328,6 +329,7 @@ def _deserialize_scan(project_path: str, payload: Any) -> scanner.ProjectScan | 
         ],
         project_frequency=as_float(payload.get("project_frequency")),
         final_duration=as_float(payload.get("final_duration")),
+        switch_type=str(payload.get("switch_type") or "None").strip() or "None",
         has_dashboards=bool(payload.get("has_dashboards", False)),
         dashboard_figures=dashboard_figures,
         dashboard_changed=bool(

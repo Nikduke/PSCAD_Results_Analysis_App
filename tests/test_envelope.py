@@ -190,6 +190,98 @@ def test_run_analysis_pipeline_reuses_sustained_cache_validation(
     }
 
 
+def test_run_analysis_pipeline_reuses_one_rms_catalog_and_selection_set(
+    tmp_path, monkeypatch
+) -> None:
+    from results_analysis_app import actions, analysis_engine, rms_analysis
+    from pscad_plotter_app_v3.models import ProjectCatalog
+    from results_analysis_app.models import ScopeEntry
+
+    project = tmp_path / "Project"
+    project.mkdir()
+    project_key = str(project.resolve())
+    catalog_context = analysis_engine.PlotterCatalogContext(object(), {}, ProjectCatalog())
+    selections = [
+        rms_analysis.RMSSelection(
+            "LG", "max", "C1", 1, "MM_161_A", 161, 210, 1.3, {}
+        )
+    ]
+    loader_calls = 0
+    captured: dict[str, dict[str, object]] = {}
+
+    monkeypatch.setattr(actions, "build_voltage_envelopes", lambda *_args, **_kwargs: [])
+
+    def load_catalog(*_args, **_kwargs):
+        nonlocal loader_calls
+        loader_calls += 1
+        return catalog_context
+
+    monkeypatch.setattr(actions.analysis_engine, "load_plotter_catalog", load_catalog)
+    monkeypatch.setattr(
+        actions.rms_analysis,
+        "select_rms_rows_from_catalog",
+        lambda *_args, **_kwargs: selections,
+    )
+
+    def capture_create(*_args, **kwargs):
+        captured["create"] = kwargs
+        return []
+
+    def capture_render(*_args, **kwargs):
+        captured["render"] = kwargs
+
+    def capture_report(*_args, **kwargs):
+        captured["report"] = kwargs
+        return []
+
+    monkeypatch.setattr(actions, "create_plot_batches", capture_create)
+    monkeypatch.setattr(actions, "render_plot_batches", capture_render)
+    monkeypatch.setattr(actions, "build_reports_from_existing_plots", capture_report)
+
+    actions.run_analysis_pipeline(
+        [project],
+        [ScopeEntry.full()],
+        ["161"],
+        [],
+        rms_settings_by_project={
+            project_key: {
+                "enabled": True,
+                "quantities": ["LG"],
+                "elements": ["MM_161_A"],
+            }
+        },
+    )
+
+    assert loader_calls == 1
+    assert captured["create"]["rms_catalog_context_by_project"][project_key] is catalog_context
+    assert captured["render"]["rms_catalog_context_by_project"][project_key] is catalog_context
+    assert captured["create"]["rms_selections_by_project"][project_key] == selections
+    assert captured["report"]["rms_selections_by_project"][project_key] == selections
+
+
+def test_plotter_catalog_context_detects_changed_mm_source(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from pscad_plotter_app_v3.models import ProjectCatalog
+    from results_analysis_app.analysis_engine import PlotterCatalogContext
+
+    results = tmp_path / "Results"
+    results.mkdir()
+    source = results / "MM results.csv"
+    source.write_text("first\n", encoding="utf-8")
+    stat = source.stat()
+    context = PlotterCatalogContext(
+        SimpleNamespace(results_dir=results),
+        {},
+        ProjectCatalog(),
+        (int(stat.st_size), int(stat.st_mtime_ns)),
+    )
+
+    assert context.mm_results_are_current()
+    source.write_text("a longer source\n", encoding="utf-8")
+    assert not context.mm_results_are_current()
+
+
 def test_rebuild_envelope_charts_uses_existing_workbooks(tmp_path, monkeypatch) -> None:
     from results_analysis_app import actions
     from results_analysis_app.models import ScopeEntry
@@ -240,6 +332,7 @@ def test_rebuild_envelope_charts_uses_existing_workbooks(tmp_path, monkeypatch) 
     assert calls[0][3]["axis_limits_by_voltage"] == {"66": {"y_min": 40.0}}
     assert calls[0][3]["event_times"] == {"SFO": 0.005}
     assert calls[0][3]["show_sa_label"] is True
+    assert calls[0][3]["move_labels"] is True
     assert calls[0][3]["chart_top_left_cell"] == "J2"
     assert calls[0][3]["chart_size"] == {"width": 800.0, "height": 400.0}
 
@@ -305,6 +398,53 @@ def test_combined_envelope_chart_failure_keeps_previous_output(tmp_path, monkeyp
 
     assert output.read_bytes() == b"previous good chart"
     assert not list(tmp_path.glob(".*.tmp.xlsx"))
+
+
+def test_combined_envelope_plot_honors_move_labels_setting(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import envelope_chart
+
+    source = tmp_path / "MM_66.xlsx"
+    source.write_bytes(b"base workbook")
+    calls: list[object] = []
+
+    def create(_excel, _input, staged, *_args) -> None:
+        staged.write_bytes(b"chart workbook")
+
+    monkeypatch.setattr(envelope_chart, "_create_combined_envelope_plot_with_excel", create)
+    monkeypatch.setattr(envelope_chart, "_patch_workbook_native_data_labels", lambda *_args: None)
+    monkeypatch.setattr(envelope_chart, "move_envelope_labels", lambda *_args, **_kwargs: calls.append(True))
+
+    disabled = tmp_path / "disabled.xlsx"
+    envelope_chart.create_combined_envelope_plot(source, disabled, excel=object(), move_labels=False)
+    assert disabled.read_bytes() == b"chart workbook"
+    assert calls == []
+
+    enabled = tmp_path / "enabled.xlsx"
+    envelope_chart.create_combined_envelope_plot(source, enabled, excel=object(), move_labels=True)
+    assert enabled.read_bytes() == b"chart workbook"
+    assert calls == [True]
+
+
+def test_envelope_label_movement_starts_from_original_native_layout() -> None:
+    from results_analysis_app import envelope_chart
+
+    cfg = {
+        "name": envelope_chart.LL_SERIES_NAME,
+        "annotation_times": [0.004],
+    }
+    native = envelope_chart._build_data_labels_xml({0.004: 3}, cfg)
+    movement = envelope_chart._build_data_labels_xml({0.004: 3}, cfg)
+    ns = envelope_chart.OOXML_NS["c"]
+    native_x = native.find(f".//{{{ns}}}manualLayout/{{{ns}}}x").attrib["val"]
+    native_y = native.find(f".//{{{ns}}}manualLayout/{{{ns}}}y").attrib["val"]
+    movement_x = movement.find(f".//{{{ns}}}manualLayout/{{{ns}}}x").attrib["val"]
+    movement_y = movement.find(f".//{{{ns}}}manualLayout/{{{ns}}}y").attrib["val"]
+
+    assert (native_x, native_y) == (
+        envelope_chart.OOXML_DATALABEL_LAYOUTS_BY_SERIES[envelope_chart.LL_SERIES_NAME][0.004]["x"],
+        envelope_chart.OOXML_DATALABEL_LAYOUTS_BY_SERIES[envelope_chart.LL_SERIES_NAME][0.004]["y"],
+    )
+    assert (movement_x, movement_y) == (native_x, native_y)
 
 
 def test_fast_array_envelope_matches_dataframe_path() -> None:

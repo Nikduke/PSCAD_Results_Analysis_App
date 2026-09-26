@@ -255,6 +255,12 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     show_sa_label_check = QtWidgets.QCheckBox("Show SA label", chart_tab)
     show_sa_label_check.setChecked(bool(self.session.envelope_chart_show_sa_label))
     chart_form.addRow("Annotations", show_sa_label_check)
+    move_labels_check = QtWidgets.QCheckBox("Move labels to avoid overlap", chart_tab)
+    move_labels_check.setChecked(bool(self.session.envelope_chart_move_labels))
+    move_labels_check.setToolTip(
+        "Move envelope labels when they overlap traces, plot edges, or other labels."
+    )
+    chart_form.addRow("Label placement", move_labels_check)
     chart_layout.addLayout(chart_form)
 
     y_limit_table = QtWidgets.QTableWidget(0, 4, chart_tab)
@@ -937,6 +943,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     self.session.envelope_chart_width = float(chart_width_spin.value())
     self.session.envelope_chart_height = float(chart_height_spin.value())
     self.session.envelope_chart_show_sa_label = show_sa_label_check.isChecked()
+    self.session.envelope_chart_move_labels = move_labels_check.isChecked()
     raw_y_limits = {}
     for row in range(y_limit_table.rowCount()):
         voltage_item = y_limit_table.item(row, 0)

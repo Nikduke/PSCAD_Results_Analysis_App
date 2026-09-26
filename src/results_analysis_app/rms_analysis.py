@@ -1,9 +1,10 @@
 """Project-specific RMS voltage selection and batch-row preparation.
 
-The RMS study uses the already parsed ``MM results.csv`` rows.  It deliberately
-does not apply the exploratory script's hard-coded element or time-window
-filters: the active project settings provide the selected MM elements and RMS
-quantities instead.
+The RMS study uses the already parsed ``MM results.csv`` rows.  New plot
+batches restrict those rows to Case/Run/MM/voltage combinations backed by the
+project's available run index.  The active project settings provide the
+selected MM elements, RMS quantities, and either discrete switching times or
+an inclusive switching-time range.
 """
 
 from __future__ import annotations
@@ -18,10 +19,22 @@ from results_analysis_app.project_config import normalize_voltage
 RMS_QUANTITIES = ("LG", "LL")
 RMS_BATCH_EVENTS = {"LG": "RMS_LG", "LL": "RMS_LL"}
 RMS_TRACE_TYPES = {"LG": "LGr", "LL": "LLr"}
-RMS_RESULT_VERSION = 1
+# Increment when the selected Case/Run/MM population or RMS calculations change.
+RMS_RESULT_VERSION = 3
 RMS_MIN_VALID_PU = 0.05
 VOLTAGE_EPSILON_KV = 1e-6
 RMS_REPORT_VARIANT_ORDER = ("max", "min")
+RMSRowKey = tuple[str, int, str, str]
+RMS_SWITCHING_TIME_COLUMNS = (
+    "Tswitch_a [s]",
+    "Tswitch_b [s]",
+    "Tswitch_c [s]",
+)
+RMS_SWITCHING_TIME_MODE_ALL = "all"
+RMS_SWITCHING_TIME_MODE_DISCRETE = "discrete"
+RMS_SWITCHING_TIME_MODE_RANGE = "range"
+RMS_DISCRETE_SWITCH_TYPES = {"sequential", "none"}
+RMS_TIME_EPSILON_S = 1e-9
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,10 +63,56 @@ def normalize_rms_quantity(value: object) -> str | None:
     return None
 
 
+def normalize_switch_type(value: object) -> str:
+    """Return a stable switch-type label, treating a blank value as None."""
+    text = str(value or "").strip()
+    return text or "None"
+
+
+def switching_time_mode_for_type(value: object) -> str:
+    """Map the project's Input_Data switch type to the RMS selector mode."""
+    return (
+        RMS_SWITCHING_TIME_MODE_DISCRETE
+        if normalize_switch_type(value).casefold() in RMS_DISCRETE_SWITCH_TYPES
+        else RMS_SWITCHING_TIME_MODE_RANGE
+    )
+
+
+def _normalize_switching_time_mode(value: object) -> str:
+    token = str(value or "").strip().casefold()
+    aliases = {
+        "all": RMS_SWITCHING_TIME_MODE_ALL,
+        "discrete": RMS_SWITCHING_TIME_MODE_DISCRETE,
+        "list": RMS_SWITCHING_TIME_MODE_DISCRETE,
+        "range": RMS_SWITCHING_TIME_MODE_RANGE,
+        "window": RMS_SWITCHING_TIME_MODE_RANGE,
+    }
+    return aliases.get(token, "")
+
+
+def _normalize_switching_times(value: object) -> list[float]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    values: set[float] = set()
+    for item in value:
+        number = _finite_float(item)
+        if number is not None:
+            values.add(number)
+    return sorted(values)
+
+
 def normalize_rms_settings(value: object) -> dict[str, Any]:
     """Return the persisted RMS settings in one stable shape."""
     if not isinstance(value, Mapping):
-        return {"enabled": False, "quantities": [*RMS_QUANTITIES], "elements": []}
+        return {
+            "enabled": False,
+            "quantities": [*RMS_QUANTITIES],
+            "elements": [],
+            "switching_time_mode": RMS_SWITCHING_TIME_MODE_ALL,
+            "switching_times": [],
+            "switching_time_start_s": None,
+            "switching_time_end_s": None,
+        }
     quantities: list[str] = []
     raw_quantities = value.get("quantities", RMS_QUANTITIES)
     if isinstance(raw_quantities, (list, tuple, set)):
@@ -71,36 +130,129 @@ def normalize_rms_settings(value: object) -> dict[str, Any]:
             if element and key not in element_keys:
                 element_keys.add(key)
                 elements.append(element)
+    mode = _normalize_switching_time_mode(value.get("switching_time_mode"))
+    if not mode:
+        if "switching_times" in value:
+            mode = RMS_SWITCHING_TIME_MODE_DISCRETE
+        elif "switching_time_start_s" in value or "switching_time_end_s" in value:
+            mode = RMS_SWITCHING_TIME_MODE_RANGE
+        else:
+            mode = RMS_SWITCHING_TIME_MODE_ALL
     return {
         "enabled": bool(value.get("enabled", False)),
         "quantities": [quantity for quantity in RMS_QUANTITIES if quantity in quantities],
         "elements": sorted(elements, key=str.casefold),
+        "switching_time_mode": mode,
+        "switching_times": _normalize_switching_times(value.get("switching_times")),
+        "switching_time_start_s": _finite_float(value.get("switching_time_start_s")),
+        "switching_time_end_s": _finite_float(value.get("switching_time_end_s")),
     }
 
 
+def row_switching_times(row: Mapping[str, object]) -> tuple[float, ...]:
+    """Return the available phase switching times for one MM result row."""
+    values = tuple(
+        value
+        for column in RMS_SWITCHING_TIME_COLUMNS
+        if (value := _finite_float(row.get(column))) is not None
+    )
+    if values:
+        return values
+    event_time = _finite_float(row.get("EventTime"))
+    return (event_time,) if event_time is not None else ()
+
+
+def _row_key(row: Mapping[str, object]) -> RMSRowKey | None:
+    case_name = str(row.get("Case name", "") or "").strip()
+    element_name = str(row.get("Bus name", "") or "").strip()
+    run_number = _finite_float(row.get("Run#"))
+    voltage_kv = _finite_float(row.get("Bus voltage [kV]"))
+    if (
+        not case_name
+        or not element_name
+        or run_number is None
+        or not run_number.is_integer()
+        or run_number < 1
+        or voltage_kv is None
+    ):
+        return None
+    return (
+        case_name.casefold(),
+        int(run_number),
+        element_name.casefold(),
+        normalize_voltage(voltage_kv),
+    )
+
+
+def available_switching_times(
+    rows: Iterable[Mapping[str, object]],
+    available_keys: Iterable[RMSRowKey] | None = None,
+) -> list[float]:
+    """Return sorted unique switching times backed by the available run index."""
+    available_key_set = set(available_keys) if available_keys is not None else None
+    values: set[float] = set()
+    for row in rows:
+        if available_key_set is not None:
+            row_key = _row_key(row)
+            if row_key is None or row_key not in available_key_set:
+                continue
+        values.update(row_switching_times(row))
+    return sorted(values)
+
+
+def row_matches_switching_time(
+    row: Mapping[str, object],
+    *,
+    mode: str = RMS_SWITCHING_TIME_MODE_ALL,
+    selected_times: Iterable[float] = (),
+    start_s: float | None = None,
+    end_s: float | None = None,
+) -> bool:
+    """Apply the RMS discrete-list or inclusive range switching-time filter."""
+    if mode == RMS_SWITCHING_TIME_MODE_ALL:
+        return True
+    times = row_switching_times(row)
+    if not times:
+        return False
+    if mode == RMS_SWITCHING_TIME_MODE_DISCRETE:
+        selected = tuple(_finite_float(value) for value in selected_times)
+        selected = tuple(value for value in selected if value is not None)
+        return any(
+            any(
+                math.isclose(time, selected_time, rel_tol=0.0, abs_tol=RMS_TIME_EPSILON_S)
+                for selected_time in selected
+            )
+            for time in times
+        )
+    if mode == RMS_SWITCHING_TIME_MODE_RANGE:
+        if start_s is not None and end_s is not None and start_s > end_s:
+            return False
+        return any(
+            (start_s is None or time >= start_s)
+            and (end_s is None or time <= end_s)
+            for time in times
+        )
+    return True
+
+
 def load_mm_results(project_root: str | Path) -> list[dict[str, object]]:
-    """Load the shared MM-results catalog, using the existing SQLite cache."""
+    """Convenience loader backed by the plotter's shared catalog service."""
     from pscad_plotter_app_v3.services.project import CatalogCache, ResultsCatalogService
 
     root = Path(project_root).resolve()
-    source_path = root / "Results" / ResultsCatalogService.MM_FILENAME
+    service = ResultsCatalogService()
+    source_path = root / "Results" / service.MM_FILENAME
     if not source_path.is_file():
         return []
-
-    parser_version = ResultsCatalogService.MM_CSV_CACHE_VERSION
     cache = CatalogCache(root / "Plots" / ".plottool_v3")
     try:
-        cached = cache.load_mm_results(source_path, parser_version)
-        if cached is not None:
-            return cached
-        rows = ResultsCatalogService()._load_mm_results(source_path)
-        cache.store_mm_results(source_path, parser_version, rows)
-        return rows
+        return service.load_mm_results(source_path, cache)
     finally:
         cache.close()
 
 
 def available_elements(rows: Iterable[Mapping[str, object]]) -> list[str]:
+    """Return alphabetized MM element names from parsed result rows."""
     values = {
         str(row.get("Bus name", "") or "").strip()
         for row in rows
@@ -109,12 +261,42 @@ def available_elements(rows: Iterable[Mapping[str, object]]) -> list[str]:
     return sorted(values, key=str.casefold)
 
 
+def available_mm_row_keys(records: Iterable[object]) -> set[RMSRowKey]:
+    """Return the Case/Run/MM/voltage keys backed by available waveforms."""
+    keys: set[RMSRowKey] = set()
+    for record in records:
+        case_name = str(getattr(record, "case_name", "") or "").strip()
+        element_name = str(getattr(record, "element_name", "") or "").strip()
+        voltage_kv = _finite_float(getattr(record, "voltage_kv", None))
+        if not case_name or not element_name or voltage_kv is None:
+            continue
+        voltage_key = normalize_voltage(voltage_kv)
+        for raw_run in getattr(record, "available_runs", ()) or ():
+            run_number = _finite_float(raw_run)
+            if run_number is None or not run_number.is_integer() or run_number < 1:
+                continue
+            keys.add(
+                (
+                    case_name.casefold(),
+                    int(run_number),
+                    element_name.casefold(),
+                    voltage_key,
+                )
+            )
+    return keys
+
+
 def select_rms_rows(
     rows: Iterable[Mapping[str, object]],
     *,
     selected_elements: Iterable[str],
     selected_quantities: Iterable[str] = RMS_QUANTITIES,
     selected_voltages: Iterable[str] | None = None,
+    available_keys: Iterable[RMSRowKey] | None = None,
+    switching_time_mode: str = RMS_SWITCHING_TIME_MODE_ALL,
+    selected_switching_times: Iterable[float] = (),
+    switching_time_start_s: float | None = None,
+    switching_time_end_s: float | None = None,
 ) -> list[RMSSelection]:
     """Select one governing max and min row per voltage and quantity.
 
@@ -130,10 +312,11 @@ def select_rms_rows(
     }
     quantities = [quantity for quantity in RMS_QUANTITIES if quantity in selected_quantity_keys]
     voltage_keys = None if selected_voltages is None else {
-        normalize_voltage(value)
+        normalized
         for value in selected_voltages
-        if normalize_voltage(value)
+        if (normalized := normalize_voltage(value))
     }
+    available_key_set = set(available_keys) if available_keys is not None else None
     candidates: list[dict[str, object]] = []
     for source in rows:
         row = dict(source)
@@ -141,11 +324,34 @@ def select_rms_rows(
         case_name = str(row.get("Case name", "") or "").strip()
         run_number = _finite_float(row.get("Run#"))
         voltage_kv = _finite_float(row.get("Bus voltage [kV]"))
-        if not element or not case_name or run_number is None or voltage_kv is None:
+        if (
+            not element
+            or not case_name
+            or run_number is None
+            or not run_number.is_integer()
+            or run_number < 1
+            or voltage_kv is None
+        ):
             continue
+        voltage_key = normalize_voltage(voltage_kv)
         if element.casefold() not in element_keys:
             continue
-        if voltage_keys is not None and normalize_voltage(voltage_kv) not in voltage_keys:
+        if voltage_keys is not None and voltage_key not in voltage_keys:
+            continue
+        if available_key_set is not None and (
+            case_name.casefold(),
+            int(run_number),
+            element.casefold(),
+            voltage_key,
+        ) not in available_key_set:
+            continue
+        if not row_matches_switching_time(
+            row,
+            mode=switching_time_mode,
+            selected_times=selected_switching_times,
+            start_s=switching_time_start_s,
+            end_s=switching_time_end_s,
+        ):
             continue
         row["Run#"] = int(run_number)
         row["Bus voltage [kV]"] = float(voltage_kv)
@@ -177,6 +383,29 @@ def select_rms_rows(
             if min_ranked:
                 output.append(_selection_from_row(min_ranked[0], quantity, "min", min_col, min_pu_col))
     return output
+
+
+def select_rms_rows_from_catalog(
+    catalog: object,
+    settings: object,
+    selected_voltages: Iterable[str] | None = None,
+) -> list[RMSSelection]:
+    """Select RMS rows from an authoritative plotter catalog."""
+    parsed = normalize_rms_settings(settings)
+    if not parsed["enabled"]:
+        return []
+    available_keys = available_mm_row_keys(getattr(catalog, "mm_elements", ()))
+    return select_rms_rows(
+        getattr(catalog, "mm_results", ()),
+        selected_elements=parsed["elements"],
+        selected_quantities=parsed["quantities"],
+        selected_voltages=selected_voltages,
+        available_keys=available_keys,
+        switching_time_mode=parsed["switching_time_mode"],
+        selected_switching_times=parsed["switching_times"],
+        switching_time_start_s=parsed["switching_time_start_s"],
+        switching_time_end_s=parsed["switching_time_end_s"],
+    )
 
 
 def rms_batch_rows(

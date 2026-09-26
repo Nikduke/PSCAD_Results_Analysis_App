@@ -7,6 +7,7 @@ from typing import Any
 
 from results_analysis_app import analysis_engine
 from results_analysis_app import resonance_checks
+from results_analysis_app import rms_analysis
 from results_analysis_app import sustained_sdpf
 from results_analysis_app import voltage_envelope
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
@@ -91,6 +92,7 @@ def build_voltage_envelopes(
     envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
+    envelope_chart_move_labels: bool = True,
     envelope_chart_top_left_cell: str | None = None,
     envelope_chart_width: float | None = None,
     envelope_chart_height: float | None = None,
@@ -98,7 +100,7 @@ def build_voltage_envelopes(
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
     event_times: dict[str, float] | None = None,
-    project_timing_by_project: dict[str, dict[str, float | None]] | None = None,
+    project_timing_by_project: dict[str, dict[str, Any]] | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
     exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
     high_voltage_proposals_by_project: dict[str, list[dict[str, object]]] | None = None,
@@ -163,6 +165,7 @@ def build_voltage_envelopes(
                 envelope_chart_x_major=_project_value(envelope_chart_x_major_by_project, root),
                 envelope_chart_y_limits_by_voltage=envelope_chart_y_limits_by_voltage,
                 envelope_chart_show_sa_label=envelope_chart_show_sa_label,
+                envelope_chart_move_labels=envelope_chart_move_labels,
                 envelope_chart_top_left_cell=envelope_chart_top_left_cell,
                 envelope_chart_width=envelope_chart_width,
                 envelope_chart_height=envelope_chart_height,
@@ -195,6 +198,7 @@ def rebuild_envelope_charts(
     envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
+    envelope_chart_move_labels: bool = True,
     envelope_chart_top_left_cell: str | None = None,
     envelope_chart_width: float | None = None,
     envelope_chart_height: float | None = None,
@@ -238,6 +242,7 @@ def rebuild_envelope_charts(
                             axis_limits_by_voltage=envelope_chart_y_limits_by_voltage,
                             event_times=event_times,
                             show_sa_label=envelope_chart_show_sa_label,
+                            move_labels=envelope_chart_move_labels,
                             chart_top_left_cell=envelope_chart_top_left_cell,
                             chart_size=chart_size,
                         )
@@ -305,6 +310,10 @@ def create_plot_batches(
     rms_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    rms_catalog_context_by_project: Mapping[str, Any] | None = None,
+    rms_selections_by_project: Mapping[
+        str, Iterable[rms_analysis.RMSSelection]
+    ] | None = None,
 ) -> list[Path]:
     """Create scope/event plot batch workbooks from existing envelope workbooks."""
     selected_scopes = list(scopes)
@@ -342,6 +351,8 @@ def create_plot_batches(
                 excel_waveform_exports_enabled=excel_waveform_exports_enabled,
                 sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
                 rms_settings=(rms_settings_by_project or {}).get(str(root)),
+                rms_catalog_context=(rms_catalog_context_by_project or {}).get(str(root)),
+                rms_selections=(rms_selections_by_project or {}).get(str(root)),
             )
         )
     return outputs
@@ -368,6 +379,7 @@ def render_plot_batches(
     rms_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    rms_catalog_context_by_project: Mapping[str, Any] | None = None,
 ) -> None:
     """Render existing scope/event plot batches into generated plot folders."""
     selected_scopes = list(scopes)
@@ -418,6 +430,7 @@ def render_plot_batches(
             excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
             rms_settings=rms_by_project.get(str(root)),
+            rms_catalog_context=(rms_catalog_context_by_project or {}).get(str(root)),
         )
 
 
@@ -466,13 +479,14 @@ def run_analysis_pipeline(
     envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
+    envelope_chart_move_labels: bool = True,
     envelope_chart_top_left_cell: str | None = None,
     envelope_chart_width: float | None = None,
     envelope_chart_height: float | None = None,
     high_voltage_limit_factor: float | None = None,
     nonconv_cb_iip_limit: float | None = None,
     nonconv_cb_iir_limit: float | None = None,
-    project_timing_by_project: dict[str, dict[str, float | None]] | None = None,
+    project_timing_by_project: dict[str, dict[str, Any]] | None = None,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
     exclusions_by_project: dict[str, list[ExclusionRule]] | None = None,
     high_voltage_proposals_by_project: dict[str, list[dict[str, object]]] | None = None,
@@ -491,6 +505,7 @@ def run_analysis_pipeline(
     nonconv_cases_by_project: dict[str, list[Any]] | None = None,
     excel_waveform_exports_enabled: bool = True,
     rms_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    rms_catalog_context_by_project: Mapping[str, Any] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[Path]:
@@ -526,6 +541,7 @@ def run_analysis_pipeline(
             envelope_chart_x_major_by_project=envelope_chart_x_major_by_project,
             envelope_chart_y_limits_by_voltage=envelope_chart_y_limits_by_voltage,
             envelope_chart_show_sa_label=envelope_chart_show_sa_label,
+            envelope_chart_move_labels=envelope_chart_move_labels,
             envelope_chart_top_left_cell=envelope_chart_top_left_cell,
             envelope_chart_width=envelope_chart_width,
             envelope_chart_height=envelope_chart_height,
@@ -549,6 +565,27 @@ def run_analysis_pipeline(
             log=log,
             check_cancel=check_cancel,
         )
+
+        rms_catalog_context = (rms_catalog_context_by_project or {}).get(project_key)
+        rms_selections: list[rms_analysis.RMSSelection] | None = None
+        parsed_rms_settings = rms_analysis.normalize_rms_settings(
+            (rms_settings_by_project or {}).get(project_key)
+        )
+        if parsed_rms_settings["enabled"] and parsed_rms_settings["elements"]:
+            if (
+                rms_catalog_context is None
+                or not rms_catalog_context.mm_results_are_current()
+            ):
+                rms_catalog_context = analysis_engine.load_plotter_catalog(
+                    root,
+                    log,
+                    check_cancel,
+                )
+            rms_selections = rms_analysis.select_rms_rows_from_catalog(
+                rms_catalog_context.catalog,
+                parsed_rms_settings,
+                selected_voltages,
+            )
 
         sustained_payloads_by_scope: dict[str, Mapping[str, Any]] = {}
         sustained_cache_validations_by_scope: dict[
@@ -586,6 +623,16 @@ def run_analysis_pipeline(
             sustained_payloads_by_scope=sustained_payloads_by_scope,
             sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
             rms_settings_by_project=rms_settings_by_project,
+            rms_catalog_context_by_project=(
+                {project_key: rms_catalog_context}
+                if rms_catalog_context is not None
+                else None
+            ),
+            rms_selections_by_project=(
+                {project_key: rms_selections}
+                if rms_selections is not None
+                else None
+            ),
             log=log,
             check_cancel=check_cancel,
         )
@@ -606,6 +653,11 @@ def run_analysis_pipeline(
             sustained_voltage_keys=selected_voltages,
             excel_waveform_exports_enabled=excel_waveform_exports_enabled,
             rms_settings_by_project=rms_settings_by_project,
+            rms_catalog_context_by_project=(
+                {project_key: rms_catalog_context}
+                if rms_catalog_context is not None
+                else None
+            ),
             log=log,
             check_cancel=check_cancel,
         )
@@ -631,6 +683,11 @@ def run_analysis_pipeline(
                 },
                 event_times=event_times,
                 rms_settings_by_project=rms_settings_by_project,
+                rms_selections_by_project=(
+                    {project_key: rms_selections}
+                    if rms_selections is not None
+                    else None
+                ),
                 log=log,
                 check_cancel=check_cancel,
             )

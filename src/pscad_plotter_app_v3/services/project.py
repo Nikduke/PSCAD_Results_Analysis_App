@@ -500,6 +500,26 @@ class ResultsCatalogService:
     MM_FILENAME = "MM results.csv"
     MM_CSV_CACHE_VERSION = 3
 
+    def load_mm_results(
+        self,
+        path: Path,
+        cache: CatalogCache | None = None,
+    ) -> list[dict[str, object]]:
+        """Load MM rows through the shared cache-aware parser."""
+        if not path.is_file():
+            return []
+        cached = (
+            cache.load_mm_results(path, self.MM_CSV_CACHE_VERSION)
+            if cache is not None
+            else None
+        )
+        if cached is not None:
+            return cached
+        rows = self._load_mm_results(path)
+        if cache is not None:
+            cache.store_mm_results(path, self.MM_CSV_CACHE_VERSION, rows)
+        return rows
+
     def build_base_catalog(
         self,
         context: ProjectContext,
@@ -511,13 +531,7 @@ class ResultsCatalogService:
 
         mm_path = context.results_dir / self.MM_FILENAME
         if mm_path.exists():
-            cached_mm = cache.load_mm_results(mm_path, self.MM_CSV_CACHE_VERSION) if cache is not None else None
-            if cached_mm is None:
-                mm_rows = self._load_mm_results(mm_path)
-                if cache is not None:
-                    cache.store_mm_results(mm_path, self.MM_CSV_CACHE_VERSION, mm_rows)
-            else:
-                mm_rows = cached_mm
+            mm_rows = self.load_mm_results(mm_path, cache)
             catalog.mm_results = list(mm_rows)
             catalog.mm_elements = self._build_mm_elements(mm_rows, run_index)
 

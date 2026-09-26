@@ -48,6 +48,11 @@ SLIM_EXCLUDES = [
 
 
 DROP_BUNDLE_NAMES = {
+    # Poppler's ICU 78 DLL exports version-suffixed symbols.  Qt6Core links
+    # against the unversioned Windows ICU API, so bundling that DLL causes
+    # Qt6Core to bind the wrong ABI at startup.
+    'icuuc.dll',
+    'icudt78.dll',
     'PySide6\\opengl32sw.dll',
     'PySide6\\Qt6Network.dll',
     'PySide6\\Qt6OpenGL.dll',
@@ -174,8 +179,8 @@ a = Analysis(
     datas=[('src\\results_analysis_app\\assets\\mpe_app_icon.ico', 'results_analysis_app\\assets')],
     hiddenimports=hiddenimports,
     hookspath=[],
+    runtime_hooks=['src\\runtime_hooks\\pyside6_dll_path.py'],
     hooksconfig={},
-    runtime_hooks=[],
     excludes=SLIM_EXCLUDES,
     noarchive=False,
     optimize=1,

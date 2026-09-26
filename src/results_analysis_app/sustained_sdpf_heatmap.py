@@ -9,6 +9,7 @@ the engineering calculation.
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import textwrap
@@ -41,6 +42,8 @@ HEATMAP_CLEAR_COLOR = "#d9ead3"
 HEATMAP_INELIGIBLE_COLOR = "#e5e7eb"
 HEATMAP_TEXT_DARK = "#111827"
 HEATMAP_TEXT_LIGHT = "#ffffff"
+HEATMAP_GRID_COLOR = "#9ca3af"
+HEATMAP_GOVERNING_COLOR = "#4b1d95"
 # Keep actual violations red and margin-only cells gold/amber.  The custom
 # ramps avoid the brown endpoint produced by YlOrBr while preserving severity
 # ordering within each category.
@@ -63,10 +66,10 @@ HEATMAP_GROUP_BAND_IN = 0.32
 HEATMAP_PANEL_TITLE_BAND_IN = 0.36
 HEATMAP_MATRIX_MIN_HEIGHT_IN = 2.35
 HEATMAP_ROW_HEIGHT_IN = 0.50
-HEATMAP_FOOTER_BAND_IN = 0.60
+HEATMAP_FOOTER_BAND_IN = 1.40
 HEATMAP_BAND_GAP_IN = 0.06
 HEATMAP_PANEL_GAP_IN = 0.14
-HEATMAP_MIN_FIG_WIDTH_IN = 8.0
+HEATMAP_MIN_FIG_WIDTH_IN = 10.5
 HEATMAP_MAX_FIG_WIDTH_IN = 42.0
 
 
@@ -932,13 +935,6 @@ def build_heatmap_layout(
                 cells[(y_value, case, split_value)] = HeatmapCell(
                     y_value, case, split_value, eligible, actual, margin
                 )
-    actual_max = max((cell.actual_count for cell in cells.values()), default=0)
-    use_actual = actual_max > 0
-    target = actual_max if use_actual else max((cell.margin_count for cell in cells.values()), default=0)
-    governing = frozenset(
-        key for key, cell in cells.items()
-        if target > 0 and (cell.actual_count if use_actual else cell.margin_count) == target
-    )
     actual_scale_max = max(
         (cell.actual_percent for cell in cells.values() if cell.actual_count > 0),
         default=0.0,
@@ -946,6 +942,22 @@ def build_heatmap_layout(
     margin_scale_max = max(
         (cell.margin_only_percent for cell in cells.values() if cell.margin_only_count > 0),
         default=0.0,
+    )
+    # Keep actual-limit findings as the primary category when any exist.  The
+    # governing outline then identifies the highest incidence percentage in
+    # that category, rather than the cell with the largest raw count.  When
+    # no actual finding exists, use the corresponding margin-only percentage.
+    use_actual = actual_scale_max > 0
+    target = actual_scale_max if use_actual else margin_scale_max
+    governing = frozenset(
+        key for key, cell in cells.items()
+        if target > 0
+        and math.isclose(
+            cell.actual_percent if use_actual else cell.margin_only_percent,
+            target,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     )
     return HeatmapLayout(
         parsed,
@@ -1333,15 +1345,6 @@ def _panel_title(
     return ""
 
 
-def _heatmap_cell_label(cell: HeatmapCell) -> str:
-    """Return top/bottom SDPF and safety-margin incidence lines."""
-    if not cell.has_eligible_data:
-        return "—"
-    actual = format_incidence(cell.actual_count, cell.eligible_count)
-    margin = format_incidence(cell.margin_count, cell.eligible_count)
-    return f"{actual}\n{margin}"
-
-
 def _case_tick_label(case: str) -> str:
     """Keep the full case identity while wrapping it at predictable widths."""
     text = str(case)
@@ -1658,7 +1661,7 @@ def _title_lines(title: str, figure_width: float) -> tuple[str, ...]:
         )
     )
     if len(lines) > 1:
-        lines[1:] = [line.lstrip("· ").strip() for line in lines[1:]]
+        lines[1:] = [line.lstrip("·— ").strip() for line in lines[1:]]
     return tuple(lines) or (title,)
 
 
@@ -1813,27 +1816,55 @@ def _draw_heatmap_panel(
                 Rectangle(
                     (x_index, y_index), 1, 1,
                     facecolor=cell_color,
-                    edgecolor="white",
-                    linewidth=0.8,
+                    edgecolor=HEATMAP_GRID_COLOR,
+                    linewidth=0.55,
                 )
             )
-            label = _heatmap_cell_label(cell)
+            if not cell.has_eligible_data:
+                ax.text(
+                    x_index + 0.5,
+                    y_index + 0.5,
+                    "—",
+                    ha="center",
+                    va="center",
+                    fontsize=7 if n_cols > 16 else 8,
+                    color=text_color,
+                )
+                continue
+            fontsize = 7 if n_cols > 16 else 8
             ax.text(
                 x_index + 0.5,
-                y_index + 0.5,
-                label,
+                y_index + 0.37,
+                format_incidence(cell.actual_count, cell.eligible_count),
                 ha="center",
                 va="center",
-                fontsize=7 if n_cols > 16 else 8,
+                fontsize=fontsize,
                 color=text_color,
-                linespacing=0.9,
+                fontweight="bold" if cell.actual_count > 0 else "normal",
+            )
+            ax.plot(
+                [x_index + 0.34, x_index + 0.66],
+                [y_index + 0.50, y_index + 0.50],
+                color=HEATMAP_TEXT_LIGHT if text_color == HEATMAP_TEXT_LIGHT else HEATMAP_GRID_COLOR,
+                linewidth=0.65,
+                clip_on=False,
+            )
+            ax.text(
+                x_index + 0.5,
+                y_index + 0.63,
+                format_incidence(cell.margin_count, cell.eligible_count),
+                ha="center",
+                va="center",
+                fontsize=fontsize,
+                color=text_color,
+                fontweight="bold" if cell.margin_count > 0 else "normal",
             )
             if (y_value, case, split_value) in layout.governing_keys:
                 ax.add_patch(
                     Rectangle(
                         (x_index + 0.03, y_index + 0.03), 0.94, 0.94,
                         fill=False,
-                        edgecolor=text_color,
+                        edgecolor=HEATMAP_GOVERNING_COLOR,
                         linewidth=2.5,
                     )
                 )
@@ -1842,42 +1873,235 @@ def _draw_heatmap_panel(
     ax.grid(False)
 
 
-def _heatmap_legend_handles():
-    from matplotlib.patches import Patch
+def _draw_heatmap_scale(
+    footer_ax,
+    *,
+    x: float,
+    width: float,
+    label: str,
+    cmap,
+    maximum: float,
+    empty_label: str,
+) -> None:
+    """Draw one gradient using the maximum represented by the heatmap."""
+    from matplotlib.patches import Rectangle
 
-    return [
-        Patch(facecolor=HEATMAP_CLEAR_COLOR, edgecolor="none", label="No exceedance"),
-        Patch(facecolor=HEATMAP_MARGIN_COLORS[2], edgecolor="none", label="Margin only"),
-        Patch(facecolor=HEATMAP_ACTUAL_COLORS[2], edgecolor="none", label="SDPF exceedance"),
-        Patch(facecolor=HEATMAP_INELIGIBLE_COLOR, edgecolor="none", label="No eligible data"),
-    ]
+    steps = 8
+    box_width = width / steps
+    footer_ax.text(
+        x + width / 2,
+        0.92,
+        label,
+        transform=footer_ax.transAxes,
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+        va="top",
+        ha="center",
+        linespacing=1.05,
+    )
+    for index in range(steps):
+        footer_ax.add_patch(
+            Rectangle(
+                (x + index * box_width, 0.57),
+                box_width,
+                0.15,
+                transform=footer_ax.transAxes,
+                facecolor=cmap(index / (steps - 1)),
+                edgecolor="none",
+            )
+        )
+    if maximum > 0:
+        footer_ax.text(
+            x,
+            0.49,
+            "0%",
+            transform=footer_ax.transAxes,
+            fontsize=7.5,
+            color="#4b5563",
+            ha="left",
+        )
+        footer_ax.text(
+            x + width / 2,
+            0.49,
+            _format_heatmap_scale_value(maximum / 2),
+            transform=footer_ax.transAxes,
+            fontsize=7.5,
+            color="#4b5563",
+            ha="center",
+        )
+        footer_ax.text(
+            x + width,
+            0.49,
+            _format_heatmap_scale_value(maximum, suffix=" max"),
+            transform=footer_ax.transAxes,
+            fontsize=7.5,
+            color="#4b5563",
+            ha="right",
+        )
+    else:
+        footer_ax.text(
+            x + width / 2,
+            0.49,
+            empty_label,
+            transform=footer_ax.transAxes,
+            fontsize=7.5,
+            color="#4b5563",
+            ha="center",
+        )
 
 
-def _add_heatmap_footer(footer_ax, *, columns: int = 2) -> None:
-    footer_ax.set_axis_off()
-    footer_ax.legend(
-        handles=_heatmap_legend_handles(),
-        loc="center",
-        bbox_to_anchor=(0.5, 0.68),
-        ncol=columns,
-        fontsize=8.5,
-        frameon=False,
-        handlelength=1.25,
-        handleheight=0.8,
-        handletextpad=0.45,
-        columnspacing=1.25,
-        borderaxespad=0,
+def _format_heatmap_scale_value(value: float, *, suffix: str = "") -> str:
+    """Format a percentage scale label without hiding small nonzero values."""
+    if value < 1:
+        return f"{value:.2f}%{suffix}"
+    if value < 10:
+        return f"{value:.1f}%{suffix}"
+    return f"{value:.0f}%{suffix}"
+
+
+def _draw_heatmap_swatch(footer_ax, *, x: float, label: str, color: str) -> None:
+    """Draw one categorical colour swatch with its centered description."""
+    from matplotlib.patches import Rectangle
+
+    footer_ax.text(
+        x + 0.045,
+        0.92,
+        label,
+        transform=footer_ax.transAxes,
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+        va="top",
+        ha="center",
+        linespacing=1.05,
+    )
+    footer_ax.add_patch(
+        Rectangle(
+            (x + 0.025, 0.57),
+            0.04,
+            0.15,
+            transform=footer_ax.transAxes,
+            facecolor=color,
+            edgecolor="none",
+        )
+    )
+
+
+def _draw_heatmap_example(footer_ax) -> None:
+    """Explain the two stacked values with one neutral example cell."""
+    from matplotlib.patches import Rectangle
+
+    cell_x, cell_y, cell_w, cell_h = 0.72, 0.55, 0.05, 0.24
+    footer_ax.text(
+        cell_x + cell_w / 2,
+        0.92,
+        "Example",
+        transform=footer_ax.transAxes,
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+        va="top",
+        ha="center",
+    )
+    footer_ax.add_patch(
+        Rectangle(
+            (cell_x, cell_y),
+            cell_w,
+            cell_h,
+            transform=footer_ax.transAxes,
+            facecolor="white",
+            edgecolor=HEATMAP_GRID_COLOR,
+            linewidth=0.8,
+        )
     )
     footer_ax.text(
-        0.5,
-        0.08,
-        "Top: SDPF  ·  Bottom: SDPF/1.15 (including SDPF)  ·  —: no eligible data  ·  <1%: nonzero",
+        cell_x + cell_w / 2,
+        cell_y + cell_h * 0.72,
+        "6%",
         transform=footer_ax.transAxes,
         ha="center",
-        va="bottom",
-        fontsize=7.5,
-        color="#4b5563",
+        va="center",
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
     )
+    footer_ax.plot(
+        [cell_x + cell_w * 0.18, cell_x + cell_w * 0.82],
+        [cell_y + cell_h / 2] * 2,
+        transform=footer_ax.transAxes,
+        color=HEATMAP_GRID_COLOR,
+        linewidth=0.65,
+        clip_on=False,
+    )
+    footer_ax.text(
+        cell_x + cell_w / 2,
+        cell_y + cell_h * 0.28,
+        "18%",
+        transform=footer_ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+    )
+    footer_ax.text(
+        cell_x + cell_w + 0.015,
+        cell_y + cell_h * 0.72,
+        "Actual SDPF-limit exceedance (%)",
+        transform=footer_ax.transAxes,
+        ha="left",
+        va="center",
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+    )
+    footer_ax.text(
+        cell_x + cell_w + 0.015,
+        cell_y + cell_h * 0.28,
+        "Safety-threshold exceedance (%)",
+        transform=footer_ax.transAxes,
+        ha="left",
+        va="center",
+        fontsize=8,
+        color=HEATMAP_TEXT_DARK,
+    )
+
+
+def _add_heatmap_footer(
+    footer_ax,
+    *,
+    actual_scale_max: float = 0.0,
+    margin_scale_max: float = 0.0,
+) -> None:
+    """Draw the shared heatmap colour key and stacked-value example."""
+    footer_ax.set_axis_off()
+    actual_cmap, margin_cmap = _heatmap_colormaps()
+    _draw_heatmap_scale(
+        footer_ax,
+        x=0.005,
+        width=0.22,
+        label="Safety-threshold exceedance\nonly",
+        cmap=margin_cmap,
+        maximum=margin_scale_max,
+        empty_label="No margin-only exceedance",
+    )
+    _draw_heatmap_scale(
+        footer_ax,
+        x=0.245,
+        width=0.22,
+        label="Actual SDPF-limit\nexceedance",
+        cmap=actual_cmap,
+        maximum=actual_scale_max,
+        empty_label="No actual exceedance",
+    )
+    _draw_heatmap_swatch(
+        footer_ax,
+        x=0.470,
+        label="No duration-qualified\nexceedance",
+        color=HEATMAP_CLEAR_COLOR,
+    )
+    _draw_heatmap_swatch(
+        footer_ax,
+        x=0.585,
+        label="No eligible\nRun–MM",
+        color=HEATMAP_INELIGIBLE_COLOR,
+    )
+    _draw_heatmap_example(footer_ax)
 
 
 def _title_with_split(
@@ -1896,7 +2120,7 @@ def _title_with_split(
         )
         for value in values
     ]
-    return f"{title} · Split: {', '.join(display_values)}"
+    return f"{title} — Split: {', '.join(display_values)}"
 
 
 def _heatmap_figure_width(labels: Sequence[str]) -> float:
@@ -2006,7 +2230,11 @@ def _plot_layout(
     )
     if "labels" in axes:
         _draw_case_labels(axes["labels"], case_labels)
-    _add_heatmap_footer(footer_ax, columns=4)
+    _add_heatmap_footer(
+        footer_ax,
+        actual_scale_max=layout.actual_scale_max,
+        margin_scale_max=layout.margin_scale_max,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=HEATMAP_RENDER_DPI, facecolor="white")
     plt.close(fig)
@@ -2109,7 +2337,11 @@ def _plot_faceted_layout(
         if label_ax is not None:
             _draw_case_labels(label_ax, panel_labels[panel_index])
     footer_ax = band_axes["footer"]
-    _add_heatmap_footer(footer_ax, columns=4)
+    _add_heatmap_footer(
+        footer_ax,
+        actual_scale_max=layout.actual_scale_max,
+        margin_scale_max=layout.margin_scale_max,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=HEATMAP_RENDER_DPI, facecolor="white")
     plt.close(fig)
@@ -2329,8 +2561,11 @@ def generate_heatmaps(
     title_parts = [f"{voltage} kV"]
     if title_prefix:
         title_parts.append(display_heatmap_set_name(title_prefix, parsed))
-    title_parts.append("Sustained SDPF incidence")
-    title = " · ".join(title_parts)
+    duration_ms = float(sustained_settings.duration_ms)
+    title_parts.append(
+        f"SDPF threshold exceedance (duration ≥ {duration_ms:g} ms)"
+    )
+    title = " — ".join(title_parts)
     jobs: list[_HeatmapRenderJob] = []
     if combine_panels:
         max_panels = max(1, layout.settings.max_panels_per_heatmap)

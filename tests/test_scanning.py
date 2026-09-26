@@ -37,6 +37,34 @@ def test_project_frequency_reads_input_data_b16(tmp_path) -> None:
     assert load_project_frequency(tmp_path) == 60.0
 
 
+def test_project_timing_reads_switch_type_from_input_data_b5(tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app.project_config import load_project_timing
+
+    workbook = Workbook()
+    workbook.active.title = "Input_Data"
+    workbook["Input_Data"]["B5"] = "Random"
+    workbook.save(tmp_path / "Input_Data_PSCAD_Python_v11.xlsx")
+    workbook.close()
+
+    assert load_project_timing(tmp_path).switch_type == "Random"
+
+
+def test_project_scan_carries_switch_type_from_input_data(tmp_path) -> None:
+    from openpyxl import Workbook
+
+    from results_analysis_app import scanner
+
+    workbook = Workbook()
+    workbook.active.title = "Input_Data"
+    workbook["Input_Data"]["B5"] = "Sequential"
+    workbook.save(tmp_path / "Input_Data_PSCAD_Python_v11.xlsx")
+    workbook.close()
+
+    assert scanner.scan_project(tmp_path).switch_type == "Sequential"
+
+
 def test_shared_float_parser_rejects_nonfinite_values() -> None:
     from results_analysis_app.common import as_float
 
@@ -390,6 +418,7 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
             "66": SDPFVoltageLimits(66.0, 140.0, 140.0),
         },
         sustained_sdpf_limit_warnings=["example warning"],
+        switch_type="Random",
     )
     cache_path = tmp_path / "project_scan_cache.json"
 
@@ -416,6 +445,7 @@ def test_project_scan_cache_reuses_unchanged_scan_and_invalidates_changed_inputs
     assert cached.voltage_configs["66"].um == 72.0
     assert cached.sustained_sdpf_limits["66"].rms("LGp") == 140.0
     assert cached.sustained_sdpf_limit_warnings == ["example warning"]
+    assert cached.switch_type == "Random"
     assert cached.high_voltage_exclusions[0].source == "Both"
     assert cached.high_voltage_exclusions[0].excluded is True
     inf_path.write_text(inf_path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")

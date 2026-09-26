@@ -23,6 +23,7 @@ class VoltageConfig:
 class ProjectTiming:
     frequency: float | None = None
     final_duration: float | None = None
+    switch_type: str = "None"
 
 
 def normalize_voltage(value: Any) -> str:
@@ -60,6 +61,12 @@ def _positive_number(value: Any) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _switch_type(value: Any) -> str:
+    """Return the project switch type, using ``None`` for a blank cell."""
+    text = str(value or "").strip()
+    return text or "None"
+
+
 def load_project_timing(project_root: str | Path) -> ProjectTiming:
     workbook_path = input_data_workbook(project_root)
     if workbook_path is None:
@@ -91,6 +98,7 @@ def load_project_timing(project_root: str | Path) -> ProjectTiming:
         return ProjectTiming(
             frequency=values.get("frequency") or _positive_number(sheet["B16"].value),
             final_duration=values.get("final duration"),
+            switch_type=_switch_type(sheet["B5"].value),
         )
     finally:
         workbook.close()

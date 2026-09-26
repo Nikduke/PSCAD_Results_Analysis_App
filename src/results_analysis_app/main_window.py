@@ -3,12 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import math
 import threading
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from results_analysis_app import (
+    analysis_engine,
     actions,
     project_scan_cache,
     project_scan_runner,
@@ -108,7 +110,7 @@ class _VoltagePopupContent(QtWidgets.QWidget):
 
 
 class _RMSPopupContent(QtWidgets.QWidget):
-    """Project-specific RMS quantity and MM-element selections."""
+    """Project-specific RMS quantity, element, and time selections."""
 
     _CHILD_INDENT = 20
     _BRANCH_OFFSET = 8
@@ -117,16 +119,22 @@ class _RMSPopupContent(QtWidgets.QWidget):
         self,
         quantity_checks: Iterable[QtWidgets.QCheckBox],
         element_checks: Iterable[QtWidgets.QCheckBox],
+        switching_time_checks: Iterable[QtWidgets.QCheckBox] = (),
+        switching_time_start_edit: QtWidgets.QLineEdit | None = None,
+        switching_time_end_edit: QtWidgets.QLineEdit | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.quantity_checks = list(quantity_checks)
         self.element_checks = list(element_checks)
+        self.switching_time_checks = list(switching_time_checks)
+        self.switching_time_start_edit = switching_time_start_edit
+        self.switching_time_end_edit = switching_time_end_edit
         self.element_rows: list[QtWidgets.QWidget] = []
-        self.setMinimumWidth(220)
+        self.setMinimumWidth(400)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 3, 8, 3)
-        layout.setSpacing(0)
+        layout.setSpacing(4)
         quantity_label = QtWidgets.QLabel("Quantities", self)
         quantity_label.setStyleSheet("font-weight: 600;")
         layout.addWidget(quantity_label)
@@ -138,9 +146,16 @@ class _RMSPopupContent(QtWidgets.QWidget):
             quantity_layout.addWidget(check)
         quantity_layout.addStretch(1)
         layout.addWidget(quantity_row)
+
+        columns = QtWidgets.QHBoxLayout()
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(14)
+        element_column = QtWidgets.QVBoxLayout()
+        element_column.setContentsMargins(0, 0, 0, 0)
+        element_column.setSpacing(0)
         element_label = QtWidgets.QLabel("MM elements", self)
         element_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(element_label)
+        element_column.addWidget(element_label)
         for check in self.element_checks:
             row = QtWidgets.QWidget(self)
             row_layout = QtWidgets.QHBoxLayout(row)
@@ -149,8 +164,41 @@ class _RMSPopupContent(QtWidgets.QWidget):
             row_layout.addWidget(check)
             row_layout.addStretch(1)
             row.setMinimumHeight(check.sizeHint().height())
-            layout.addWidget(row)
+            element_column.addWidget(row)
             self.element_rows.append(row)
+        if not self.element_checks:
+            element_column.addWidget(QtWidgets.QLabel("No MM elements available", self))
+        element_column.addStretch(1)
+        columns.addLayout(element_column, 1)
+
+        switching_column = QtWidgets.QVBoxLayout()
+        switching_column.setContentsMargins(0, 0, 0, 0)
+        switching_column.setSpacing(0)
+        switching_label = QtWidgets.QLabel("Switching times", self)
+        switching_label.setStyleSheet("font-weight: 600;")
+        switching_column.addWidget(switching_label)
+        if self.switching_time_checks:
+            for check in self.switching_time_checks:
+                row = QtWidgets.QWidget(self)
+                row_layout = QtWidgets.QHBoxLayout(row)
+                row_layout.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
+                row_layout.setSpacing(0)
+                row_layout.addWidget(check)
+                row_layout.addStretch(1)
+                row.setMinimumHeight(check.sizeHint().height())
+                switching_column.addWidget(row)
+        elif self.switching_time_start_edit is not None and self.switching_time_end_edit is not None:
+            form = QtWidgets.QFormLayout()
+            form.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
+            form.setSpacing(3)
+            form.addRow("Start time [s]", self.switching_time_start_edit)
+            form.addRow("End time [s]", self.switching_time_end_edit)
+            switching_column.addLayout(form)
+        else:
+            switching_column.addWidget(QtWidgets.QLabel("No switching times available", self))
+        switching_column.addStretch(1)
+        columns.addLayout(switching_column, 1)
+        layout.addLayout(columns)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 - Qt override name
         super().paintEvent(event)
@@ -315,7 +363,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.ensure_full_scope()
         self.project_scans: dict[str, scanner.ProjectScan] = {}
         self.dashboard_figures: dict[str, list[DashboardFigure]] = {}
-        self._mm_catalog_by_project: dict[str, Any] = {}
+        self._preview_cache: dict[
+            tuple[str, int, str, tuple[str, ...]],
+            scanner.ScopePreview,
+        ] = {}
+        self._mm_catalog_context_by_project: dict[str, Any] = {}
+        self._rms_selector_values_by_project: dict[
+            str,
+            tuple[tuple[int, int], list[str], list[float]],
+        ] = {}
+        self._rms_catalog_workers: dict[
+            str,
+            tuple[BackgroundTask, CancelToken],
+        ] = {}
         self._fault_types_by_project: dict[str, dict[tuple[str, int], str]] = {}
         self._high_voltage_groups_by_project: dict[
             str,
@@ -346,11 +406,6 @@ class MainWindow(QtWidgets.QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 6)
         root_layout.setSpacing(6)
 
-        self.project_header = QtWidgets.QLabel(root)
-        self.project_header.setObjectName("projectHeader")
-        self.project_header.setFixedHeight(22)
-        self.project_header.setText("PSCAD Results Analysis")
-        root_layout.addWidget(self.project_header)
         root_layout.addWidget(self._build_top_bar(root))
 
         self.workspace_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, root)
@@ -413,22 +468,30 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addSpacing(6)
 
     def _build_top_bar(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
-        bar = self._panel(parent)
+        bar = QtWidgets.QWidget(parent)
+        bar.setObjectName("topBar")
         layout = QtWidgets.QHBoxLayout(bar)
-        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.settings_button = QtWidgets.QPushButton("Settings", bar)
+        self.project_controls_group = QtWidgets.QGroupBox("Project: —", bar)
+        self.project_controls_group.setObjectName("projectControlsGroup")
+        project_layout = QtWidgets.QHBoxLayout(self.project_controls_group)
+        project_layout.setContentsMargins(8, 5, 8, 5)
+        project_layout.setSpacing(6)
+        layout.addWidget(self.project_controls_group, 1)
+
+        self.settings_button = QtWidgets.QPushButton("Settings", self.project_controls_group)
         self.settings_button.setMinimumWidth(88)
         apply_secondary_button_style(self.settings_button)
         self.settings_button.setToolTip("Analysis and chart settings.")
         self.settings_button.clicked.connect(self.open_settings_dialog)
-        layout.addWidget(self.settings_button)
+        project_layout.addWidget(self.settings_button)
 
-        layout.addSpacing(12)
+        project_layout.addSpacing(12)
         self.voltage_checks: dict[str, QtWidgets.QCheckBox] = {}
         self.all_voltages_check: QtWidgets.QCheckBox | None = None
-        self.voltage_button = QtWidgets.QPushButton("Voltages", bar)
+        self.voltage_button = QtWidgets.QPushButton("Voltages", self.project_controls_group)
         self.voltage_button.setMinimumWidth(96)
         apply_secondary_button_style(self.voltage_button)
         self.voltage_button.setToolTip(
@@ -436,24 +499,24 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.voltage_menu = QtWidgets.QMenu(self.voltage_button)
         self.voltage_button.setMenu(self.voltage_menu)
-        layout.addWidget(self.voltage_button)
+        project_layout.addWidget(self.voltage_button)
 
-        self._add_top_bar_divider(layout, bar)
-        layout.addWidget(make_section_label("Envelopes:", bar))
+        self._add_top_bar_divider(project_layout, self.project_controls_group)
+        project_layout.addWidget(make_section_label("Envelopes:", self.project_controls_group))
         self.event_checks: dict[str, QtWidgets.QCheckBox] = {}
         for event in DEFAULT_EVENTS:
-            check = QtWidgets.QCheckBox(event, bar)
+            check = QtWidgets.QCheckBox(event, self.project_controls_group)
             check.toggled.connect(self._on_global_selection_changed)
             self.event_checks[event] = check
-            layout.addWidget(check)
+            project_layout.addWidget(check)
 
-        self._add_top_bar_divider(layout, bar)
-        layout.addWidget(make_section_label("Analysis:", bar))
-        self.rms_checkbox = QtWidgets.QCheckBox(bar)
+        self._add_top_bar_divider(project_layout, self.project_controls_group)
+        project_layout.addWidget(make_section_label("Analysis:", self.project_controls_group))
+        self.rms_checkbox = QtWidgets.QCheckBox(self.project_controls_group)
         self.rms_checkbox.setToolTip("Enable project-specific RMS voltage analysis.")
         self.rms_checkbox.toggled.connect(self._on_global_selection_changed)
-        layout.addWidget(self.rms_checkbox)
-        self.rms_button = QtWidgets.QPushButton("RMS", bar)
+        project_layout.addWidget(self.rms_checkbox)
+        self.rms_button = QtWidgets.QPushButton("RMS", self.project_controls_group)
         self.rms_button.setMinimumWidth(52)
         apply_secondary_button_style(self.rms_button)
         self.rms_button.setToolTip("Select RMS quantity and MM elements for the current project.")
@@ -461,9 +524,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rms_button.setMenu(self.rms_menu)
         self.rms_quantity_checks: dict[str, QtWidgets.QCheckBox] = {}
         self.rms_element_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.rms_switching_time_checks: dict[float, QtWidgets.QCheckBox] = {}
+        self.rms_switching_time_mode = rms_analysis.RMS_SWITCHING_TIME_MODE_ALL
+        self.rms_switching_time_start_edit: QtWidgets.QLineEdit | None = None
+        self.rms_switching_time_end_edit: QtWidgets.QLineEdit | None = None
         self.rms_popup_content: _RMSPopupContent | None = None
         self.rms_popup_scroll: QtWidgets.QScrollArea | None = None
-        layout.addWidget(self.rms_button)
+        project_layout.addWidget(self.rms_button)
         resonance_short_labels = {
             "Post_Event_Stress": "Stress",
             "Late_Growth": "Late",
@@ -471,61 +538,82 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         self.resonance_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
         for check_name in DEFAULT_RESONANCE_CHECKS:
-            check = QtWidgets.QCheckBox(resonance_short_labels.get(check_name, check_name), bar)
+            check = QtWidgets.QCheckBox(
+                resonance_short_labels.get(check_name, check_name),
+                self.project_controls_group,
+            )
             check.setToolTip(resonance_checks.CHECK_DEFINITIONS[check_name]["label"])
             check.toggled.connect(self._on_global_selection_changed)
             self.resonance_checkboxes[check_name] = check
-            layout.addWidget(check)
-        self.sustained_sdpf_checkbox = QtWidgets.QCheckBox("SDPF", bar)
+            project_layout.addWidget(check)
+        self.sustained_sdpf_checkbox = QtWidgets.QCheckBox(
+            "SDPF",
+            self.project_controls_group,
+        )
         self.sustained_sdpf_checkbox.setToolTip("Sustained SDPF Stress")
         self.sustained_sdpf_checkbox.toggled.connect(self._on_global_selection_changed)
-        layout.addWidget(self.sustained_sdpf_checkbox)
+        project_layout.addWidget(self.sustained_sdpf_checkbox)
+        project_layout.addStretch(1)
 
-        layout.addStretch(1)
+        self.action_group = QtWidgets.QGroupBox("Actions", bar)
+        self.action_group.setObjectName("actionGroup")
+        action_layout = QtWidgets.QHBoxLayout(self.action_group)
+        action_layout.setContentsMargins(8, 5, 8, 5)
+        action_layout.setSpacing(6)
+        layout.addWidget(self.action_group)
 
-        self.scan_dashboard_figures_button = QtWidgets.QPushButton("Scan figures", bar)
+        self.scan_dashboard_figures_button = QtWidgets.QPushButton(
+            "Scan figures",
+            self.action_group,
+        )
         self.scan_dashboard_figures_button.setMinimumWidth(106)
         apply_secondary_button_style(self.scan_dashboard_figures_button)
         self.scan_dashboard_figures_button.setToolTip(
             "Read dashboard chart names from existing dashboard files without refreshing Excel data."
         )
         self.scan_dashboard_figures_button.clicked.connect(self.scan_dashboard_figures)
-        layout.addWidget(self.scan_dashboard_figures_button)
+        action_layout.addWidget(self.scan_dashboard_figures_button)
 
-        self.refresh_dashboards_button = QtWidgets.QPushButton("Dashboards update", bar)
+        self.refresh_dashboards_button = QtWidgets.QPushButton(
+            "Dashboards update",
+            self.action_group,
+        )
         self.refresh_dashboards_button.setMinimumWidth(148)
         apply_choice_button_style(self.refresh_dashboards_button)
         self.refresh_dashboards_button.setToolTip(
             "Refresh dashboard workbook data in Excel, then scan available dashboard figures."
         )
         self.refresh_dashboards_button.clicked.connect(self.refresh_dashboards)
-        layout.addWidget(self.refresh_dashboards_button)
+        action_layout.addWidget(self.refresh_dashboards_button)
 
-        self.run_full_button = QtWidgets.QPushButton("Run analysis", bar)
+        self.run_full_button = QtWidgets.QPushButton("Run analysis", self.action_group)
         self.run_full_button.setMinimumWidth(116)
         apply_run_button_style(self.run_full_button)
         self.run_full_button.setToolTip(
             "Build envelopes, create plot batches, render plots, and build reports. Dashboards are not updated."
         )
         self.run_full_button.clicked.connect(self.run_full_analysis)
-        layout.addWidget(self.run_full_button)
+        action_layout.addWidget(self.run_full_button)
 
-        self.build_reports_button = QtWidgets.QPushButton("Rebuild reports", bar)
+        self.build_reports_button = QtWidgets.QPushButton(
+            "Rebuild reports",
+            self.action_group,
+        )
         self.build_reports_button.setMinimumWidth(128)
         apply_choice_button_style(self.build_reports_button)
         self.build_reports_button.setToolTip(
             "Create DOCX reports only. This does not run envelopes, batches, plots, or dashboard update."
         )
         self.build_reports_button.clicked.connect(self.build_reports_only)
-        layout.addWidget(self.build_reports_button)
+        action_layout.addWidget(self.build_reports_button)
 
-        self.stop_button = QtWidgets.QPushButton("Stop", bar)
+        self.stop_button = QtWidgets.QPushButton("Stop", self.action_group)
         self.stop_button.setMinimumWidth(66)
         apply_stop_button_style(self.stop_button)
         self.stop_button.setEnabled(False)
         self.stop_button.setToolTip("Stop after the current file or Excel operation finishes.")
         self.stop_button.clicked.connect(self.stop_current_task)
-        layout.addWidget(self.stop_button)
+        action_layout.addWidget(self.stop_button)
 
         return bar
 
@@ -945,7 +1033,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reload_project_tree()
             self._reload_scope_list()
             self._reload_project_exclusions()
-            self._load_project_analysis_options(self._current_project_path())
+            self._load_project_analysis_options(
+                self._current_project_path(),
+                load_catalog=False,
+            )
             self._update_project_header()
         finally:
             self._loading = was_loading
@@ -1012,7 +1103,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._loading:
             self._sync_global_selections_from_ui()
 
-    def _load_project_analysis_options(self, project_path: str | None) -> None:
+    def _load_project_analysis_options(
+        self,
+        project_path: str | None,
+        *,
+        load_catalog: bool = False,
+    ) -> None:
         """Load project-scoped analysis and RMS choices without changing legacy sessions."""
         selected_analysis = set(self._analysis_selection_for_project(project_path))
         has_project_selection = bool(
@@ -1024,9 +1120,13 @@ class MainWindow(QtWidgets.QMainWindow):
             for check_name, check in self.resonance_checkboxes.items():
                 check.setChecked(check_name in selected_analysis)
             self.sustained_sdpf_checkbox.setChecked("Sustained_SDPF" in selected_analysis)
-            self._set_rms_options(project_path)
             rms_settings = rms_analysis.normalize_rms_settings(
                 self.session.rms_settings_by_project.get(project_path or "")
+            )
+            self._set_rms_options(
+                project_path,
+                rms_settings,
+                load_catalog=load_catalog,
             )
             self.rms_checkbox.setChecked(
                 bool(rms_settings["enabled"]) and bool(rms_settings["elements"])
@@ -1048,6 +1148,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         finally:
             self._loading = was_loading
+        if not load_catalog:
+            self._ensure_rms_catalog_loaded(project_path)
 
     def _analysis_selection_for_project(self, project_path: str | None) -> list[str]:
         if project_path and project_path in self.session.analysis_enabled_by_project:
@@ -1082,20 +1184,77 @@ class MainWindow(QtWidgets.QMainWindow):
             sustained_by_project[project_path] = sustained
         return resonance_by_project, sustained_by_project
 
-    def _set_rms_options(self, project_path: str | None) -> None:
+    def _set_rms_options(
+        self,
+        project_path: str | None,
+        rms_settings: Mapping[str, Any] | None = None,
+        *,
+        load_catalog: bool = True,
+    ) -> None:
         self.rms_menu.clear()
         self.rms_quantity_checks = {}
         self.rms_element_checks = {}
+        self.rms_switching_time_checks = {}
+        self.rms_switching_time_mode = rms_analysis.RMS_SWITCHING_TIME_MODE_ALL
+        self.rms_switching_time_start_edit = None
+        self.rms_switching_time_end_edit = None
         self.rms_popup_content = None
         self.rms_popup_scroll = None
+        parsed_settings = rms_analysis.normalize_rms_settings(rms_settings)
         elements: list[str] = []
+        switching_times: list[float] = []
+        switch_type = "None"
+        scan_available = False
         if project_path:
-            try:
-                elements = rms_analysis.available_elements(
-                    self._load_mm_catalog_for_project(project_path).mm_results
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                self.log(f"RMS MM catalog unavailable for {Path(project_path).name}: {exc}")
+            scan = self._selected_scan(project_path)
+            if scan is not None:
+                scan_available = True
+                switch_type = getattr(scan, "switch_type", "None") or "None"
+            if scan_available:
+                try:
+                    normalized_path = str(Path(project_path).resolve())
+                    catalog_context = self._mm_catalog_context_by_project.get(normalized_path)
+                    if load_catalog:
+                        catalog = self._load_mm_catalog_for_project(project_path)
+                    elif (
+                        catalog_context is not None
+                        and catalog_context.mm_results_are_current()
+                    ):
+                        catalog = catalog_context.catalog
+                    else:
+                        catalog = None
+                    if catalog is not None:
+                        source_key = (id(catalog.mm_elements), id(catalog.mm_results))
+                        cached_values = self._rms_selector_values_by_project.get(normalized_path)
+                        if cached_values is not None and cached_values[0] == source_key:
+                            elements = cached_values[1]
+                            switching_times = cached_values[2]
+                        else:
+                            elements = sorted(
+                                {
+                                    str(record.element_name).strip()
+                                    for record in catalog.mm_elements
+                                    if str(record.element_name).strip()
+                                },
+                                key=str.casefold,
+                            )
+                            switching_times = rms_analysis.available_switching_times(
+                                catalog.mm_results,
+                                rms_analysis.available_mm_row_keys(catalog.mm_elements),
+                            )
+                            self._rms_selector_values_by_project[normalized_path] = (
+                                source_key,
+                                elements,
+                                switching_times,
+                            )
+                except (OSError, ValueError, TypeError) as exc:
+                    self.log(f"RMS MM catalog unavailable for {Path(project_path).name}: {exc}")
+        mode = (
+            rms_analysis.switching_time_mode_for_type(switch_type)
+            if scan_available
+            else rms_analysis.RMS_SWITCHING_TIME_MODE_ALL
+        )
+        self.rms_switching_time_mode = mode
         quantity_checks = []
         for quantity in rms_analysis.RMS_QUANTITIES:
             check = QtWidgets.QCheckBox(quantity)
@@ -1106,9 +1265,66 @@ class MainWindow(QtWidgets.QMainWindow):
             check = QtWidgets.QCheckBox(element)
             check.toggled.connect(self._on_global_selection_changed)
             self.rms_element_checks[element] = check
+        switching_time_checks: list[QtWidgets.QCheckBox] = []
+        if mode == rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE:
+            persisted_mode = parsed_settings["switching_time_mode"]
+            persisted_times = parsed_settings["switching_times"]
+            selected_times = (
+                persisted_times
+                if persisted_mode == rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE
+                else switching_times
+            )
+            for switching_time in switching_times:
+                check = QtWidgets.QCheckBox(f"{switching_time:g} s")
+                check.setProperty("switchingTime", switching_time)
+                check.setChecked(
+                    any(
+                        abs(switching_time - selected) <= rms_analysis.RMS_TIME_EPSILON_S
+                        for selected in selected_times
+                    )
+                )
+                check.toggled.connect(self._on_global_selection_changed)
+                self.rms_switching_time_checks[switching_time] = check
+                switching_time_checks.append(check)
+        else:
+            self.rms_switching_time_start_edit = QtWidgets.QLineEdit()
+            self.rms_switching_time_start_edit.setObjectName("rmsSwitchingTimeStart")
+            self.rms_switching_time_start_edit.setPlaceholderText("Start")
+            self.rms_switching_time_end_edit = QtWidgets.QLineEdit()
+            self.rms_switching_time_end_edit.setObjectName("rmsSwitchingTimeEnd")
+            self.rms_switching_time_end_edit.setPlaceholderText("End")
+            validator = QtGui.QDoubleValidator(self)
+            validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
+            self.rms_switching_time_start_edit.setValidator(validator)
+            self.rms_switching_time_end_edit.setValidator(validator)
+            for edit in (
+                self.rms_switching_time_start_edit,
+                self.rms_switching_time_end_edit,
+            ):
+                edit.setMinimumWidth(90)
+                edit.textChanged.connect(self._on_global_selection_changed)
+            if switching_times:
+                default_start = switching_times[0]
+                default_end = switching_times[-1]
+            else:
+                default_start = default_end = None
+            if parsed_settings["switching_time_mode"] == rms_analysis.RMS_SWITCHING_TIME_MODE_RANGE:
+                start = parsed_settings["switching_time_start_s"]
+                end = parsed_settings["switching_time_end_s"]
+                if start is not None:
+                    default_start = start
+                if end is not None:
+                    default_end = end
+            if default_start is not None:
+                self.rms_switching_time_start_edit.setText(f"{default_start:g}")
+            if default_end is not None:
+                self.rms_switching_time_end_edit.setText(f"{default_end:g}")
         self.rms_popup_content = _RMSPopupContent(
             quantity_checks,
             self.rms_element_checks.values(),
+            switching_time_checks,
+            self.rms_switching_time_start_edit,
+            self.rms_switching_time_end_edit,
         )
         self.rms_popup_scroll = QtWidgets.QScrollArea(self.rms_menu)
         self.rms_popup_scroll.setObjectName("rmsPopupScroll")
@@ -1116,7 +1332,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rms_popup_scroll.setWidgetResizable(True)
         self.rms_popup_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.rms_popup_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.rms_popup_scroll.setFixedWidth(260)
+        self.rms_popup_scroll.setFixedWidth(440)
         self.rms_popup_scroll.setMaximumHeight(320)
         self.rms_popup_scroll.setWidget(self.rms_popup_content)
         popup_height = self.rms_popup_content.sizeHint().height() + 2
@@ -1127,54 +1343,185 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_mm_catalog_for_project(self, project_path: str):
         normalized = str(Path(project_path).resolve())
-        catalog = self._mm_catalog_by_project.get(normalized)
-        if catalog is not None:
-            return catalog
-        from pscad_plotter_app_v3.services.project import (
-            CatalogCache,
-            ProjectDiscoveryService,
-            ResultsCatalogService,
-            RunAvailabilityService,
-        )
+        catalog_context = self._mm_catalog_context_by_project.get(normalized)
+        if (
+            catalog_context is None
+            or not catalog_context.mm_results_are_current()
+        ):
+            catalog_context = analysis_engine.load_plotter_catalog(Path(normalized))
+            self._mm_catalog_context_by_project[normalized] = catalog_context
+        return catalog_context.catalog
 
-        context = ProjectDiscoveryService().discover(normalized)
-        context.state_dir.mkdir(parents=True, exist_ok=True)
-        cache = CatalogCache(context.state_dir)
-        try:
-            run_index = RunAvailabilityService().build_index(context)
-            catalog = ResultsCatalogService().build_base_catalog(context, run_index, cache)
-        finally:
-            cache.close()
-        self._mm_catalog_by_project[normalized] = catalog
-        return catalog
+    def _ensure_rms_catalog_loaded(self, project_path: str | None) -> None:
+        """Load the current project's RMS catalog without blocking the UI."""
+        if not project_path:
+            return
+        normalized = str(Path(project_path).resolve())
+        scan = self.project_scans.get(normalized)
+        if scan is None:
+            return
+        mm_path = Path(normalized) / "Results" / "MM results.csv"
+        if not mm_path.is_file():
+            return
+        catalog_context = self._mm_catalog_context_by_project.get(normalized)
+        if (
+            catalog_context is not None
+            and catalog_context.mm_results_are_current()
+        ):
+            return
+        existing = self._rms_catalog_workers.get(normalized)
+        if existing is not None and existing[0].isRunning():
+            return
+
+        cancel_token = CancelToken()
+
+        def work(_log, cancel):
+            return analysis_engine.load_plotter_catalog(
+                Path(normalized),
+                check_cancel=cancel.throw_if_cancelled,
+            )
+
+        worker = BackgroundTask(work, cancel_token, self)
+        self._rms_catalog_workers[normalized] = (worker, cancel_token)
+        worker.succeeded.connect(
+            lambda context, path=normalized, task=worker: self._rms_catalog_loaded(
+                path,
+                task,
+                context,
+            )
+        )
+        worker.failed.connect(
+            lambda message, _details, path=normalized, task=worker: self._rms_catalog_failed(
+                path,
+                task,
+                message,
+            )
+        )
+        worker.finished.connect(
+            lambda path=normalized, task=worker: self._rms_catalog_worker_finished(
+                path,
+                task,
+            )
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _rms_catalog_loaded(
+        self,
+        project_path: str,
+        worker: BackgroundTask,
+        catalog_context: Any,
+    ) -> None:
+        current = self._rms_catalog_workers.get(project_path)
+        if current is None or current[0] is not worker:
+            return
+        self._mm_catalog_context_by_project[project_path] = catalog_context
+        if self._current_project_path() == project_path:
+            self._load_project_analysis_options(
+                project_path,
+                load_catalog=False,
+            )
+            self._update_rms_selector_state()
+
+    def _rms_catalog_failed(
+        self,
+        project_path: str,
+        worker: BackgroundTask,
+        message: str,
+    ) -> None:
+        current = self._rms_catalog_workers.get(project_path)
+        if current is None or current[0] is not worker:
+            return
+        self.log(f"RMS MM catalog unavailable for {Path(project_path).name}: {message}")
+        if self._current_project_path() == project_path:
+            self._update_rms_selector_state()
+
+    def _rms_catalog_worker_finished(
+        self,
+        project_path: str,
+        worker: BackgroundTask,
+    ) -> None:
+        current = self._rms_catalog_workers.get(project_path)
+        if current is not None and current[0] is worker:
+            self._rms_catalog_workers.pop(project_path, None)
+        if self._current_project_path() == project_path:
+            self._update_rms_selector_state()
+        if self._close_when_idle and self._background_workers_idle():
+            QtCore.QTimer.singleShot(0, self.close)
+
+    def _cancel_rms_catalog_workers(
+        self,
+        project_paths: Iterable[str] | None = None,
+    ) -> None:
+        paths = (
+            set(self._rms_catalog_workers)
+            if project_paths is None
+            else {str(Path(path).resolve()) for path in project_paths}
+        )
+        for path in paths:
+            entry = self._rms_catalog_workers.get(path)
+            if entry is None:
+                continue
+            worker, cancel_token = self._rms_catalog_workers.pop(path)
+            cancel_token.cancel()
+            worker.requestInterruption()
+
+    def _rms_catalog_contexts_for_projects(
+        self,
+        project_paths: Iterable[str],
+    ) -> dict[str, Any]:
+        return {
+            project_path: self._mm_catalog_context_by_project[project_path]
+            for project_path in project_paths
+            if project_path in self._mm_catalog_context_by_project
+        }
 
     def _update_rms_selector_state(self) -> None:
         project_path = self._current_project_path()
         selected_project_paths = {
             project.path for project in self.session.projects if project.selected
         }
+        normalized = str(Path(project_path).resolve()) if project_path else None
+        loading = bool(normalized and normalized in self._rms_catalog_workers)
+        has_elements = bool(self.rms_element_checks)
         available = bool(
             project_path
             and project_path in selected_project_paths
-            and self.rms_element_checks
+            and (has_elements or loading)
         )
-        self.rms_checkbox.setEnabled(available)
+        self.rms_checkbox.setEnabled(available and has_elements and not loading)
         self.rms_button.setEnabled(available)
-        if not available:
+        if available and has_elements and project_path is not None:
+            rms_settings = rms_analysis.normalize_rms_settings(
+                self.session.rms_settings_by_project.get(project_path)
+            )
+            desired = bool(rms_settings["enabled"]) and bool(rms_settings["elements"])
+            blocker = QtCore.QSignalBlocker(self.rms_checkbox)
+            self.rms_checkbox.setChecked(desired)
+            del blocker
+        elif not available:
             blocker = QtCore.QSignalBlocker(self.rms_checkbox)
             self.rms_checkbox.setChecked(False)
             del blocker
-        self.rms_button.setToolTip(
-            "Select RMS quantity and MM elements for the current project."
-            if available
-            else "Select a project with MM measurement elements to configure RMS."
-        )
+        if loading:
+            tooltip = "Loading MM elements for RMS selection."
+        elif available:
+            tooltip = "Select RMS quantity and MM elements for the current project."
+        else:
+            tooltip = "Select a project with MM measurement elements to configure RMS."
+        self.rms_button.setToolTip(tooltip)
 
     def _sorted_voltages(self, voltages: Iterable[str]) -> list[str]:
         unique = {str(voltage).strip() for voltage in voltages if str(voltage).strip()}
         return sorted(unique, key=self._voltage_sort_key)
 
-    def _reload_project_tree(self) -> None:
+    def _reload_project_tree(self, restore_path: str | None = None) -> None:
+        """Rebuild project rows while preserving the active project context."""
+        active_path = (
+            restore_path
+            if restore_path is not None
+            else self._current_project_path()
+        )
         blocker = QtCore.QSignalBlocker(self.project_tree)
         try:
             self.project_tree.clear()
@@ -1198,17 +1545,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_tree.setColumnWidth(1, 180)
         if self.project_tree.columnWidth(0) < 260:
             self.project_tree.setColumnWidth(0, 260)
+        restored = active_path is not None and self._select_project_path(active_path)
+        if not restored and self.project_tree.topLevelItemCount():
+            fallback = next(
+                (
+                    self.project_tree.topLevelItem(row)
+                    for row in range(self.project_tree.topLevelItemCount())
+                    if self.project_tree.topLevelItem(row).checkState(0)
+                    == QtCore.Qt.CheckState.Checked
+                ),
+                self.project_tree.topLevelItem(0),
+            )
+            self.project_tree.setCurrentItem(fallback)
+        self._update_project_selection_visual(self.project_tree.currentItem())
         self._update_project_header()
+        self._update_dashboard_figure_header()
 
     def _update_project_header(self) -> None:
         project_path = self._current_project_path()
         if project_path:
             project_name = Path(project_path).name or project_path
-            self.project_header.setText(f"PSCAD Results Analysis — Project: {project_name}")
-            self.project_header.setToolTip(project_path)
+            self.project_controls_group.setTitle(f"Project: {project_name}")
+            self.project_controls_group.setToolTip(project_path)
         else:
-            self.project_header.setText("PSCAD Results Analysis")
-            self.project_header.setToolTip("")
+            self.project_controls_group.setTitle("Project: —")
+            self.project_controls_group.setToolTip("")
 
     def _reload_scope_list(self) -> None:
         self.scope_list.clear()
@@ -1247,7 +1608,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.rms_checkbox.isChecked():
                 selected_analysis.append("RMS")
             self.session.analysis_enabled_by_project[project_path] = selected_analysis
-            self.session.rms_settings_by_project[project_path] = {
+            rms_settings: dict[str, Any] = {
                 "enabled": self.rms_checkbox.isChecked(),
                 "quantities": [
                     quantity
@@ -1260,8 +1621,45 @@ class MainWindow(QtWidgets.QMainWindow):
                     if check.isChecked()
                 ],
             }
+            if self.rms_switching_time_mode == rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE:
+                rms_settings.update(
+                    {
+                        "switching_time_mode": rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE,
+                        "switching_times": [
+                            switching_time
+                            for switching_time, check in self.rms_switching_time_checks.items()
+                            if check.isChecked()
+                        ],
+                        "switching_time_start_s": None,
+                        "switching_time_end_s": None,
+                    }
+                )
+            elif self.rms_switching_time_mode == rms_analysis.RMS_SWITCHING_TIME_MODE_RANGE:
+                rms_settings.update(
+                    {
+                        "switching_time_mode": rms_analysis.RMS_SWITCHING_TIME_MODE_RANGE,
+                        "switching_times": [],
+                        "switching_time_start_s": self._rms_time_edit_value(
+                            self.rms_switching_time_start_edit
+                        ),
+                        "switching_time_end_s": self._rms_time_edit_value(
+                            self.rms_switching_time_end_edit
+                        ),
+                    }
+                )
+            self.session.rms_settings_by_project[project_path] = rms_settings
         self._save_current_project_exclusions()
         self._update_voltage_selector_state()
+
+    @staticmethod
+    def _rms_time_edit_value(edit: QtWidgets.QLineEdit | None) -> float | None:
+        if edit is None:
+            return None
+        try:
+            value = float(edit.text().strip())
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     def _update_voltage_selector_state(self) -> None:
         selected_count = sum(check.isChecked() for check in self.voltage_checks.values())
@@ -1314,6 +1712,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.project_scans.get(project_path) if project_path is not None else None
 
     def _reload_project_exclusions(self, project_path: str | None = None) -> None:
+        if project_path is None:
+            project_path = self._current_project_path()
         scan = self._selected_scan(project_path)
         was_loading = self._loading
         self._loading = True
@@ -1528,15 +1928,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _clear_project_ui_caches(self, project_paths: Iterable[str] | None = None) -> None:
         if project_paths is None:
+            self._cancel_rms_catalog_workers()
             self._fault_types_by_project.clear()
             self._high_voltage_groups_by_project.clear()
-            self._mm_catalog_by_project.clear()
+            self._mm_catalog_context_by_project.clear()
+            self._rms_selector_values_by_project.clear()
+            self._preview_cache.clear()
             return
-        for project_path in project_paths:
-            normalized = str(Path(project_path).resolve())
+        normalized_paths = {str(Path(path).resolve()) for path in project_paths}
+        self._cancel_rms_catalog_workers(normalized_paths)
+        for normalized in normalized_paths:
             self._fault_types_by_project.pop(normalized, None)
             self._high_voltage_groups_by_project.pop(normalized, None)
-            self._mm_catalog_by_project.pop(normalized, None)
+            self._mm_catalog_context_by_project.pop(normalized, None)
+            self._rms_selector_values_by_project.pop(normalized, None)
+        self._preview_cache = {
+            key: value
+            for key, value in self._preview_cache.items()
+            if key[0] not in normalized_paths
+        }
 
     def _set_high_voltage_ui_visible(self, visible: bool) -> None:
         index = self.exclusion_tabs.indexOf(self.high_voltage_tab)
@@ -1949,8 +2359,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 project.selected = item.checkState(0) == QtCore.Qt.CheckState.Checked
                 break
         self._update_voltage_options_from_scans()
-        if path == self._current_project_path():
-            self._load_project_analysis_options(path)
         self._update_rms_selector_state()
         self.autosave()
         self.update_preview()
@@ -1964,29 +2372,45 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         project_path = self._project_path_from_item(current)
         self._update_project_header()
-        self._update_project_selection_visual(current)
+        self._update_project_selection_visual(current, _previous)
         if current is None:
             self._load_dashboard_figure_list(None)
             self._reload_project_exclusions(None)
-            self._load_project_analysis_options(None)
+            self._load_project_analysis_options(None, load_catalog=False)
             return
         self._load_dashboard_figure_list(project_path)
         self._reload_project_exclusions(project_path)
-        self._load_project_analysis_options(project_path)
+        self._load_project_analysis_options(project_path, load_catalog=False)
         self.update_preview()
 
     def _update_project_selection_visual(
         self,
         current: QtWidgets.QTreeWidgetItem | None,
+        previous: QtWidgets.QTreeWidgetItem | None = None,
     ) -> None:
         """Keep the active project obvious even when the tree loses focus."""
-        for row in range(self.project_tree.topLevelItemCount()):
-            item = self.project_tree.topLevelItem(row)
-            font = item.font(0)
-            is_current = item is current
-            if font.bold() != is_current:
-                font.setBold(is_current)
-                item.setFont(0, font)
+        # Font changes emit ``itemChanged`` just like edits to the check state.
+        # Block the tree signal while applying this presentation-only update so
+        # selecting a project does not rerun the project-settings path.
+        blocker = QtCore.QSignalBlocker(self.project_tree)
+        try:
+            items: list[QtWidgets.QTreeWidgetItem] = []
+            for item in (previous, current):
+                if item is not None and not any(item is other for other in items):
+                    items.append(item)
+            for item in items:
+                try:
+                    font = item.font(0)
+                except RuntimeError:
+                    # A tree rebuild can delete the previous C++ item before
+                    # Qt delivers the selection-change notification.
+                    continue
+                is_current = item is current
+                if font.bold() != is_current:
+                    font.setBold(is_current)
+                    item.setFont(0, font)
+        finally:
+            del blocker
 
     def _handle_project_tree_double_click(
         self,
@@ -2102,11 +2526,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.dashboard_figure_shared_selection_initialized = True
 
     def _update_dashboard_figure_header(self) -> None:
-        self.dashboard_figure_header.setText(
-            "Dashboard Figures"
-            if self.session.dashboard_figure_apply_to_all
-            else "Dashboard Figures for Current Project"
-        )
+        project_path = self._current_project_path()
+        if project_path:
+            project_name = Path(project_path).name or project_path
+            self.dashboard_figure_header.setText(f"Dashboard Figures: {project_name}")
+        else:
+            self.dashboard_figure_header.setText("Dashboard Figures")
 
     def _dashboard_figure_ids_for_project(self, project_path: str) -> list[str]:
         figures = self.dashboard_figures.get(project_path, [])
@@ -2216,7 +2641,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for path in paths:
             self.project_scans.pop(path, None)
             self.dashboard_figures.pop(path, None)
-            self._mm_catalog_by_project.pop(str(Path(path).resolve()), None)
+            self._mm_catalog_context_by_project.pop(str(Path(path).resolve()), None)
         try:
             project_scan_cache.remove_projects(paths)
         except OSError as exc:
@@ -2357,7 +2782,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session = AppSession.default()
         self.project_scans.clear()
         self.dashboard_figures.clear()
-        self._mm_catalog_by_project.clear()
+        self._mm_catalog_context_by_project.clear()
         self._autosave_timer.stop()
         storage.clear_autosave()
         try:
@@ -2640,11 +3065,13 @@ class MainWindow(QtWidgets.QMainWindow):
         restore_path = current_path or self._current_project_path()
         self._loading = True
         try:
-            self._reload_project_tree()
-            if restore_path is not None:
-                self._select_project_path(restore_path)
+            self._reload_project_tree(restore_path=restore_path)
         finally:
             self._loading = False
+        self._load_project_analysis_options(
+            self._current_project_path(),
+            load_catalog=False,
+        )
         self._load_dashboard_figure_list(self._current_project_path())
         self._reload_project_exclusions()
         self.autosave()
@@ -2666,7 +3093,17 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = current_selected.intersection(discovered)
         if not selected:
             selected = discovered
-        self._set_voltage_options(discovered, selected)
+        options = self._sorted_voltages(discovered)
+        current_options = set(self.voltage_checks)
+        current_ui_selected = {
+            voltage
+            for voltage, check in self.voltage_checks.items()
+            if check.isChecked()
+        }
+        if current_options == set(options) and current_ui_selected == selected:
+            self._update_voltage_selector_state()
+            return
+        self._set_voltage_options(options, selected)
 
     def _refresh_project_status_after_action(
         self,
@@ -2765,21 +3202,23 @@ class MainWindow(QtWidgets.QMainWindow):
         current_path = self._current_project_path()
         self._loading = True
         try:
-            self._reload_project_tree()
-            if current_path is not None:
-                self._select_project_path(current_path)
+            self._reload_project_tree(restore_path=current_path)
         finally:
             self._loading = False
         self._reload_project_exclusions()
         self.autosave()
         self.update_preview()
 
-    def _select_project_path(self, project_path: str) -> None:
+    def _select_project_path(self, project_path: str) -> bool:
+        target_path = str(Path(project_path).resolve()).casefold()
         for row in range(self.project_tree.topLevelItemCount()):
             item = self.project_tree.topLevelItem(row)
-            if str(item.data(0, USER_ROLE_PATH)) == project_path:
+            item_path = self._project_path_from_item(item)
+            if item_path is not None and str(Path(item_path).resolve()).casefold() == target_path:
                 self.project_tree.setCurrentItem(item)
-                return
+                self._update_project_header()
+                return True
+        return False
 
     def scan_dashboard_figures(self) -> None:
         projects = self.selected_project_paths()
@@ -2938,6 +3377,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     for path in projects
                 },
+                rms_catalog_context_by_project=self._rms_catalog_contexts_for_projects(projects),
                 **envelope_kwargs,
                 log=prompt_log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -3156,6 +3596,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     for path in projects
                 },
+                rms_catalog_context_by_project=self._rms_catalog_contexts_for_projects(projects),
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -3200,6 +3641,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     for path in projects
                 },
+                rms_catalog_context_by_project=self._rms_catalog_contexts_for_projects(projects),
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -3257,6 +3699,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 sustained_sdpf_heatmap_settings_by_project=heatmap_settings,
                 sustained_sdpf_ranking_settings_by_project=ranking_settings,
                 rms_settings_by_project=rms_settings,
+                rms_catalog_context_by_project=self._rms_catalog_contexts_for_projects(projects),
                 event_times=dict(self.session.event_times),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
@@ -3282,9 +3725,25 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         with self._table_bulk_update(self.preview_table):
             self.preview_table.setRowCount(len(rows))
+            outputs_by_scope = {
+                scope.folder: self._outputs_text(scope, self.session.events)
+                for scope in scopes
+            }
+            missing_voltages_by_project: dict[str, list[str]] = {}
+            for project in projects:
+                scan = self.project_scans.get(project.path)
+                missing_voltages_by_project[project.path] = (
+                    [
+                        voltage
+                        for voltage in self.session.voltages
+                        if voltage not in scan.available_voltages
+                    ]
+                    if scan is not None and scan.available_voltages
+                    else []
+                )
             for row_index, (project, scope) in enumerate(rows):
                 scan = self.project_scans.get(project.path)
-                preview = scanner.preview_scope(scan, scope) if scan else None
+                preview = self._preview_for_scope(project.path, scan, scope) if scan else None
                 cases = (
                     f"{preview.matched_count}/{preview.total_count}"
                     if preview is not None
@@ -3293,21 +3752,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 warnings = preview.warning if preview is not None else ""
                 if scan and "Missing Results" in scan.chips:
                     warnings = f"{warnings}; missing results".strip("; ")
-                if scan and scan.available_voltages:
-                    missing_voltages = [
-                        voltage
-                        for voltage in self.session.voltages
-                        if voltage not in scan.available_voltages
-                    ]
-                    if missing_voltages:
-                        warning = f"missing voltages: {', '.join(missing_voltages)}"
-                        warnings = f"{warnings}; {warning}".strip("; ")
-                outputs = self._outputs_text(scope, self.session.events)
+                missing_voltages = missing_voltages_by_project[project.path]
+                if missing_voltages:
+                    warning = f"missing voltages: {', '.join(missing_voltages)}"
+                    warnings = f"{warnings}; {warning}".strip("; ")
+                outputs = outputs_by_scope[scope.folder]
                 values = [project.name, scope.folder, cases, outputs, warnings]
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
                     item.setToolTip(value)
                     self.preview_table.setItem(row_index, column, item)
+
+    def _preview_for_scope(
+        self,
+        project_path: str,
+        scan: scanner.ProjectScan,
+        scope: ScopeEntry,
+    ) -> scanner.ScopePreview:
+        key = (
+            str(Path(project_path).resolve()),
+            id(scan),
+            scope.mode,
+            tuple(scope.tokens),
+        )
+        preview = self._preview_cache.get(key)
+        if preview is None:
+            preview = scanner.preview_scope(scan, scope)
+            self._preview_cache[key] = preview
+        return preview
 
     def _outputs_text(self, scope: ScopeEntry, events: Iterable[str]) -> str:
         event_text = ", ".join(events) if events else "no events"
@@ -3366,6 +3838,7 @@ class MainWindow(QtWidgets.QMainWindow):
             **self._project_chart_axis_kwargs(project_paths),
             "envelope_chart_y_limits_by_voltage": dict(self.session.envelope_chart_y_limits_by_voltage),
             "envelope_chart_show_sa_label": bool(self.session.envelope_chart_show_sa_label),
+            "envelope_chart_move_labels": bool(self.session.envelope_chart_move_labels),
             "envelope_chart_top_left_cell": self.session.envelope_chart_top_left_cell,
             "envelope_chart_width": float(self.session.envelope_chart_width),
             "envelope_chart_height": float(self.session.envelope_chart_height),
@@ -3391,6 +3864,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 path: {
                     "frequency": scan.project_frequency,
                     "final_duration": scan.final_duration,
+                    "switch_type": scan.switch_type,
                 }
                 for path in paths
                 if (scan := self.project_scans.get(path)) is not None
@@ -3562,8 +4036,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_settings_if_requested()
 
     def _worker_finished(self) -> None:
-        if self._close_when_idle:
+        if self._close_when_idle and self._background_workers_idle():
             QtCore.QTimer.singleShot(0, self.close)
+
+    def _background_workers_idle(self) -> bool:
+        return not (
+            (self._worker is not None and self._worker.isRunning())
+            or any(worker.isRunning() for worker, _cancel in self._rms_catalog_workers.values())
+        )
 
     def _open_settings_if_requested(self) -> None:
         if not self._open_settings_after_task:
@@ -3613,6 +4093,16 @@ class MainWindow(QtWidgets.QMainWindow):
             check.setEnabled(not busy)
         for check in self.rms_element_checks.values():
             check.setEnabled(not busy)
+        for check in self.rms_switching_time_checks.values():
+            check.setEnabled(not busy)
+        for edit in (
+            self.rms_switching_time_start_edit,
+            self.rms_switching_time_end_edit,
+        ):
+            if edit is not None:
+                edit.setEnabled(not busy)
+        if not busy:
+            self._update_rms_selector_state()
         self.busy_progress.setVisible(busy)
         self.stop_button.setEnabled(busy)
         self.set_status(status)
@@ -3640,6 +4130,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._close_when_idle = True
             self.stop_current_task()
+            event.ignore()
+            return
+        if self._rms_catalog_workers:
+            self._close_when_idle = True
+            self._cancel_rms_catalog_workers()
             event.ignore()
             return
         if self._autosave_timer.isActive():

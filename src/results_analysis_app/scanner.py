@@ -122,6 +122,7 @@ class ProjectScan:
     sustained_sdpf_limit_warnings: list[str] = field(default_factory=list)
     project_frequency: float | None = None
     final_duration: float | None = None
+    switch_type: str = "None"
     has_dashboards: bool = False
     dashboard_figures: list[DashboardFigure] = field(default_factory=list)
     dashboard_changed: bool = False
@@ -1058,6 +1059,7 @@ def scan_project(
         timing = futures["project_timing"].result()
         scan.project_frequency = timing.frequency
         scan.final_duration = timing.final_duration
+        scan.switch_type = timing.switch_type
         if "high_voltage_log" in futures:
             scan.high_voltage_log_measurements, warnings = futures["high_voltage_log"].result()
             scan.messages.extend(warnings)

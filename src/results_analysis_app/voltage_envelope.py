@@ -505,6 +505,7 @@ def _refresh_cached_presentation(
     chart_axis_limits_by_voltage: dict[str, dict[str, float | None]] | None,
     event_times: dict[str, float] | None,
     show_sa_label: bool,
+    move_labels: bool,
     chart_top_left_cell: str | None,
     chart_size: dict[str, float],
     build_charts: bool,
@@ -580,6 +581,7 @@ def _refresh_cached_presentation(
                         axis_limits_by_voltage=chart_axis_limits_by_voltage,
                         event_times=event_times,
                         show_sa_label=show_sa_label,
+                        move_labels=move_labels,
                         chart_top_left_cell=chart_top_left_cell,
                         chart_size=chart_size,
                     )
@@ -687,6 +689,7 @@ def build_voltage_envelopes(
     envelope_chart_x_major: float | None = None,
     envelope_chart_y_limits_by_voltage: dict[str, dict[str, float | None]] | None = None,
     envelope_chart_show_sa_label: bool = False,
+    envelope_chart_move_labels: bool = True,
     envelope_chart_top_left_cell: str | None = None,
     envelope_chart_width: float | None = None,
     envelope_chart_height: float | None = None,
@@ -899,6 +902,7 @@ def build_voltage_envelopes(
         "chart_axis_limits": chart_axis_limits,
         "chart_y_limits_by_voltage": envelope_chart_y_limits_by_voltage,
         "chart_show_sa_label": envelope_chart_show_sa_label,
+        "chart_move_labels": envelope_chart_move_labels,
         "chart_top_left_cell": envelope_chart_top_left_cell,
         "chart_size": chart_size,
     }
@@ -962,6 +966,7 @@ def build_voltage_envelopes(
                 envelope_chart_y_limits_by_voltage,
                 event_times,
                 envelope_chart_show_sa_label,
+                envelope_chart_move_labels,
                 envelope_chart_top_left_cell,
                 chart_size,
                 build_charts,
@@ -1120,6 +1125,7 @@ def build_voltage_envelopes(
                     axis_limits_by_voltage=envelope_chart_y_limits_by_voltage,
                     event_times=event_times,
                     show_sa_label=envelope_chart_show_sa_label,
+                    move_labels=envelope_chart_move_labels,
                     chart_top_left_cell=envelope_chart_top_left_cell,
                     chart_size=chart_size,
                 )

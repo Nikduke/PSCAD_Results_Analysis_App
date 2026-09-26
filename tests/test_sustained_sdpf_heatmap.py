@@ -690,14 +690,6 @@ def test_heatmap_split_normalizes_mixed_case_token_prefixes() -> None:
     assert metadata.token_labels["POC"] == "POC — POC, VSR"
 
 
-def test_heatmap_cell_labels_show_top_and_bottom_percentages() -> None:
-    from results_analysis_app.sustained_sdpf_heatmap import HeatmapCell, _heatmap_cell_label
-
-    assert _heatmap_cell_label(HeatmapCell("All", "case", None, 10, 0, 0)) == "0%\n0%"
-    assert _heatmap_cell_label(HeatmapCell("All", "case", None, 200, 1, 3)) == "<1%\n1.5%"
-    assert _heatmap_cell_label(HeatmapCell("All", "case", None, 0, 0, 0)) == "—"
-
-
 def test_long_case_tick_labels_wrap_without_truncation() -> None:
     from results_analysis_app.sustained_sdpf_heatmap import _case_tick_label
 
@@ -817,6 +809,94 @@ def test_heatmap_severity_and_small_percentage_display() -> None:
     assert colors.to_hex(margin).upper() == "#C98200"
     assert _text_color_for_background(actual) == "#ffffff"
     assert _text_color_for_background(margin) == "#111827"
+
+
+def test_heatmap_footer_explains_stacked_values_with_example() -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    from results_analysis_app.sustained_sdpf_heatmap import _add_heatmap_footer
+
+    figure, axis = plt.subplots()
+    _add_heatmap_footer(axis, actual_scale_max=0.0, margin_scale_max=3.125)
+    labels = {text.get_text() for text in axis.texts}
+
+    assert "Example" in labels
+    assert "Actual SDPF-limit exceedance (%)" in labels
+    assert "Safety-threshold exceedance (%)" in labels
+    assert "Safety-threshold exceedance\nonly" in labels
+    assert "Actual SDPF-limit\nexceedance" in labels
+    assert "No actual exceedance" in labels
+    assert "1.6%" in labels
+    assert "3.1% max" in labels
+    assert "50%" not in labels
+    assert "No duration-qualified\nexceedance" in labels
+    assert "No eligible\nRun–MM" in labels
+    assert not any(text.startswith("Top:") for text in labels)
+    assert len(axis.patches) == 19  # two 8-step scales, two swatches, one example cell
+    assert len(axis.lines) == 1
+    plt.close(figure)
+
+
+def test_heatmap_governing_outline_uses_deep_violet() -> None:
+    from results_analysis_app.sustained_sdpf_heatmap import HEATMAP_GOVERNING_COLOR
+
+    assert HEATMAP_GOVERNING_COLOR == "#4b1d95"
+
+
+def test_heatmap_governing_keys_use_highest_incidence_percentage() -> None:
+    from results_analysis_app.sustained_sdpf_heatmap import (
+        HeatmapObservation,
+        HeatmapSettings,
+        aggregate_observations,
+        metadata_from_cases,
+    )
+
+    cases = ["O2_P1_A", "O2_P1_B"]
+    observations = []
+    # A has the higher percentage (2/64 = 3.1%), while B has the higher raw
+    # count (3/192 = 1.6%).  The outline must follow the percentage.
+    for case, eligible, margin_count in (
+        (cases[0], 64, 2),
+        (cases[1], 192, 3),
+    ):
+        observations.extend(
+            HeatmapObservation(case, run, "MM_66_A", "AG", False, run <= margin_count)
+            for run in range(1, eligible + 1)
+        )
+    layout = aggregate_observations(
+        observations,
+        HeatmapSettings(y_grouping="Fault type"),
+        metadata_from_cases(cases, {(case, 1): "AG" for case in cases}),
+    )
+
+    assert layout.governing_keys == frozenset({("AG", "O2_P1_A", None)})
+
+    actual_observations = []
+    for case, eligible, actual_count in (
+        (cases[0], 64, 2),
+        (cases[1], 192, 3),
+    ):
+        actual_observations.extend(
+            HeatmapObservation(
+                case,
+                run,
+                "MM_66_A",
+                "AG",
+                run <= actual_count,
+                run <= actual_count,
+            )
+            for run in range(1, eligible + 1)
+        )
+    actual_layout = aggregate_observations(
+        actual_observations,
+        HeatmapSettings(y_grouping="Fault type"),
+        metadata_from_cases(cases, {(case, 1): "AG" for case in cases}),
+    )
+
+    assert actual_layout.governing_keys == frozenset({("AG", "O2_P1_A", None)})
 
 
 def test_heatmap_persists_complete_observations_and_renders_without_excel(tmp_path) -> None:

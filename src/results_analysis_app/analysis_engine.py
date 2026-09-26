@@ -50,6 +50,29 @@ class _PlotBatchPlan:
     stage_dir: Path
     jobs: list[Any]
 
+
+@dataclass(slots=True)
+class PlotterCatalogContext:
+    """Reusable project catalog and run index for one connected workflow."""
+
+    context: Any
+    run_index: dict[str, dict[int, Path]]
+    catalog: Any
+    mm_source_signature: tuple[int, int] | None = None
+
+    def mm_results_are_current(self) -> bool:
+        """Check the source metadata before reusing a cached UI context."""
+        if self.mm_source_signature is None:
+            return True
+        source = Path(self.context.results_dir) / "MM results.csv"
+        try:
+            stat = source.stat()
+            signature = (int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            signature = (-1, -1)
+        return signature == self.mm_source_signature
+
+
 EVENT_DEFINITIONS = {
     "TOV": {"source_sheet": "LLp", "trace": "Both"},
     "SFO": {"source_sheet": "LLp", "trace": "Both"},
@@ -428,6 +451,8 @@ def create_plot_batches(
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
     rms_settings: Mapping[str, Any] | None = None,
+    rms_catalog_context: PlotterCatalogContext | None = None,
+    rms_selections: Iterable[rms_analysis.RMSSelection] | None = None,
 ) -> list[Path]:
     outputs: list[Path] = []
     selected_events = [
@@ -443,14 +468,20 @@ def create_plot_batches(
     parsed_rms = rms_analysis.normalize_rms_settings(rms_settings) if rms_settings is not None else None
     rms_batch_rows_by_event: dict[str, list[dict[str, object]]] | None = None
     if parsed_rms is not None:
-        if parsed_rms["enabled"]:
-            catalog = _load_rms_catalog(project_root)
-            selections = rms_analysis.select_rms_rows(
-                catalog.mm_results,
-                selected_elements=parsed_rms["elements"],
-                selected_quantities=parsed_rms["quantities"],
-                selected_voltages=selected_voltages,
-            )
+        if parsed_rms["enabled"] and parsed_rms["elements"]:
+            if rms_selections is None:
+                catalog_context = rms_catalog_context or load_plotter_catalog(
+                    project_root,
+                    log,
+                    check_cancel,
+                )
+                selections = rms_analysis.select_rms_rows_from_catalog(
+                    catalog_context.catalog,
+                    parsed_rms,
+                    selected_voltages,
+                )
+            else:
+                selections = list(rms_selections)
             rms_batch_rows_by_event = rms_analysis.rms_batch_rows(
                 selections,
                 excel_export=excel_waveform_exports_enabled,
@@ -632,54 +663,61 @@ def create_plot_batches(
     return outputs
 
 
-def _load_embedded_plotter_session(
+def load_plotter_catalog(
     project_root: Path,
     log: LogFn | None = None,
     check_cancel: CancelFn | None = None,
-):
-    import pscad_plotter_app_v3
-    from pscad_plotter_app_v3.services.exporter import ExcelExporter
-    from pscad_plotter_app_v3.services.limits import LimitService
+) -> PlotterCatalogContext:
+    """Load one authoritative plotter catalog and its available run index."""
     from pscad_plotter_app_v3.services.project import (
         CatalogCache,
         ProjectDiscoveryService,
         ResultsCatalogService,
         RunAvailabilityService,
     )
+
+    discovery_service = ProjectDiscoveryService()
+    context = discovery_service.discover(project_root)
+    context.state_dir.mkdir(parents=True, exist_ok=True)
+    cache = CatalogCache(context.state_dir)
+    try:
+        _cancel(check_cancel)
+        _log(log, "plotter: Indexing runs...")
+        run_index = RunAvailabilityService().build_index(context)
+        _cancel(check_cancel)
+        _log(log, "plotter: Loading MM results...")
+        catalog = ResultsCatalogService().build_base_catalog(context, run_index, cache)
+        mm_path = context.results_dir / ResultsCatalogService.MM_FILENAME
+        try:
+            mm_stat = mm_path.stat()
+            mm_source_signature = (int(mm_stat.st_size), int(mm_stat.st_mtime_ns))
+        except OSError:
+            mm_source_signature = (-1, -1)
+        return PlotterCatalogContext(context, run_index, catalog, mm_source_signature)
+    finally:
+        cache.close()
+
+
+def _load_embedded_plotter_session(
+    project_root: Path,
+    log: LogFn | None = None,
+    check_cancel: CancelFn | None = None,
+    catalog_context: PlotterCatalogContext | None = None,
+):
+    import pscad_plotter_app_v3
+    from pscad_plotter_app_v3.services.exporter import ExcelExporter
+    from pscad_plotter_app_v3.services.limits import LimitService
     from pscad_plotter_app_v3.services.renderer import MatplotlibRenderer
 
     version = getattr(pscad_plotter_app_v3, "__version__", "embedded")
     _log(log, f"Using embedded plotter engine: pscad_plotter_app_v3 {version}")
 
-    discovery_service = ProjectDiscoveryService()
-    run_service = RunAvailabilityService()
-    results_service = ResultsCatalogService()
     limit_service = LimitService()
-
-    context = discovery_service.discover(project_root)
-    context.state_dir.mkdir(parents=True, exist_ok=True)
-    cache = CatalogCache(context.state_dir)
-    try:
-        _log(log, "plotter: Indexing runs...")
-        run_index = run_service.build_index(context)
-        _log(log, "plotter: Loading MM results...")
-        catalog = results_service.build_base_catalog(context, run_index, cache)
-        limits = limit_service.load_effective_limits(context)
-        renderer = MatplotlibRenderer(run_index, check_cancel)
-        exporter = ExcelExporter(renderer)
-        return catalog, limits, renderer, exporter
-    finally:
-        cache.close()
-
-
-def _load_rms_catalog(project_root: Path):
-    """Load the shared MM catalog without constructing a renderer."""
-    from pscad_plotter_app_v3.models import ProjectCatalog
-
-    catalog = ProjectCatalog()
-    catalog.mm_results = rms_analysis.load_mm_results(project_root)
-    return catalog
-
+    context_data = catalog_context or load_plotter_catalog(project_root, log, check_cancel)
+    limits = limit_service.load_effective_limits(context_data.context)
+    renderer = MatplotlibRenderer(context_data.run_index, check_cancel)
+    exporter = ExcelExporter(renderer)
+    return context_data.catalog, limits, renderer, exporter
 
 def _apply_sustained_sdpf_plot_limit_overrides(
     limits: dict[str, Any],
@@ -839,9 +877,11 @@ def _plot_source_manifest(
     project_root: Path,
     renderer: Any,
     jobs: Iterable[Any],
+    source_manifest_cache: dict[str, tuple[dict[str, Any], ...]] | None = None,
 ) -> list[dict[str, Any]]:
+    shared_cache = source_manifest_cache if source_manifest_cache is not None else {}
     run_index = getattr(renderer, "run_index", {})
-    source_paths: dict[str, Path] = {}
+    manifest_entries: dict[str, dict[str, Any]] = {}
     special_entries: dict[str, dict[str, Any]] = {}
     scanned_inf_paths: set[str] = set()
     for job in jobs:
@@ -866,17 +906,25 @@ def _plot_source_manifest(
         if resolved_inf in scanned_inf_paths:
             continue
         scanned_inf_paths.add(resolved_inf)
-        source_paths[resolved_inf] = inf_path
+        cached_entries = shared_cache.get(resolved_inf)
+        if cached_entries is not None:
+            manifest_entries.update(
+                {str(entry["path"]): dict(entry) for entry in cached_entries}
+            )
+            continue
         try:
             candidates = list(inf_path.parent.iterdir())
         except OSError:
             relative = _plot_manifest_path(project_root, inf_path.parent)
-            special_entries[f"directory:{relative}"] = {
+            entry = {
                 "path": relative,
                 "directory_error": True,
             }
+            shared_cache[resolved_inf] = (entry,)
+            special_entries[f"directory:{relative}"] = entry
             continue
         stem = inf_path.stem.casefold()
+        source_paths = [inf_path]
         for candidate in candidates:
             candidate_name = candidate.name.casefold()
             if (
@@ -887,28 +935,38 @@ def _plot_source_manifest(
                     or candidate_name.startswith("statistic")
                 )
             ):
-                source_paths[str(candidate.resolve())] = candidate
+                source_paths.append(candidate)
 
-    entries: list[dict[str, Any]] = []
-    for path in sorted(source_paths.values(), key=lambda item: str(item).casefold()):
-        relative = _plot_manifest_path(project_root, path)
-        try:
-            stat = path.stat()
-        except OSError:
-            entries.append({"path": relative, "missing": True})
-        else:
-            entries.append(
-                {
+        run_entries: list[dict[str, Any]] = []
+        for path in sorted(
+            dict.fromkeys(source_paths),
+            key=lambda item: str(item).casefold(),
+        ):
+            relative = _plot_manifest_path(project_root, path)
+            try:
+                stat = path.stat()
+            except OSError:
+                entry = {"path": relative, "missing": True}
+            else:
+                entry = {
                     "path": relative,
                     "size": int(stat.st_size),
                     "mtime_ns": int(stat.st_mtime_ns),
                 }
-            )
+            run_entries.append(entry)
+            manifest_entries[relative] = entry
+        shared_cache[resolved_inf] = tuple(run_entries)
+
+    entries = list(manifest_entries.values())
     entries.extend(special_entries.values())
     return sorted(entries, key=lambda item: str(item["path"]).casefold())
 
 
-def _plot_signature(plan: _PlotBatchPlan, renderer: Any) -> str:
+def _plot_signature(
+    plan: _PlotBatchPlan,
+    renderer: Any,
+    source_manifest_cache: dict[str, tuple[dict[str, Any], ...]] | None = None,
+) -> str:
     payload = {
         "version": PLOT_MANIFEST_VERSION,
         "sustained_sdpf_result_version": (
@@ -916,7 +974,12 @@ def _plot_signature(plan: _PlotBatchPlan, renderer: Any) -> str:
             if plan.event_name == sustained_sdpf.SUSTAINED_SDPF
             else None
         ),
-        "sources": _plot_source_manifest(plan.project_root, renderer, plan.jobs),
+        "sources": _plot_source_manifest(
+            plan.project_root,
+            renderer,
+            plan.jobs,
+            source_manifest_cache,
+        ),
         "jobs": [
             _plot_job_manifest_payload(job)
             for job in sorted(plan.jobs, key=_plot_job_sort_key)
@@ -1009,7 +1072,11 @@ def _write_plot_manifest(
         pass
 
 
-def _plot_manifest_matches(plan: _PlotBatchPlan, renderer: Any) -> bool:
+def _plot_manifest_matches(
+    plan: _PlotBatchPlan,
+    renderer: Any,
+    source_manifest_cache: dict[str, tuple[dict[str, Any], ...]] | None = None,
+) -> bool:
     output_dir = plan.output_dir
     if not output_dir.is_dir():
         return False
@@ -1018,7 +1085,11 @@ def _plot_manifest_matches(plan: _PlotBatchPlan, renderer: Any) -> bool:
     entry = entries.get(_plot_cache_key(plan.project_root, output_dir)) if isinstance(entries, dict) else None
     if not isinstance(entry, dict):
         return False
-    if entry.get("version") != PLOT_MANIFEST_VERSION or entry.get("signature") != _plot_signature(plan, renderer):
+    if (
+        entry.get("version") != PLOT_MANIFEST_VERSION
+        or entry.get("signature")
+        != _plot_signature(plan, renderer, source_manifest_cache)
+    ):
         return False
     records = entry.get("outputs")
     if not isinstance(records, list):
@@ -1277,6 +1348,7 @@ def _render_plot_batches_direct(
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
     rms_settings: Mapping[str, Any] | None = None,
+    rms_catalog_context: PlotterCatalogContext | None = None,
 ) -> None:
     _cancel(check_cancel)
     selected_scopes = list(scopes)
@@ -1294,6 +1366,7 @@ def _render_plot_batches_direct(
         project_root,
         log,
         check_cancel,
+        catalog_context=rms_catalog_context,
     )
 
     from pscad_plotter_app_v3.services.batch_excel import BatchExcelService
@@ -1303,6 +1376,7 @@ def _render_plot_batches_direct(
     limit_service = LimitService()
     batch_dir = project_root / "Plots" / "Plot_batch"
     plans: list[_PlotBatchPlan] = []
+    source_manifest_cache: dict[str, tuple[dict[str, Any], ...]] = {}
     selected_sustained_voltage_keys = (
         tuple(sustained_voltage_keys)
         if sustained_voltage_keys is not None
@@ -1438,7 +1512,7 @@ def _render_plot_batches_direct(
                     stage_dir=stage_dir,
                     jobs=jobs,
                 )
-                if _plot_manifest_matches(plan, renderer):
+                if _plot_manifest_matches(plan, renderer, source_manifest_cache):
                     _log(log, f"Skipping unchanged plots: {batch_file.name}")
                     try:
                         (output_dir / LEGACY_PLOT_MANIFEST_FILENAME).unlink(missing_ok=True)
@@ -1528,6 +1602,7 @@ def render_plot_batches(
         str, sustained_sdpf.SustainedSDPFCacheValidation
     ] | None = None,
     rms_settings: Mapping[str, Any] | None = None,
+    rms_catalog_context: PlotterCatalogContext | None = None,
 ) -> None:
     selected_scopes = list(scopes)
     selected_events = list(events)
@@ -1551,6 +1626,7 @@ def render_plot_batches(
         excel_waveform_exports_enabled=excel_waveform_exports_enabled,
         sustained_cache_validations_by_scope=sustained_cache_validations_by_scope,
         rms_settings=rms_settings,
+        rms_catalog_context=rms_catalog_context,
     )
     if sustained_sdpf_settings is not None or sustained_sdpf.SUSTAINED_SDPF in selected_events:
         render_sustained_heatmaps(
