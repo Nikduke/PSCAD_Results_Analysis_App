@@ -1,6 +1,6 @@
 # PSCAD Results Analysis Methods
 
-Last reviewed: 2026-09-25
+Last reviewed: 2026-09-26
 
 This document describes the methods implemented by the current app. It is a code-level description of the data flow and calculations, not a replacement for the PSCAD model specification or an engineering acceptance standard.
 
@@ -10,7 +10,8 @@ The main implementation modules are:
 - `src/results_analysis_app/scanner.py` - project discovery, NonConv proposals, and PSCAD-log high-voltage proposals.
 - `src/results_analysis_app/voltage_envelope.py` - raw waveform reads, high-voltage checks, per-run envelopes, and envelope workbook data.
 - `src/results_analysis_app/resonance_checks.py` - Stress, Late Growth, and No-settle Growth checks.
-- `src/results_analysis_app/rms_analysis.py` - project-specific RMS selection from the project's MM-results catalog and RMS batch rows.
+- `src/results_analysis_app/rms_analysis.py` - project-specific RMS selection, Real RMS/legacy method switching, and RMS batch rows.
+- `src/results_analysis_app/real_rms.py` - creator-style instantaneous LGp/LLp to one-cycle RMS conversion used by the Real RMS method.
 - `src/results_analysis_app/sustained_sdpf.py` - chronological Sustained SDPF stress assessment, rank-sorted manual-plot summary, and compact result persistence.
 - `src/results_analysis_app/sustained_sdpf_heatmap.py` - project-specific incidence aggregation and report-ready heatmap rendering from persisted Sustained SDPF observations.
 - `src/results_analysis_app/common.py` - shared cancellation, logging, boolean normalization, and atomic workbook helpers used by workflow stages.
@@ -47,11 +48,12 @@ files. `Run analysis` and report rebuilding do not refresh dashboard data.
 
 The source code and focused tests are authoritative. The compact cache
 versions currently governing invalidation are: project scan **8**, project
-analysis **1**, envelope manifest **3**, RMS result selection **3**, Sustained
-result JSON **19**, Sustained summary workbook **4**, plot batch manifest **3**,
-report manifest **2**, RMS report layout **2**, Sustained report layout **3**,
-and embedded plotter SQLite/MM caches **3/3**. No processed
-waveform arrays are persisted.
+analysis **1**, envelope run-data **1**, envelope manifest **3**, RMS result
+selection **5**, Sustained result JSON **19**, Sustained summary workbook **4**,
+plot batch manifest **4**, report manifest **2**, RMS report layout **3**,
+Sustained report layout **3**, and embedded plotter SQLite/MM caches **3/3**.
+The optional envelope run-data cache persists compact derived arrays only; raw
+PSCAD waveform arrays are never persisted.
 
 ## 1. End-to-end method
 
@@ -60,12 +62,12 @@ For each selected project, scope, and voltage, the app follows this sequence:
 1. Read or restore the project scan. The scan identifies `.inf` run descriptors, project timing, frequency, voltage levels, existing outputs, NonConv proposals, and (when available) PSCAD-log high-voltage candidates.
 2. Resolve the selected voltage configuration from `Input_Data_PSCAD*.xlsx` and `.inf` signal prefixes. The configuration supplies the MM bus prefix and `Um`.
 3. Apply the selected Manual and NonConv exclusions before submitting waveform work. High Voltage rows are checked against raw waveforms during the build itself; an unchecked High Voltage row creates an exact include override.
-4. Read the selected raw `.out` channels, check high voltage, and create a chronological rolling envelope for every surviving case/run/bus and measurement type.
+4. Reuse source/signature-valid derived run data when the project cache is enabled. For cache misses, read the selected raw `.out` channels, check high voltage, and create a chronological rolling envelope for every surviving case/run/bus and measurement type. Current scope, bus exclusions, and High Voltage include overrides are applied after cached data is loaded.
 5. Merge the per-run phase candidates into the base `MM_<voltage>.xlsx` workbook, preserving the source Case, Run, fault type, and MM name for each phase and for the overall maximum.
-6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already in memory. If Sustained SDPF is enabled, assess each raw fixed phase/pair from the same loaded worker data; no separate `.out` read is performed. If RMS is enabled, use the project MM catalog, restrict rows to Case/Run/MM/voltage combinations backed by the `.inf` run index, and select the project-specific MM elements and LG/LL quantities from those parsed/cached `Results/MM results.csv` rows; it does not reread raw `.out` files. The UI-held catalog is reused when current, otherwise the connected run loads it once and reuses it for RMS selection, batch creation, rendering, and report text.
+6. If enabled, run the Stress/Late/No-settle checks from the chronological per-run envelope data already loaded from cache or raw sources. If Sustained SDPF is enabled, use cached Sustained result rows when valid, otherwise assess each raw fixed phase/pair during the same worker read; no second `.out` pass is performed. If RMS is enabled, preserve the selected MM elements, LG/LL quantities, and switching-time filters from the project MM catalog. The catalog selects the governing Case/Run/MM rows using the existing reported RMS columns. With **Real RMS** enabled (the default), recompute only those selected rows from instantaneous `LGp`/`LLp` channels using the creator's one-cycle, half-cycle-update RVC method, then pass the method metadata to the existing renderer. The app does not scan every eligible raw run for a second ranking. With Real RMS disabled, use the reported `LGr`/`LLr`/`LGrm`/`LLrm` catalog values exactly as before; no raw waveform reread is needed. The UI-held catalog is reused when current, otherwise the connected run loads it once and reuses it for RMS selection, batch creation, rendering, and report text. RMS logs record the active filters, catalog-selected row count, selected source-run count, enriched/fallback row counts, and missing/failed sources.
 7. Write the base workbook, resonance workbook, combined Excel charts, compact Sustained SDPF JSON metadata, rank-sorted Sustained SDPF summary workbook, plot batches, rendered waveform plots, and DOCX reports through the selected workflow steps. Automatically generated waveform plot batches request Excel exports by default; the Settings option `Create automatic Excel waveform exports` can disable those `.xlsx` writes without changing the PNG plots or analysis results.
 
-The selected voltage levels submit their raw-read jobs concurrently through one shared bounded process pool. The pool cap is shared across voltages, so concurrency does not multiply the configured worker count. The automatic worker setting selects the ceiling of 80% of detected logical CPUs, capped at 60 and reduced when fewer runs exist. A positive manual value remains available when a machine or workload needs a different balance. This scheduling change does not alter envelope, resonance, exclusion, or Sustained SDPF calculations.
+Cache misses for the selected voltage levels submit raw-read jobs concurrently through one shared bounded process pool. The pool cap is shared across voltages, so concurrency does not multiply the configured worker count. The automatic worker setting selects the ceiling of 80% of detected logical CPUs, capped at 60 and reduced when fewer runs exist. A positive manual value remains available when a machine or workload needs a different balance. This scheduling and caching behavior does not alter envelope, resonance, exclusion, or Sustained SDPF calculations.
 
 ### 1.1 Analysis paths and selection rules
 
@@ -76,7 +78,7 @@ The app has several distinct analysis paths. Their inputs, qualification rules, 
 | High Voltage | Every finite raw LG and LL phase/pair sample against `high-voltage factor × Um × sqrt(2)` | Any exceeding phase excludes the complete Case/Run/MM bus from both measurements; this is an exclusion gate, not a severity ranking | Detailed exclusions in the envelope workbook and consolidated UI rows |
 | Representative envelope | Per-phase centered half-cycle rolling absolute envelopes, then the ranked cross-case representative rows | Source phase rows are ranked by magnitude and aligned by rank; the merged maximum keeps its source provenance | `MM_<voltage>.xlsx` and combined Excel envelope charts |
 | TOV, SFO, and SA event selection | The representative envelope workbook at one configured event time | Select the nearest valid row within `0.001 s` (`LLp` for TOV/SFO, `LGp` for SA); this is plot/report row selection, not a new compliance test | Event batch rows, envelope values, waveform plots, and report text |
-| RMS | Project parsed/cached `Results/MM results.csv` rows for the selected project, voltage, MM elements, and LG/LL quantities, restricted to `.inf`-backed Case/Run/MM/voltage combinations when an inventory is available and to the active switching-time selection | `Input_Data!B5` values `Sequential` and `None` use sorted discrete switching-time values (all selected by default); other values use an inclusive start/end range (defaulting to the available minimum/maximum). A row qualifies when any available `Tswitch_a/b/c` value is inside the selection. For each selected voltage and quantity, choose one maximum (`LGr`/`LLr`) and one minimum (`LGrm`/`LLrm`) after excluding minimums at or below `0.05 pu`; LG pu uses `voltage / sqrt(3)`, LL pu uses `voltage` | Separate `RMS_LG`/`RMS_LL` batches and value-only `[kV]` annotations under `Plots/Generated/<scope>/RMS/LG|LL/`; report section immediately after event sections. A report-only rebuild with no raw `.inf` inventory retains existing CSV metadata for its existing plots. |
+| RMS | The selected project MM elements, LG/LL quantities, switching-time selection, and `.inf`-backed Case/Run/MM/voltage rows. The catalog's existing RMS columns choose the governing rows; Real RMS then recomputes only those rows from instantaneous `LGp`/`LLp` data for plots/reports. | `Input_Data!B5` values `Sequential` and `None` use sorted discrete switching-time values (all selected by default); other values use an inclusive start/end range (defaulting to the available minimum/maximum). A row qualifies when any available `Tswitch_a/b/c` value is inside the selection. For each selected voltage and quantity, choose one reported maximum and one reported minimum after excluding minimums at or below `0.05 pu`; LG pu uses `voltage / sqrt(3)`, LL pu uses `voltage`. The Real RMS toggle is project-specific, defaults on, and off selects the legacy catalog method. | Separate `RMS_LG`/`RMS_LL` batches and value-only `[kV]` annotations under `Plots/Generated/<scope>/RMS/LG|LL/`; batch metadata carries the method and frequency, and report text identifies the method. If a selected raw source is unavailable, that row falls back to the catalog value. A report-only rebuild with no raw `.inf` inventory uses the same catalog fallback. |
 | Post-event Stress | Chronological per-run envelope `E(t)` after release/manual start | Keep positive-area findings and rank by `A_post = integral(max(E - Vlim, 0))` | Top N per `(check, voltage, measurement)` in `Resonance_Checks.xlsx` |
 | Late Growth | Smoothed chronological envelope after release/manual start | Positive-slope and relevance gates, then rank by `(sigma, growth ratio, positive fraction, tail p95 / Vlim)` | Top N per `(check, voltage, measurement)` and result plots |
 | No-settle Growth | Smoothed post-guard envelope when automatic release is not found | Positive-slope and relevance gates, then rank by `(sigma, positive fraction, longest positive-growth window, growth ratio, end p95 / Vlim, area)` | Top N per `(check, voltage, measurement)` and result plots |
@@ -109,7 +111,7 @@ Run identity comes from the `.inf` filename parser and is represented as `(Case,
 - `Input_Data` supplies `Frequency`, `Final duration`, and the project `Switch type` in cell `B5` when present. Cell `B16` is the frequency fallback location. The scan stores the switch type with the project metadata so the RMS selector does not reopen the workbook.
 - `MM_blocks` supplies the voltage/`Un` and `Um` values and identifies the MM bus prefix.
 
-If a project configuration is incomplete, voltage prefixes can still be discovered from `.inf` groups and `Um` can be supplied as a project-specific Settings override. If automatic frequency detection fails, the project frequency is used first, then the Settings fallback (default 50 Hz).
+If a project configuration is incomplete, voltage prefixes can still be discovered from `.inf` groups and `Um` can be supplied as a project-specific Settings override. If automatic frequency detection fails, the project frequency is used first, then the Settings fallback (default 50 Hz). Real RMS uses that resolved project frequency to locate the fundamental zero crossings; it does not change the selected switching-time or MM-element filters.
 
 ### 2.3 Fault type mapping
 
@@ -342,17 +344,26 @@ the choice is restored by canonical project path when the active project
 changes.
 
 The source is the project's already parsed/cached `Results/MM results.csv` catalog. The
-bus name is the catalog's existing MM identity, so RMS does not rescan the
-input workbook or reread raw waveform `.out` files. For each selected voltage
-and enabled quantity, the selector ranks the selected rows and retains one
-maximum (`LGr [kV]` or `LLr [kV]`) and one minimum (`LGrm [kV]` or `LLrm [kV]`).
+bus name is the catalog's existing MM identity. For `Sequential`/`None` switch
+types, the popup uses a sorted list with normal extended selection: a plain
+click selects one switching time and Ctrl+click adds or removes additional
+times. For each selected voltage and enabled quantity, the selector ranks the
+selected rows and retains one maximum (`LGr [kV]` or `LLr [kV]`) and one minimum
+(`LGrm [kV]` or `LLrm [kV]`). The catalog therefore remains authoritative for
+the governing Case/Run/MM identity. With Real RMS enabled, only those selected
+rows are recomputed from their instantaneous `LGp`/`LLp` channels for the
+plot/report values; the application does not rerank every eligible raw run.
 Minimum candidates with a reported or derived value at or below `0.05 pu` are
 ignored. When a pu column is missing, LG uses `value / (voltage / sqrt(3))` and
 LL uses `value / voltage`. Voltage levels are filtered explicitly; an empty
 selection produces no RMS rows.
 
 The selected maximum and minimum rows become separate `RMS_LG` and `RMS_LL`
-batch rows using the existing MM renderer. Each row sets exactly one of the
+batch rows using the existing MM renderer. When Real RMS is enabled, the batch
+row carries its method and frequency metadata and the renderer replaces the
+visible `LGr`/`LLr` trace with the creator-style RMS trace from instantaneous
+data. If the selected raw source is unavailable, that row falls back to the
+catalog trace and the log records the fallback. Each row sets exactly one of the
 standard `annotate_max` or `annotate_min` flags; the renderer reports only the
 global value with its unit, for example `87.5 [kV]`, and does not add an RMS
 label, time, marker, or vertical line. No new plotting engine or binary
@@ -440,9 +451,9 @@ and the parent atomically replaces the complete voltage/set output after all
 pages succeed. This changes rendering concurrency only; it does not change
 grouping, split, incidence, or selection logic.
 
-Envelope builds do not retain processed waveform DataFrames between runs. Raw arrays and processed envelope frames exist only during the current build, while the project `.state/analysis_cache.json` keeps one small envelope signature and generated-output record so an unchanged complete stage can be skipped.
+Envelope builds do not retain raw waveform arrays between runs. When the project-specific **Cache analyzed run data** setting is enabled, the separate `.state/envelope_data.sqlite3` cache retains compact derived per-run envelope arrays and Sustained result rows, validated by source metadata and calculation settings; it never stores raw PSCAD `.out` samples. The cached time and `Max_*` arrays use `float32` deliberately: this keeps the numeric payload compact (a representative compressed array was about 742 KB as `float32` versus 1.53 MB as `float64`) while the final envelope workbook rounds maxima to `0.1 kV`; the tested round-trip error stayed below `0.0001 kV`. Switching the entire cache to `float64` is therefore not required for the current engineering output contract, would approximately double numeric cache storage, and should only be reconsidered if exact pre-rounding reproducibility at threshold boundaries becomes a requirement. Cache writes are committed once per build. When disabled, a required envelope build bypasses that cache. The project `.state/analysis_cache.json` still keeps one small envelope signature and generated-output record so an unchanged complete stage can be skipped.
 
-The project analysis cache has one explicit schema version and stores only stage signatures, output paths, sizes, and modification times. Its envelope signature includes both the current Sustained result version and the summary-workbook format version, so a summary-only layout change rebuilds the envelope/summary outputs while leaving the engineering result schema unchanged. Sustained plot jobs apply the same project SDPF RMS overrides used by detection and retain the workbook SIWL fields unchanged; the plot signature includes the resulting effective limits and current Sustained result version.
+The project analysis cache has one explicit schema version and stores stage signatures, output paths, sizes, modification times, and the project cache setting. Its envelope signature includes both the current Sustained result version and the summary-workbook format version, so a summary-only layout change rebuilds the envelope/summary outputs while leaving the engineering result schema unchanged. Sustained plot jobs apply the same project SDPF RMS overrides used by detection and retain the workbook SIWL fields unchanged; the plot signature includes the resulting effective limits and current Sustained result version.
 
 The Sustained result version is also included in the centralized plot and report signatures. A plot or DOCX produced from an obsolete Sustained result cannot be accepted by a later report-only/render-only action; the affected output is regenerated from the current result JSON.
 

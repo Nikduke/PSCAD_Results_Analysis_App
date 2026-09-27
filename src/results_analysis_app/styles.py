@@ -361,7 +361,7 @@ QTabBar::tab:selected {{
     color: {theme.text};
     font-weight: 600;
 }}
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+QLineEdit, QComboBox {{
     background-color: {theme.input};
     color: {theme.text};
     border: 1px solid {theme.border};
@@ -370,10 +370,39 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     selection-background-color: {theme.selection};
     selection-color: {theme.selected_text};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+QSpinBox, QDoubleSpinBox {{
+    background-color: {theme.input};
+    color: {theme.text};
+    padding: 3px 5px;
+    selection-background-color: {theme.selection};
+    selection-color: {theme.selected_text};
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-origin: border;
+    width: 16px;
+    background-color: {theme.control};
+    border-left: 1px solid {theme.border};
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-position: top right;
+    border-bottom: 1px solid {theme.border};
+}}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-position: bottom right;
+}}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+    background-color: {theme.hover};
+}}
+QLineEdit:focus, QComboBox:focus {{
     border-color: {theme.focus};
 }}
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QComboBox:disabled {{
+    background-color: {theme.disabled_background};
+    color: {theme.disabled_text};
+}}
+QSpinBox:disabled, QDoubleSpinBox:disabled {{
     background-color: {theme.disabled_background};
     color: {theme.disabled_text};
 }}

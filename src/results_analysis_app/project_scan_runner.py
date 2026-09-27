@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from results_analysis_app import project_scan_cache, scanner, storage
-from results_analysis_app.common import CancelFn, LogFn
+from results_analysis_app.common import CancelFn, LogFn, ProgressFn
 
 
 @dataclass(frozen=True)
@@ -22,10 +22,14 @@ def scan_projects(
     high_voltage_limit_factor: float,
     voltage_um_overrides_by_project: dict[str, dict[str, float]] | None = None,
     check_cancel: CancelFn | None = None,
+    progress: ProgressFn | None = None,
 ) -> ProjectScanBatch:
     paths = list(project_paths)
     scans = {}
-    for project_path in paths:
+    total = len(paths)
+    if progress is not None:
+        progress(0, total, "Scanning projects")
+    for index, project_path in enumerate(paths, start=1):
         if check_cancel is not None:
             check_cancel()
         scans[project_path] = scanner.scan_project(
@@ -36,6 +40,8 @@ def scan_projects(
             voltage_um_overrides=(voltage_um_overrides_by_project or {}).get(project_path, {}),
             check_cancel=check_cancel,
         )
+        if progress is not None:
+            progress(index, total, f"Scanned project: {Path(project_path).name}")
     return ProjectScanBatch(current_path=current_path, scans=scans)
 
 
@@ -50,6 +56,7 @@ def scan_projects_cached(
     force: bool = False,
     check_cancel: CancelFn | None = None,
     log: LogFn | None = None,
+    progress: ProgressFn | None = None,
     cache_path: Path = storage.PROJECT_SCAN_CACHE_PATH,
 ) -> ProjectScanBatch:
     paths = list(dict.fromkeys(str(Path(path).resolve()) for path in project_paths))
@@ -59,6 +66,10 @@ def scan_projects_cached(
     stale_paths: list[str] = []
     refreshed_paths: list[str] = []
     manifests: dict[str, dict] = {}
+    completed = 0
+    total = len(paths)
+    if progress is not None:
+        progress(0, total, "Checking project cache")
 
     for project_path in paths:
         if check_cancel is not None:
@@ -162,6 +173,13 @@ def scan_projects_cached(
                             f"{Path(project_path).name} | {exc}"
                         )
             scans[project_path] = cached
+            completed += 1
+            if progress is not None:
+                progress(
+                    completed,
+                    total,
+                    f"Checked project: {Path(project_path).name}",
+                )
             if any(
                 project_scan_cache.manifest_section_changed(
                     cache,
@@ -185,6 +203,15 @@ def scan_projects_cached(
             high_voltage_limit_factor,
             voltage_um_overrides_by_project,
             check_cancel=check_cancel,
+            progress=(
+                None
+                if progress is None
+                else lambda index, _stale_total, message: progress(
+                    completed + index,
+                    total,
+                    message,
+                )
+            ),
         )
         scans.update(fresh.scans)
         if log is not None:

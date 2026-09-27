@@ -17,9 +17,10 @@ App context:
   global token filters. Do not let one project provide another project's
   exclusions, dashboard selection, settings, scan rows, status, or outputs.
 - The project scan cache and project analysis cache are compact metadata caches;
-  `Sustained_SDpf.json` is compact engineering metadata and heatmap flags. No
-  persistent cache stores raw waveform arrays or acts as a replacement for
-  source PSCAD `.out` data.
+  `Sustained_SDpf.json` is compact engineering metadata and heatmap flags. The
+  optional project-local envelope run-data cache stores compact derived arrays,
+  but no persistent cache stores raw waveform arrays or acts as a replacement
+  for source PSCAD `.out` data.
 - `graphify-out/` is the generated local repository graph. If it exists, use
   Graphify `query`, `path`, and `explain` as the primary architecture/navigation
   layer before opening source files. Rebuild it after source changes with
@@ -69,17 +70,25 @@ Current output contract:
 - Generated plots and heatmaps: `Plots/Generated/<scope>/`.
 - RMS batches and outputs: `Plots/Plot_batch/batch_paste_<scope>_RMS_LG.xlsx`,
   `batch_paste_<scope>_RMS_LL.xlsx`, and `Plots/Generated/<scope>/RMS/LG|LL/`.
-  `Input_Data!B5` selects discrete switching-time checkboxes for `Sequential`/
-  `None`, or inclusive start/end fields for other switch types; all available
-  times are selected by default.
+  The project-specific Real RMS method is on by default; clearing it uses the
+  legacy catalog RMS columns while preserving the same MM and switching-time
+  selections.
+  `Input_Data!B5` selects a discrete switching-time list for `Sequential`/
+  `None` (click one item, Ctrl+click to add/remove multiple items), or
+  inclusive start/end fields for other switch types; all available times are
+  selected by default.
 - Reports: `Reports/<scope>/`.
 - Stage signatures/output metadata: the single project-local
   `.state/analysis_cache.json`.
+- Optional derived envelope run-data cache: project-local
+  `.state/envelope_data.sqlite3`; controlled by the project-specific
+  **Cache analyzed run data** setting, enabled by default.
 
 Current invalidation versions are project scan 8, project analysis 1,
-envelope manifest 3, RMS result selection 3, Sustained result 19, Sustained
-summary workbook 4, plot batch 3, report manifest 2, RMS report layout 2,
-Sustained report layout 3, and embedded plotter SQLite/MM caches 3/3.
+envelope run-data cache 1, envelope manifest 3, RMS result selection 5,
+Sustained result 19, Sustained summary workbook 4, plot batch 4, report
+manifest 2, RMS report layout 3, Sustained report layout 3, and embedded
+plotter SQLite/MM caches 3/3.
 Obsolete or incomplete artifacts must be rebuilt rather than treated as a
 valid empty result.
 

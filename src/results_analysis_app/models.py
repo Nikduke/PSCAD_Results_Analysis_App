@@ -511,7 +511,12 @@ class AppSession:
         )
         self.rms_settings_by_project.setdefault(
             resolved,
-            {"enabled": False, "quantities": ["LG", "LL"], "elements": []},
+            {
+                "enabled": False,
+                "quantities": ["LG", "LL"],
+                "elements": [],
+                "real_rms": True,
+            },
         )
 
     def remove_projects(self, paths: set[str]) -> None:

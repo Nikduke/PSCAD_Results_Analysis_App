@@ -38,6 +38,8 @@ def build_mm_jobs(
             annotate_max=request.annotate_max,
             annotate_min=request.annotate_min,
             plot_variant=plot_variant,
+            real_rms=request.real_rms,
+            real_rms_frequency_hz=request.real_rms_frequency_hz,
         )
         for element_name in request.elements
         for run_number in request.run_numbers

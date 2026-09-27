@@ -1,10 +1,10 @@
-"""Project-specific RMS voltage selection and batch-row preparation.
+"""Project-specific RMS selection and plot-batch preparation.
 
-The RMS study uses the already parsed ``MM results.csv`` rows.  New plot
-batches restrict those rows to Case/Run/MM/voltage combinations backed by the
-project's available run index.  The active project settings provide the
-selected MM elements, RMS quantities, and either discrete switching times or
-an inclusive switching-time range.
+The project catalog remains authoritative for the governing Case/Run/MM rows.
+When Real RMS is enabled, those selected rows carry metadata that makes the
+plotter recompute their visible traces from instantaneous ``LGp``/``LLp``
+waveforms.  The explicit legacy path keeps using the reported ``LGr``/``LLr``
+catalog traces.
 """
 
 from __future__ import annotations
@@ -12,15 +12,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Iterable, Mapping
 
 from results_analysis_app.project_config import normalize_voltage
+from results_analysis_app import real_rms
 
 RMS_QUANTITIES = ("LG", "LL")
 RMS_BATCH_EVENTS = {"LG": "RMS_LG", "LL": "RMS_LL"}
 RMS_TRACE_TYPES = {"LG": "LGr", "LL": "LLr"}
 # Increment when the selected Case/Run/MM population or RMS calculations change.
-RMS_RESULT_VERSION = 3
+RMS_RESULT_VERSION = 5
 RMS_MIN_VALID_PU = 0.05
 VOLTAGE_EPSILON_KV = 1e-6
 RMS_REPORT_VARIANT_ORDER = ("max", "min")
@@ -48,6 +50,8 @@ class RMSSelection:
     value_kv: float
     value_pu: float | None
     source_row: Mapping[str, object]
+    real_rms: bool = False
+    frequency_hz: float | None = None
 
     @property
     def voltage_key(self) -> str:
@@ -108,6 +112,7 @@ def normalize_rms_settings(value: object) -> dict[str, Any]:
             "enabled": False,
             "quantities": [*RMS_QUANTITIES],
             "elements": [],
+            "real_rms": True,
             "switching_time_mode": RMS_SWITCHING_TIME_MODE_ALL,
             "switching_times": [],
             "switching_time_start_s": None,
@@ -142,6 +147,7 @@ def normalize_rms_settings(value: object) -> dict[str, Any]:
         "enabled": bool(value.get("enabled", False)),
         "quantities": [quantity for quantity in RMS_QUANTITIES if quantity in quantities],
         "elements": sorted(elements, key=str.casefold),
+        "real_rms": bool(value.get("real_rms", True)),
         "switching_time_mode": mode,
         "switching_times": _normalize_switching_times(value.get("switching_times")),
         "switching_time_start_s": _finite_float(value.get("switching_time_start_s")),
@@ -286,31 +292,19 @@ def available_mm_row_keys(records: Iterable[object]) -> set[RMSRowKey]:
     return keys
 
 
-def select_rms_rows(
+def _filtered_rms_rows(
     rows: Iterable[Mapping[str, object]],
     *,
     selected_elements: Iterable[str],
-    selected_quantities: Iterable[str] = RMS_QUANTITIES,
-    selected_voltages: Iterable[str] | None = None,
-    available_keys: Iterable[RMSRowKey] | None = None,
-    switching_time_mode: str = RMS_SWITCHING_TIME_MODE_ALL,
-    selected_switching_times: Iterable[float] = (),
-    switching_time_start_s: float | None = None,
-    switching_time_end_s: float | None = None,
-) -> list[RMSSelection]:
-    """Select one governing max and min row per voltage and quantity.
-
-    Ranking follows the reference method: max uses the reported RMS peak, min
-    uses the reported RMS minimum after excluding values at or below 0.05 pu.
-    Duplicate Case/Bus rows are collapsed before selecting one unique case.
-    """
+    selected_voltages: Iterable[str] | None,
+    available_keys: Iterable[RMSRowKey] | None,
+    switching_time_mode: str,
+    selected_switching_times: Iterable[float],
+    switching_time_start_s: float | None,
+    switching_time_end_s: float | None,
+) -> list[dict[str, object]]:
+    """Apply the shared MM-element, voltage, run, and switch-time filters."""
     element_keys = {str(item).strip().casefold() for item in selected_elements if str(item).strip()}
-    selected_quantity_keys = {
-        normalized
-        for item in selected_quantities
-        if (normalized := normalize_rms_quantity(item))
-    }
-    quantities = [quantity for quantity in RMS_QUANTITIES if quantity in selected_quantity_keys]
     voltage_keys = None if selected_voltages is None else {
         normalized
         for value in selected_voltages
@@ -356,6 +350,43 @@ def select_rms_rows(
         row["Run#"] = int(run_number)
         row["Bus voltage [kV]"] = float(voltage_kv)
         candidates.append(row)
+    return candidates
+
+
+def select_rms_rows(
+    rows: Iterable[Mapping[str, object]],
+    *,
+    selected_elements: Iterable[str],
+    selected_quantities: Iterable[str] = RMS_QUANTITIES,
+    selected_voltages: Iterable[str] | None = None,
+    available_keys: Iterable[RMSRowKey] | None = None,
+    switching_time_mode: str = RMS_SWITCHING_TIME_MODE_ALL,
+    selected_switching_times: Iterable[float] = (),
+    switching_time_start_s: float | None = None,
+    switching_time_end_s: float | None = None,
+) -> list[RMSSelection]:
+    """Select one governing max and min row per voltage and quantity.
+
+    Ranking follows the reference method: max uses the reported RMS peak, min
+    uses the reported RMS minimum after excluding values at or below 0.05 pu.
+    Duplicate Case/Bus rows are collapsed before selecting one unique case.
+    """
+    selected_quantity_keys = {
+        normalized
+        for item in selected_quantities
+        if (normalized := normalize_rms_quantity(item))
+    }
+    quantities = [quantity for quantity in RMS_QUANTITIES if quantity in selected_quantity_keys]
+    candidates = _filtered_rms_rows(
+        rows,
+        selected_elements=selected_elements,
+        selected_voltages=selected_voltages,
+        available_keys=available_keys,
+        switching_time_mode=switching_time_mode,
+        selected_switching_times=selected_switching_times,
+        switching_time_start_s=switching_time_start_s,
+        switching_time_end_s=switching_time_end_s,
+    )
 
     output: list[RMSSelection] = []
     for voltage_kv in sorted(
@@ -385,27 +416,240 @@ def select_rms_rows(
     return output
 
 
+def apply_real_rms_to_selections(
+    selections: Iterable[RMSSelection],
+    *,
+    run_index: Mapping[str, Mapping[int, Path]],
+    frequency_hz: float | None = None,
+    check_cancel: Callable[[], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> list[RMSSelection]:
+    """Recompute only the already-selected rows from instantaneous waveforms.
+
+    The catalog selector deliberately remains the source of governing-row
+    identity.  Raw data is used only for the selected plot/report rows, so
+    enabling Real RMS cannot change which Case/Run/MM was selected or require
+    a full scan of every eligible source run.
+    """
+    selected = list(selections)
+    if not selected:
+        if log is not None:
+            log(
+                "RMS Real RMS enrichment: selected rows=0; source runs=0; "
+                "computed source runs=0; enriched rows=0; fallback rows=0"
+            )
+        return []
+
+    try:
+        resolved_frequency = float(
+            frequency_hz or real_rms.DEFAULT_REAL_RMS_FREQUENCY_HZ
+        )
+    except (TypeError, ValueError):
+        resolved_frequency = real_rms.DEFAULT_REAL_RMS_FREQUENCY_HZ
+    if not math.isfinite(resolved_frequency) or resolved_frequency <= 0:
+        resolved_frequency = real_rms.DEFAULT_REAL_RMS_FREQUENCY_HZ
+
+    case_index = {
+        str(case_name).casefold(): runs
+        for case_name, runs in run_index.items()
+    }
+    groups_by_source: dict[tuple[str, int], tuple[str, set[str]]] = {}
+    for selection in selected:
+        source_key = (selection.case_name.casefold(), int(selection.run_number))
+        if source_key not in groups_by_source:
+            groups_by_source[source_key] = (selection.case_name, set())
+        groups_by_source[source_key][1].add(selection.element_name)
+
+    computed: dict[tuple[str, int, str, str], real_rms.RealRMSResult] = {}
+    computed_sources: set[tuple[str, int]] = set()
+    missing_paths = 0
+    failed_sources = 0
+    failure_samples: list[str] = []
+    quantities = sorted({selection.quantity for selection in selected})
+    for (case_key, run_number), (case_name, group_labels) in groups_by_source.items():
+        if check_cancel is not None:
+            check_cancel()
+        inf_path = case_index.get(case_key, {}).get(run_number)
+        if inf_path is None:
+            missing_paths += 1
+            continue
+        try:
+            group_results = real_rms.compute_groups_real_rms(
+                inf_path,
+                group_labels,
+                quantities,
+                resolved_frequency,
+                check_cancel=check_cancel,
+            )
+        except (OSError, ValueError, IndexError) as exc:
+            failed_sources += 1
+            if len(failure_samples) < 3:
+                failure_samples.append(
+                    f"{case_name} Run {run_number}: {type(exc).__name__}: {exc}"
+                )
+            continue
+        if not group_results:
+            failed_sources += 1
+            if len(failure_samples) < 3:
+                failure_samples.append(
+                    f"{case_name} Run {run_number}: no computable selected LGp/LLp groups"
+                )
+            continue
+        computed_sources.add((case_key, run_number))
+        for (group_label, quantity), result in group_results.items():
+            computed[(case_key, run_number, group_label.casefold(), quantity)] = result
+
+    output: list[RMSSelection] = []
+    enriched_rows = 0
+    fallback_rows = 0
+    for selection in selected:
+        result = computed.get(
+            (
+                selection.case_name.casefold(),
+                int(selection.run_number),
+                selection.element_name.casefold(),
+                selection.quantity,
+            )
+        )
+        if result is None:
+            output.append(selection)
+            fallback_rows += 1
+            continue
+        value_kv = result.max_kv if selection.variant == "max" else result.min_kv
+        reference_kv = selection.voltage_kv / (
+            math.sqrt(3.0) if selection.quantity == "LG" else 1.0
+        )
+        value_pu = value_kv / reference_kv if reference_kv > 0 else None
+        source_row = dict(selection.source_row)
+        max_col, max_pu_col, min_col, min_pu_col = _columns(selection.quantity)
+        value_col = max_col if selection.variant == "max" else min_col
+        pu_col = max_pu_col if selection.variant == "max" else min_pu_col
+        source_row[value_col] = value_kv
+        source_row[pu_col] = value_pu
+        output.append(
+            RMSSelection(
+                quantity=selection.quantity,
+                variant=selection.variant,
+                case_name=selection.case_name,
+                run_number=selection.run_number,
+                element_name=selection.element_name,
+                voltage_kv=selection.voltage_kv,
+                value_kv=float(value_kv),
+                value_pu=value_pu,
+                source_row=source_row,
+                real_rms=True,
+                frequency_hz=resolved_frequency,
+            )
+        )
+        enriched_rows += 1
+
+    if log is not None:
+        log(
+            "RMS Real RMS enrichment: "
+            f"selected rows={len(selected)}; "
+            f"source runs={len(groups_by_source)}; "
+            f"computed source runs={len(computed_sources)}; "
+            f"enriched rows={enriched_rows}; "
+            f"fallback rows={fallback_rows}; "
+            f"missing source paths={missing_paths}; "
+            f"failed sources={failed_sources}"
+        )
+        for failure in failure_samples:
+            log(f"RMS raw source failure: {failure}")
+    return output
+
+
 def select_rms_rows_from_catalog(
     catalog: object,
     settings: object,
     selected_voltages: Iterable[str] | None = None,
+    *,
+    run_index: Mapping[str, Mapping[int, Path]] | None = None,
+    frequency_hz: float | None = None,
+    check_cancel: Callable[[], None] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> list[RMSSelection]:
     """Select RMS rows from an authoritative plotter catalog."""
     parsed = normalize_rms_settings(settings)
     if not parsed["enabled"]:
         return []
-    available_keys = available_mm_row_keys(getattr(catalog, "mm_elements", ()))
-    return select_rms_rows(
+    mm_elements = getattr(catalog, "mm_elements", ()) or ()
+    available_keys = available_mm_row_keys(mm_elements)
+    selected_voltage_values = (
+        None if selected_voltages is None else list(selected_voltages)
+    )
+    # Report-only rebuilds may have the catalog CSV but no surviving .inf
+    # inventory.  Preserve the catalog fallback in that case; a populated
+    # MM inventory still constrains rows to available Case/Run/MM/voltage keys.
+    if not mm_elements:
+        available_keys = None
+    selections = select_rms_rows(
         getattr(catalog, "mm_results", ()),
         selected_elements=parsed["elements"],
         selected_quantities=parsed["quantities"],
-        selected_voltages=selected_voltages,
+        selected_voltages=selected_voltage_values,
         available_keys=available_keys,
         switching_time_mode=parsed["switching_time_mode"],
         selected_switching_times=parsed["switching_times"],
         switching_time_start_s=parsed["switching_time_start_s"],
         switching_time_end_s=parsed["switching_time_end_s"],
     )
+    quantity_text = ",".join(parsed["quantities"]) or "none"
+    element_count = len(parsed["elements"])
+    if element_count <= 8:
+        element_text = ",".join(parsed["elements"]) or "none"
+    else:
+        element_text = f"{element_count} selected"
+    if selected_voltage_values is None:
+        voltage_text = "all"
+    else:
+        voltage_keys = sorted(
+            {
+                normalized
+                for value in selected_voltage_values
+                if (normalized := normalize_voltage(value))
+            },
+            key=str,
+        )
+        voltage_text = ",".join(voltage_keys) or "none"
+    switching_mode = parsed["switching_time_mode"]
+    if switching_mode == RMS_SWITCHING_TIME_MODE_DISCRETE:
+        switching_text = "discrete[" + ",".join(
+            f"{value:g}" for value in parsed["switching_times"]
+        ) + "]"
+    elif switching_mode == RMS_SWITCHING_TIME_MODE_RANGE:
+        start = parsed["switching_time_start_s"]
+        end = parsed["switching_time_end_s"]
+        switching_text = f"range[{start:g}..{end:g}]" if start is not None and end is not None else "range[invalid]"
+    else:
+        switching_text = "all"
+    if log is not None:
+        log(
+            "RMS filters: "
+            f"quantities={quantity_text}; elements={element_text}; "
+            f"voltages={voltage_text}; switching={switching_text}"
+        )
+    if parsed["real_rms"] and run_index is not None:
+        if log is not None:
+            log(
+                "RMS catalog selection: method=MM results.csv; "
+                f"selected rows={len(selections)}; Real RMS enrichment=on"
+            )
+        return apply_real_rms_to_selections(
+            selections,
+            run_index=run_index,
+            frequency_hz=frequency_hz,
+            check_cancel=check_cancel,
+            log=log,
+        )
+    if log is not None:
+        method = (
+            "MM results.csv"
+            if not parsed["real_rms"]
+            else "MM results.csv fallback (raw run index unavailable)"
+        )
+        log(f"RMS catalog selection: method={method}; selected rows={len(selections)}")
+    return selections
 
 
 def rms_batch_rows(
@@ -421,6 +665,8 @@ def rms_batch_rows(
                 "run": selection.run_number,
                 "element": selection.element_name,
                 "trace": RMS_TRACE_TYPES[selection.quantity],
+                "real_rms": bool(selection.real_rms),
+                "real_rms_frequency_hz": selection.frequency_hz,
                 "overview": False,
                 "tov_windows": False,
                 "limits": False,

@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec
 
+from results_analysis_app import real_rms
 from pscad_plotter_app_v3.models import DEFAULT_TOV_WINDOW_S, PlotJob, PlotMode
 from pscad_plotter_app_v3.services.plot_naming import time_range_filename_token
 from pscad_plotter_app_v3.services.project_conventions import find_stat_file, parse_stat_rows
@@ -154,8 +155,8 @@ class MatplotlibRenderer:
             [*idx_map["LGp"], *idx_map["LLp"]],
             out_cache,
         )
-        bundle_lg = self._process_finder(job, inf_path, idx_map["LGp"], "LGp", "LGp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s)
-        bundle_ll = self._process_finder(job, inf_path, idx_map["LLp"], "LLp", "LLp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s)
+        bundle_lg = self._process_finder(job, inf_path, idx_map["LGp"], "LGp", "LGp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s, real_rms_enabled=job.real_rms)
+        bundle_ll = self._process_finder(job, inf_path, idx_map["LLp"], "LLp", "LLp", event_info, policy, out_cache, show_limits=job.show_limits, tov_window_s=job.tov_window_s, real_rms_enabled=job.real_rms)
         basename, title = self._make_labels(job.case_name, job.group_label, job.run_number, "LGp", event_info, combine=True)
 
         out = output_dir / f"{basename}_3Ph.png"
@@ -203,10 +204,26 @@ class MatplotlibRenderer:
 
     def _render_single(self, job: PlotJob, inf_path: Path, desc_df: list[InfDescriptor], event_info: dict[str, object] | None, output_dir: Path, finder: str) -> Path:
         idx_map = self._filter_signals(desc_df, job.group_label)
-        if finder not in idx_map:
-            raise ValueError(f"Signal '{finder}' not available for {job.group_label}")
+        display_finder = finder
+        source_finder = finder
+        if job.real_rms and finder in {"LGr", "LLr"}:
+            source_finder = "LGp" if finder == "LGr" else "LLp"
+        if source_finder not in idx_map:
+            raise ValueError(f"Signal '{source_finder}' not available for {job.group_label}")
         policy = self._get_group_policy()
-        bundle = self._process_finder(job, inf_path, idx_map[finder], finder, finder, event_info, policy, {}, show_limits=job.show_limits, tov_window_s=job.tov_window_s)
+        bundle = self._process_finder(
+            job,
+            inf_path,
+            idx_map[source_finder],
+            display_finder,
+            source_finder,
+            event_info,
+            policy,
+            {},
+            show_limits=job.show_limits,
+            tov_window_s=job.tov_window_s,
+            real_rms_enabled=job.real_rms,
+        )
         out = output_dir / f"{bundle['basename']}_3Ph.png"
 
         plt.figure(figsize=self.FIGSIZE)
@@ -268,6 +285,7 @@ class MatplotlibRenderer:
         out_cache: dict[int, _OutFileColumns],
         show_limits: bool,
         tov_window_s: float,
+        real_rms_enabled: bool = False,
     ) -> dict[str, Any]:
         data = self._load_standardized_group_frame(
             inf_path,
@@ -275,7 +293,18 @@ class MatplotlibRenderer:
             finder,
             idx_df=idx_df,
             out_cache=out_cache,
+            source_finder=finder if not real_rms_enabled else type_tag,
         )
+        if real_rms_enabled:
+            frequency = job.real_rms_frequency_hz or real_rms.DEFAULT_REAL_RMS_FREQUENCY_HZ
+            cache_key = (inf_path, str(job.group_label), f"Real{finder}:{float(frequency):g}")
+            cached = self._group_frame_cache.get(cache_key)
+            if cached is None:
+                cached = real_rms.compute_real_rms(data, frequency).frame
+                self._remember_group_frame(cache_key, cached)
+            else:
+                self._group_frame_cache.move_to_end(cache_key)
+            data = cached
         group_label = job.group_label
         data = self._crop_to_job_time_range(job, data)
         analysis = self._analyze_data(data, type_tag, policy, job.limits, show_limits, tov_window_s, job.tov_window_count)
@@ -343,8 +372,10 @@ class MatplotlibRenderer:
         *,
         idx_df: list[InfDescriptor],
         out_cache: dict[int, _OutFileColumns] | None = None,
+        source_finder: str | None = None,
     ) -> WaveformFrame:
-        key = (inf_path, str(group_label), str(finder))
+        source_finder = source_finder or finder
+        key = (inf_path, str(group_label), str(source_finder))
         cached = self._group_frame_cache.get(key)
         if cached is not None:
             self._group_frame_cache.move_to_end(key)
@@ -355,7 +386,7 @@ class MatplotlibRenderer:
             idx_df,
             out_cache if out_cache is not None else {},
         )
-        frame = self._standardize_phase_labels(frame, finder)
+        frame = self._standardize_phase_labels(frame, source_finder)
         self._remember_group_frame(key, frame)
         return frame
 

@@ -88,6 +88,8 @@ class PlotRequest:
     annotate_max: bool = False
     annotate_min: bool = False
     plot_variant: str | None = None
+    real_rms: bool = False
+    real_rms_frequency_hz: float | None = None
 
 
 @dataclass(slots=True)
@@ -112,6 +114,8 @@ class PlotJob:
     annotate_max: bool = False
     annotate_min: bool = False
     plot_variant: str | None = None
+    real_rms: bool = False
+    real_rms_frequency_hz: float | None = None
 
 
 @dataclass(slots=True)

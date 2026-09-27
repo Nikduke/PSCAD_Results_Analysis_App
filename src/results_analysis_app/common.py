@@ -9,6 +9,7 @@ from typing import Any
 
 LogFn = Callable[[str], None]
 CancelFn = Callable[[], None]
+ProgressFn = Callable[[int, int, str], None]
 
 
 def log_message(log: LogFn | None, message: str) -> None:

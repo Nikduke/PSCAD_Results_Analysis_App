@@ -533,6 +533,7 @@ def test_report_writes_semantic_rms_headings_and_change_text(tmp_path, monkeypat
     assert "The lowest LG RMS voltage is 87.5 kV, corresponding to a voltage dip of 5.9%." in paragraphs
     assert "The highest LL RMS voltage is 180 kV, corresponding to a voltage rise of 11.8%." in paragraphs
     assert "The lowest LL RMS voltage is 120 kV, corresponding to a voltage dip of 25.5%." in paragraphs
+    assert any("reported LGr/LLr catalog traces" in paragraph for paragraph in paragraphs)
     assert "LG" not in headings
     assert "LL" not in headings
 

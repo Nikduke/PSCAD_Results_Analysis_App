@@ -100,6 +100,7 @@ def test_session_event_times_round_trip() -> None:
     session.rms_settings_by_project = {
         project: {
             "enabled": True,
+            "real_rms": True,
             "quantities": ["LG"],
             "elements": ["MM_161_A"],
             "switching_time_mode": "range",
@@ -178,6 +179,7 @@ def test_session_event_times_round_trip() -> None:
     assert loaded.rms_settings_by_project == {
         project: {
             "enabled": True,
+            "real_rms": True,
             "quantities": ["LG"],
             "elements": ["MM_161_A"],
             "switching_time_mode": "range",
@@ -460,6 +462,27 @@ def test_rms_popup_switching_selector_follows_project_switch_type(monkeypatch, t
         window._load_project_analysis_options(project, load_catalog=True)
         app.processEvents()
 
+        assert window.rms_real_checkbox is not None
+        assert window.rms_real_checkbox.text() == "Real RMS"
+        assert window.rms_real_checkbox.isChecked()
+        assert window.session.rms_settings_by_project[project]["real_rms"] is True
+        window.rms_element_checks["MM_161_A"].setChecked(True)
+        window.rms_checkbox.setChecked(True)
+        app.processEvents()
+        assert window.session.rms_settings_by_project[project]["enabled"] is True
+        window.rms_element_checks["MM_161_A"].setChecked(False)
+        app.processEvents()
+        window._update_rms_selector_state()
+        assert window.rms_checkbox.isChecked()
+        window.rms_element_checks["MM_161_A"].setChecked(True)
+        app.processEvents()
+        window.rms_real_checkbox.setChecked(False)
+        app.processEvents()
+        assert window.session.rms_settings_by_project[project]["real_rms"] is False
+        window.rms_real_checkbox.setChecked(True)
+        app.processEvents()
+        assert window.rms_checkbox.isChecked()
+
         assert window.rms_switching_time_mode == "range"
         assert window.rms_switching_time_start_edit is not None
         assert window.rms_switching_time_end_edit is not None
@@ -476,12 +499,42 @@ def test_rms_popup_switching_selector_follows_project_switch_type(monkeypatch, t
         window._load_project_analysis_options(project, load_catalog=True)
         app.processEvents()
         assert window.rms_switching_time_mode == "discrete"
-        assert [check.text() for check in window.rms_switching_time_checks.values()] == [
+        assert window.rms_switching_time_list is not None
+        assert (
+            window.rms_switching_time_list.selectionMode()
+            == QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        assert [
+            window.rms_switching_time_list.item(index).text()
+            for index in range(window.rms_switching_time_list.count())
+        ] == [
             "10.2 s",
             "10.4 s",
         ]
-        assert all(check.checkState() == QtCore.Qt.CheckState.Checked for check in window.rms_switching_time_checks.values())
-        window.rms_switching_time_checks[10.4].setChecked(False)
+        assert all(
+            window.rms_switching_time_list.item(index).isSelected()
+            for index in range(window.rms_switching_time_list.count())
+        )
+        selection_model = window.rms_switching_time_list.selectionModel()
+        first = window.rms_switching_time_list.model().index(0, 0)
+        second = window.rms_switching_time_list.model().index(1, 0)
+        selection_model.select(
+            first,
+            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+        )
+        selection_model.select(
+            second,
+            QtCore.QItemSelectionModel.SelectionFlag.Toggle
+            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+        )
+        app.processEvents()
+        assert window.session.rms_settings_by_project[project]["switching_times"] == [10.2, 10.4]
+        selection_model.select(
+            second,
+            QtCore.QItemSelectionModel.SelectionFlag.Toggle
+            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+        )
         app.processEvents()
         assert window.session.rms_settings_by_project[project]["switching_times"] == [10.2]
     finally:
@@ -1794,6 +1847,55 @@ def test_theme_proxy_paints_widget_and_item_checkboxes_consistently() -> None:
         )
 
 
+def test_spinbox_arrows_remain_visible_in_light_and_dark_themes() -> None:
+    from PySide6 import QtGui, QtWidgets
+
+    from results_analysis_app.styles import apply_application_theme
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original_palette = QtGui.QPalette(app.palette())
+    original_stylesheet = app.styleSheet()
+    original_scheme = app.property("colorScheme")
+    try:
+        for dark in (False, True):
+            apply_application_theme(app, dark=dark)
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(0.0, 1000.0)
+            spin.setValue(901.39)
+            spin.resize(220, 32)
+            for enabled in (True, False):
+                spin.setEnabled(enabled)
+                spin.show()
+                app.processEvents()
+
+                image = spin.grab().toImage()
+                background = image.pixelColor(image.width() // 2, image.height() // 2)
+                arrow_x = range(image.width() - 14, image.width() - 1)
+                top_widths = [
+                    sum(image.pixelColor(x, y) != background for x in arrow_x)
+                    for y in range(3, image.height() // 2)
+                ]
+                bottom_widths = [
+                    sum(image.pixelColor(x, y) != background for x in arrow_x)
+                    for y in range(image.height() // 2 + 1, image.height() - 3)
+                ]
+                assert sum(width >= 3 for width in top_widths) >= 3, (
+                    "spin up arrow is not visible for "
+                    f"{'dark' if dark else 'light'} theme "
+                    f"({'enabled' if enabled else 'disabled'} state)"
+                )
+                assert sum(width >= 3 for width in bottom_widths) >= 3, (
+                    "spin down arrow is not visible for "
+                    f"{'dark' if dark else 'light'} theme "
+                    f"({'enabled' if enabled else 'disabled'} state)"
+                )
+            spin.close()
+    finally:
+        app.setPalette(original_palette)
+        app.setStyleSheet(original_stylesheet)
+        app.setProperty("colorScheme", original_scheme)
+
+
 def test_background_task_preserves_traceback() -> None:
     from results_analysis_app.background import BackgroundTask, CancelToken
 
@@ -1829,6 +1931,150 @@ def test_background_task_reports_cancellation_separately() -> None:
 
     assert cancelled == [True]
     assert failures == []
+
+
+def test_background_task_reports_optional_progress() -> None:
+    from results_analysis_app.background import BackgroundTask, CancelToken
+
+    progress = []
+
+    def work(_log, _cancel, report_progress):
+        report_progress(2, 5, "Reading")
+        return "done"
+
+    task = BackgroundTask(work, CancelToken(), with_progress=True)
+    task.progress.connect(lambda current, total, message: progress.append((current, total, message)))
+    task.run()
+
+    assert progress == [(2, 5, "Reading")]
+
+
+def test_settings_table_validation_rejects_silent_numeric_fallbacks() -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app.settings_dialog import validate_settings_table_inputs
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    y_limits = QtWidgets.QTableWidget(1, 4)
+    y_limits.setItem(0, 0, QtWidgets.QTableWidgetItem("22"))
+    y_limits.setItem(0, 1, QtWidgets.QTableWidgetItem("not-a-number"))
+    y_limits.setItem(0, 2, QtWidgets.QTableWidgetItem("100"))
+    y_limits.setItem(0, 3, QtWidgets.QTableWidgetItem("0"))
+    um = QtWidgets.QTableWidget(1, 3)
+    um.setItem(0, 0, QtWidgets.QTableWidgetItem("66"))
+    um.setItem(0, 1, QtWidgets.QTableWidgetItem("nan"))
+    um.setItem(0, 2, QtWidgets.QTableWidgetItem("Manual"))
+
+    errors = validate_settings_table_inputs(y_limits, um)
+
+    assert any("Y min" in error and "finite number" in error for error in errors)
+    assert any("Y major" in error and "positive" in error for error in errors)
+    assert any("Um" in error and "positive number" in error for error in errors)
+    y_limits.deleteLater()
+    um.deleteLater()
+    app.processEvents()
+
+
+def test_main_window_splitter_layout_round_trips_and_reset_clears_saved_state(
+    monkeypatch,
+) -> None:
+    from PySide6 import QtWidgets
+
+    from results_analysis_app import storage
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    class FakeSettings:
+        values = {}
+
+        def value(self, key):
+            return self.values.get(key)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+        def remove(self, prefix):
+            for key in list(self.values):
+                if key == prefix or key.startswith(prefix + "/"):
+                    del self.values[key]
+
+        def sync(self):
+            return None
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    monkeypatch.setattr(storage, "load_autosave", AppSession.default)
+    monkeypatch.setattr(MainWindow, "refresh_project_scans", lambda *_args, **_kwargs: None)
+    fake_settings = FakeSettings()
+    monkeypatch.setattr(MainWindow, "_layout_settings", lambda _self: fake_settings)
+
+    first = MainWindow()
+    second = None
+    try:
+        first.resize(1200, 800)
+        first.show()
+        app.processEvents()
+        first.workspace_splitter.setSizes([300, 900])
+        first.left_workspace_splitter.setSizes([250, 550])
+        first.project_scope_splitter.setSizes([250, 950])
+        expected = [splitter.saveState() for splitter in first._splitters()]
+        first._save_splitter_layout()
+
+        second = MainWindow()
+        second.resize(1200, 800)
+        second.show()
+        app.processEvents()
+        assert [splitter.saveState() for splitter in second._splitters()] == expected
+
+        second.reset_splitter_layout()
+        assert not fake_settings.values
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+        app.processEvents()
+
+
+def test_dashboard_figure_indicator_shows_mixed_local_selections() -> None:
+    from types import SimpleNamespace
+
+    from PySide6 import QtWidgets
+
+    from results_analysis_app.main_window import MainWindow
+    from results_analysis_app.models import AppSession
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = AppSession.default()
+    first = r"C:\Project\O1"
+    second = r"C:\Project\O2"
+    session.add_project(first)
+    session.add_project(second)
+    session.dashboard_figure_selection_by_project = {
+        first: ["figure-a"],
+        second: ["figure-b"],
+    }
+    session.dashboard_figure_apply_to_all = False
+    indicator = QtWidgets.QLabel()
+    window = SimpleNamespace(
+        session=session,
+        dashboard_figures={
+            first: [SimpleNamespace(id="figure-a")],
+            second: [SimpleNamespace(id="figure-b")],
+        },
+        dashboard_figure_mode_indicator=indicator,
+        _current_project_path=lambda: first,
+    )
+    window._dashboard_local_selections_are_mixed = lambda: (
+        MainWindow._dashboard_local_selections_are_mixed(window)
+    )
+
+    MainWindow._update_dashboard_figure_mode_indicator(window)
+    assert indicator.text() == "[-] Mixed"
+
+    session.dashboard_figure_apply_to_all = True
+    MainWindow._update_dashboard_figure_mode_indicator(window)
+    assert indicator.text() == "[x] Shared"
+    indicator.deleteLater()
+    app.processEvents()
 
 
 def test_busy_state_keeps_only_log_interactive_and_preserves_manual_scroll(

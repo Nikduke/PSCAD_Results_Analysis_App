@@ -53,6 +53,7 @@ from results_analysis_app.voltage_envelope import FREQUENCY_FALLBACK_MESSAGE_PRE
 USER_ROLE_PATH = QtCore.Qt.ItemDataRole.UserRole
 USER_ROLE_SCOPE_FOLDER = QtCore.Qt.ItemDataRole.UserRole + 1
 USER_ROLE_FIGURE_ID = QtCore.Qt.ItemDataRole.UserRole + 2
+USER_ROLE_RMS_SWITCHING_TIME = QtCore.Qt.ItemDataRole.UserRole + 3
 
 
 class _VoltagePopupContent(QtWidgets.QWidget):
@@ -118,16 +119,18 @@ class _RMSPopupContent(QtWidgets.QWidget):
     def __init__(
         self,
         quantity_checks: Iterable[QtWidgets.QCheckBox],
+        real_rms_check: QtWidgets.QCheckBox | None,
         element_checks: Iterable[QtWidgets.QCheckBox],
-        switching_time_checks: Iterable[QtWidgets.QCheckBox] = (),
+        switching_time_list: QtWidgets.QListWidget | None = None,
         switching_time_start_edit: QtWidgets.QLineEdit | None = None,
         switching_time_end_edit: QtWidgets.QLineEdit | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.quantity_checks = list(quantity_checks)
+        self.real_rms_check = real_rms_check
         self.element_checks = list(element_checks)
-        self.switching_time_checks = list(switching_time_checks)
+        self.switching_time_list = switching_time_list
         self.switching_time_start_edit = switching_time_start_edit
         self.switching_time_end_edit = switching_time_end_edit
         self.element_rows: list[QtWidgets.QWidget] = []
@@ -144,6 +147,9 @@ class _RMSPopupContent(QtWidgets.QWidget):
         quantity_layout.setSpacing(8)
         for check in self.quantity_checks:
             quantity_layout.addWidget(check)
+        if self.real_rms_check is not None:
+            quantity_layout.addSpacing(8)
+            quantity_layout.addWidget(self.real_rms_check)
         quantity_layout.addStretch(1)
         layout.addWidget(quantity_row)
 
@@ -177,16 +183,8 @@ class _RMSPopupContent(QtWidgets.QWidget):
         switching_label = QtWidgets.QLabel("Switching times", self)
         switching_label.setStyleSheet("font-weight: 600;")
         switching_column.addWidget(switching_label)
-        if self.switching_time_checks:
-            for check in self.switching_time_checks:
-                row = QtWidgets.QWidget(self)
-                row_layout = QtWidgets.QHBoxLayout(row)
-                row_layout.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
-                row_layout.setSpacing(0)
-                row_layout.addWidget(check)
-                row_layout.addStretch(1)
-                row.setMinimumHeight(check.sizeHint().height())
-                switching_column.addWidget(row)
+        if self.switching_time_list is not None:
+            switching_column.addWidget(self.switching_time_list)
         elif self.switching_time_start_edit is not None and self.switching_time_end_edit is not None:
             form = QtWidgets.QFormLayout()
             form.setContentsMargins(self._CHILD_INDENT, 0, 0, 0)
@@ -393,6 +391,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(750)
         self._autosave_timer.timeout.connect(self._save_autosave_now)
+        self._layout_save_timer = QtCore.QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.setInterval(250)
+        self._layout_save_timer.timeout.connect(self._save_splitter_layout)
+        self._restoring_splitter_layout = False
 
         self.frequency_fallback_prompt_requested.connect(self._show_frequency_fallback_prompt)
         self._build_ui()
@@ -421,20 +424,73 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_scope_splitter.addWidget(self._build_scopes_panel(self.project_scope_splitter))
         self.project_scope_splitter.setStretchFactor(0, 4)
         self.project_scope_splitter.setStretchFactor(1, 7)
-        self.project_scope_splitter.setSizes([400, 720])
         self.left_workspace_splitter.addWidget(self.project_scope_splitter)
         self.project_exclusions_panel = self._build_project_exclusions_panel(self.left_workspace_splitter)
         self.left_workspace_splitter.addWidget(self.project_exclusions_panel)
         self.left_workspace_splitter.setStretchFactor(0, 1)
         self.left_workspace_splitter.setStretchFactor(1, 1)
-        self.left_workspace_splitter.setSizes([560, 460])
         self.workspace_splitter.addWidget(self.left_workspace_splitter)
         self.workspace_splitter.addWidget(self._build_preview_panel(self.workspace_splitter))
         self.workspace_splitter.setStretchFactor(0, 8)
         self.workspace_splitter.setStretchFactor(1, 5)
-        self.workspace_splitter.setSizes([1160, 720])
+        self._set_default_splitter_sizes()
+        for splitter in self._splitters():
+            splitter.splitterMoved.connect(lambda *_args: self._schedule_save_splitter_layout())
         root_layout.addWidget(self.workspace_splitter, 1)
+        self._restore_splitter_layout()
         self._build_status_bar()
+
+    def _splitters(self) -> tuple[QtWidgets.QSplitter, ...]:
+        return (
+            self.workspace_splitter,
+            self.left_workspace_splitter,
+            self.project_scope_splitter,
+        )
+
+    def _set_default_splitter_sizes(self) -> None:
+        self.project_scope_splitter.setSizes([400, 720])
+        self.left_workspace_splitter.setSizes([560, 460])
+        self.workspace_splitter.setSizes([1160, 720])
+
+    def _layout_settings(self) -> QtCore.QSettings:
+        return QtCore.QSettings("loMPE", "PSCAD Results Analysis")
+
+    def _restore_splitter_layout(self) -> None:
+        self._restoring_splitter_layout = True
+        try:
+            settings = self._layout_settings()
+            for name, splitter in zip(
+                ("workspace", "left_workspace", "project_scope"),
+                self._splitters(),
+            ):
+                value = settings.value(f"splitters/{name}")
+                if isinstance(value, QtCore.QByteArray) and not value.isEmpty():
+                    splitter.restoreState(value)
+        finally:
+            self._restoring_splitter_layout = False
+
+    def _save_splitter_layout(self) -> None:
+        if self._restoring_splitter_layout:
+            return
+        settings = self._layout_settings()
+        for name, splitter in zip(
+            ("workspace", "left_workspace", "project_scope"),
+            self._splitters(),
+        ):
+            settings.setValue(f"splitters/{name}", splitter.saveState())
+        settings.sync()
+
+    def _schedule_save_splitter_layout(self) -> None:
+        if not self._restoring_splitter_layout:
+            self._layout_save_timer.start()
+
+    def reset_splitter_layout(self) -> None:
+        self._layout_save_timer.stop()
+        settings = self._layout_settings()
+        settings.remove("splitters")
+        settings.sync()
+        self._set_default_splitter_sizes()
+        self.set_status("Layout reset")
 
     def _build_status_bar(self) -> None:
         self.status_label = QtWidgets.QLabel("Ready", self)
@@ -488,6 +544,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_button.clicked.connect(self.open_settings_dialog)
         project_layout.addWidget(self.settings_button)
 
+        self.reset_layout_button = QtWidgets.QPushButton("Reset layout", self.project_controls_group)
+        self.reset_layout_button.setToolTip("Restore the default workspace splitter positions.")
+        apply_secondary_button_style(self.reset_layout_button)
+        self.reset_layout_button.clicked.connect(self.reset_splitter_layout)
+        project_layout.addWidget(self.reset_layout_button)
+
         project_layout.addSpacing(12)
         self.voltage_checks: dict[str, QtWidgets.QCheckBox] = {}
         self.all_voltages_check: QtWidgets.QCheckBox | None = None
@@ -513,7 +575,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_top_bar_divider(project_layout, self.project_controls_group)
         project_layout.addWidget(make_section_label("Analysis:", self.project_controls_group))
         self.rms_checkbox = QtWidgets.QCheckBox(self.project_controls_group)
-        self.rms_checkbox.setToolTip("Enable project-specific RMS voltage analysis.")
+        self.rms_checkbox.setObjectName("rmsAnalysisCheckbox")
+        self.rms_checkbox.setToolTip(
+            "Enable project-specific RMS voltage analysis. The state is saved per project."
+        )
         self.rms_checkbox.toggled.connect(self._on_global_selection_changed)
         project_layout.addWidget(self.rms_checkbox)
         self.rms_button = QtWidgets.QPushButton("RMS", self.project_controls_group)
@@ -523,8 +588,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rms_menu = QtWidgets.QMenu(self.rms_button)
         self.rms_button.setMenu(self.rms_menu)
         self.rms_quantity_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.rms_real_checkbox: QtWidgets.QCheckBox | None = None
         self.rms_element_checks: dict[str, QtWidgets.QCheckBox] = {}
-        self.rms_switching_time_checks: dict[float, QtWidgets.QCheckBox] = {}
+        self.rms_switching_time_list: QtWidgets.QListWidget | None = None
         self.rms_switching_time_mode = rms_analysis.RMS_SWITCHING_TIME_MODE_ALL
         self.rms_switching_time_start_edit: QtWidgets.QLineEdit | None = None
         self.rms_switching_time_end_edit: QtWidgets.QLineEdit | None = None
@@ -982,15 +1048,15 @@ class MainWindow(QtWidgets.QMainWindow):
         dashboard_header = QtWidgets.QHBoxLayout()
         self.dashboard_figure_header = make_section_label("Dashboard Figures", panel)
         dashboard_header.addWidget(self.dashboard_figure_header)
+        self.dashboard_figure_mode_indicator = make_muted_label("[ ] Local", panel)
+        dashboard_header.addWidget(self.dashboard_figure_mode_indicator)
         dashboard_header.addStretch(1)
-        self.dashboard_figure_apply_all_checkbox = QtWidgets.QCheckBox("All checked", panel)
+        self.dashboard_figure_apply_all_checkbox = QtWidgets.QCheckBox("Shared", panel)
         self.dashboard_figure_apply_all_checkbox.setChecked(
             bool(self.session.dashboard_figure_apply_to_all)
         )
         self.dashboard_figure_apply_all_checkbox.setToolTip(
-            "When enabled, the current project's selection is used for every "
-            "checked project. Project-specific selections are preserved when "
-            "you switch back to local mode."
+            "Use one figure selection for all checked projects."
         )
         self.dashboard_figure_apply_all_checkbox.toggled.connect(
             self._on_dashboard_figure_apply_all_changed
@@ -1038,6 +1104,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 load_catalog=False,
             )
             self._update_project_header()
+            self._update_dashboard_figure_mode_indicator()
         finally:
             self._loading = was_loading
 
@@ -1129,7 +1196,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 load_catalog=load_catalog,
             )
             self.rms_checkbox.setChecked(
-                bool(rms_settings["enabled"]) and bool(rms_settings["elements"])
+                bool(rms_settings["enabled"])
             )
             for quantity, check in self.rms_quantity_checks.items():
                 check.setChecked(quantity in rms_settings["quantities"])
@@ -1193,8 +1260,9 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         self.rms_menu.clear()
         self.rms_quantity_checks = {}
+        self.rms_real_checkbox = None
         self.rms_element_checks = {}
-        self.rms_switching_time_checks = {}
+        self.rms_switching_time_list = None
         self.rms_switching_time_mode = rms_analysis.RMS_SWITCHING_TIME_MODE_ALL
         self.rms_switching_time_start_edit = None
         self.rms_switching_time_end_edit = None
@@ -1261,11 +1329,18 @@ class MainWindow(QtWidgets.QMainWindow):
             check.toggled.connect(self._on_global_selection_changed)
             self.rms_quantity_checks[quantity] = check
             quantity_checks.append(check)
+        self.rms_real_checkbox = QtWidgets.QCheckBox("Real RMS")
+        self.rms_real_checkbox.setObjectName("rmsRealCheckbox")
+        self.rms_real_checkbox.setToolTip(
+            "Compute RMS from instantaneous LGp/LLp waveforms using the creator's RVC method."
+        )
+        self.rms_real_checkbox.setChecked(bool(parsed_settings["real_rms"]))
+        self.rms_real_checkbox.toggled.connect(self._on_global_selection_changed)
         for element in elements:
             check = QtWidgets.QCheckBox(element)
             check.toggled.connect(self._on_global_selection_changed)
             self.rms_element_checks[element] = check
-        switching_time_checks: list[QtWidgets.QCheckBox] = []
+        switching_time_list: QtWidgets.QListWidget | None = None
         if mode == rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE:
             persisted_mode = parsed_settings["switching_time_mode"]
             persisted_times = parsed_settings["switching_times"]
@@ -1274,18 +1349,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 if persisted_mode == rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE
                 else switching_times
             )
-            for switching_time in switching_times:
-                check = QtWidgets.QCheckBox(f"{switching_time:g} s")
-                check.setProperty("switchingTime", switching_time)
-                check.setChecked(
-                    any(
-                        abs(switching_time - selected) <= rms_analysis.RMS_TIME_EPSILON_S
-                        for selected in selected_times
-                    )
+            if switching_times:
+                switching_time_list = QtWidgets.QListWidget()
+                switching_time_list.setObjectName("rmsSwitchingTimeList")
+                switching_time_list.setSelectionMode(
+                    QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
                 )
-                check.toggled.connect(self._on_global_selection_changed)
-                self.rms_switching_time_checks[switching_time] = check
-                switching_time_checks.append(check)
+                switching_time_list.setSelectionBehavior(
+                    QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+                )
+                switching_time_list.setAlternatingRowColors(True)
+                switching_time_list.setToolTip(
+                    "Click to select one switching time; hold Ctrl while clicking to select multiple."
+                )
+                for switching_time in switching_times:
+                    item = QtWidgets.QListWidgetItem(f"{switching_time:g} s")
+                    item.setData(USER_ROLE_RMS_SWITCHING_TIME, float(switching_time))
+                    switching_time_list.addItem(item)
+                    item.setSelected(
+                        any(
+                            abs(switching_time - selected) <= rms_analysis.RMS_TIME_EPSILON_S
+                            for selected in selected_times
+                        )
+                    )
+                switching_time_list.itemSelectionChanged.connect(
+                    self._on_global_selection_changed
+                )
+                self.rms_switching_time_list = switching_time_list
         else:
             self.rms_switching_time_start_edit = QtWidgets.QLineEdit()
             self.rms_switching_time_start_edit.setObjectName("rmsSwitchingTimeStart")
@@ -1321,8 +1411,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.rms_switching_time_end_edit.setText(f"{default_end:g}")
         self.rms_popup_content = _RMSPopupContent(
             quantity_checks,
+            self.rms_real_checkbox,
             self.rms_element_checks.values(),
-            switching_time_checks,
+            switching_time_list,
             self.rms_switching_time_start_edit,
             self.rms_switching_time_end_edit,
         )
@@ -1495,7 +1586,10 @@ class MainWindow(QtWidgets.QMainWindow):
             rms_settings = rms_analysis.normalize_rms_settings(
                 self.session.rms_settings_by_project.get(project_path)
             )
-            desired = bool(rms_settings["enabled"]) and bool(rms_settings["elements"])
+            # RMS enablement is independent from the current element subset.
+            # Keep the master checkbox stable while the selector is edited;
+            # the analysis path already skips RMS when no elements are chosen.
+            desired = bool(rms_settings["enabled"])
             blocker = QtCore.QSignalBlocker(self.rms_checkbox)
             self.rms_checkbox.setChecked(desired)
             del blocker
@@ -1610,6 +1704,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.analysis_enabled_by_project[project_path] = selected_analysis
             rms_settings: dict[str, Any] = {
                 "enabled": self.rms_checkbox.isChecked(),
+                "real_rms": (
+                    self.rms_real_checkbox.isChecked()
+                    if self.rms_real_checkbox is not None
+                    else True
+                ),
                 "quantities": [
                     quantity
                     for quantity, check in self.rms_quantity_checks.items()
@@ -1625,11 +1724,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 rms_settings.update(
                     {
                         "switching_time_mode": rms_analysis.RMS_SWITCHING_TIME_MODE_DISCRETE,
-                        "switching_times": [
-                            switching_time
-                            for switching_time, check in self.rms_switching_time_checks.items()
-                            if check.isChecked()
-                        ],
+                        "switching_times": self._selected_rms_switching_times(),
                         "switching_time_start_s": None,
                         "switching_time_end_s": None,
                     }
@@ -1660,6 +1755,20 @@ class MainWindow(QtWidgets.QMainWindow):
         except (TypeError, ValueError):
             return None
         return value if math.isfinite(value) else None
+
+    def _selected_rms_switching_times(self) -> list[float]:
+        if self.rms_switching_time_list is None:
+            return []
+        values: list[float] = []
+        for item in self.rms_switching_time_list.selectedItems():
+            value = item.data(USER_ROLE_RMS_SWITCHING_TIME)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                values.append(number)
+        return sorted(set(values))
 
     def _update_voltage_selector_state(self) -> None:
         selected_count = sum(check.isChecked() for check in self.voltage_checks.values())
@@ -2453,6 +2562,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.dashboard_figure_shared_selection_initialized = True
         else:
             self.session.dashboard_figure_selection_by_project[project_path] = checked
+        self._update_dashboard_figure_mode_indicator()
         self.autosave()
 
     def _on_dashboard_figure_apply_all_changed(self, checked: bool) -> None:
@@ -2494,6 +2604,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session.dashboard_figure_apply_to_all = checked
         self._update_dashboard_figure_header()
         self._load_dashboard_figure_list(current_path)
+        self._update_dashboard_figure_mode_indicator()
         self.autosave()
 
     def _current_project_path(self) -> str | None:
@@ -2532,6 +2643,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dashboard_figure_header.setText(f"Dashboard Figures: {project_name}")
         else:
             self.dashboard_figure_header.setText("Dashboard Figures")
+
+    def _dashboard_local_selections_are_mixed(self) -> bool:
+        selected_projects = [
+            project
+            for project in self.session.projects
+            if project.selected
+        ]
+        selections: list[tuple[str, ...]] = []
+        for project in selected_projects:
+            available_ids = {
+                figure.id for figure in self.dashboard_figures.get(project.path, [])
+            }
+            selection = self.session.dashboard_figure_selection_by_project.get(project.path)
+            if selection is None:
+                selection = (
+                    self.session.dashboard_figure_shared_selection
+                    if self.session.dashboard_figure_shared_selection_initialized
+                    else list(available_ids)
+                )
+            selections.append(
+                tuple(figure_id for figure_id in selection if figure_id in available_ids)
+            )
+        return bool(selections) and any(selection != selections[0] for selection in selections[1:])
+
+    def _update_dashboard_figure_mode_indicator(self) -> None:
+        if self.session.dashboard_figure_apply_to_all:
+            text = "[x] Shared"
+            tooltip = "One saved figure selection is used for every checked project."
+        elif self._dashboard_local_selections_are_mixed():
+            text = "[-] Mixed"
+            tooltip = "Checked projects have different project-specific figure selections."
+        else:
+            project_path = self._current_project_path()
+            project_name = Path(project_path).name if project_path else "project"
+            text = f"[ ] Local: {project_name}"
+            tooltip = "The active project's figure selection is used for its report."
+        self.dashboard_figure_mode_indicator.setText(text)
+        self.dashboard_figure_mode_indicator.setToolTip(tooltip)
 
     def _dashboard_figure_ids_for_project(self, project_path: str) -> list[str]:
         figures = self.dashboard_figures.get(project_path, [])
@@ -2588,7 +2737,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     item = QtWidgets.QListWidgetItem(figure.label, self.dashboard_figure_list)
                     item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                     item.setData(USER_ROLE_FIGURE_ID, figure.id)
-                    item.setToolTip(figure.label)
+                    available_projects = sum(
+                        figure.id in {
+                            available.id
+                            for available in self.dashboard_figures.get(project.path, [])
+                        }
+                        for project in self.session.projects
+                        if project.selected
+                    )
+                    total_projects = sum(
+                        project.selected for project in self.session.projects
+                    )
+                    tooltip = figure.label
+                    if self.session.dashboard_figure_apply_to_all and total_projects:
+                        tooltip = (
+                            f"{figure.label}\nAvailable in {available_projects}/"
+                            f"{total_projects} checked projects."
+                        )
+                    item.setToolTip(tooltip)
                     item.setCheckState(
                         QtCore.Qt.CheckState.Checked
                         if figure.id in selected_ids
@@ -2598,6 +2764,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 del blocker
                 self.dashboard_figure_list.setUpdatesEnabled(True)
             self._update_dashboard_figure_header()
+            self._update_dashboard_figure_mode_indicator()
         finally:
             self._loading = was_loading
 
@@ -2828,8 +2995,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         projects, scopes = selected
 
-        def work(log, cancel):
-            return work_factory(projects, scopes, log, cancel)
+        def work(log, cancel, progress):
+            return work_factory(projects, scopes, log, cancel, progress)
 
         on_success = (
             on_success_factory(projects)
@@ -2982,7 +3149,7 @@ class MainWindow(QtWidgets.QMainWindow):
         iip_limit = float(self.session.nonconv_cb_iip_limit)
         iir_limit = float(self.session.nonconv_cb_iir_limit)
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             return project_scan_runner.scan_projects_cached(
                 paths,
                 current_path,
@@ -2993,6 +3160,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 force=force,
                 check_cancel=cancel.throw_if_cancelled,
                 log=log,
+                progress=progress,
             )
 
         title = "Rebuilding project cache" if force else "Checking project cache"
@@ -3226,9 +3394,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("No checked projects for dashboard figure scan.")
             return
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             result: dict[str, tuple[list[DashboardFigure], list[str]]] = {}
-            for project_path in projects:
+            progress(0, len(projects), "Scanning dashboard figures")
+            for index, project_path in enumerate(projects, start=1):
                 cancel.throw_if_cancelled()
                 root = Path(project_path)
                 log(f"Scanning dashboard figures without updating Excel data: {root.name}")
@@ -3237,6 +3406,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 log(f"Dashboard figure scan complete: {root.name} | {len(figures)} figures")
                 for warning in warnings:
                     log(warning)
+                progress(index, len(projects), f"Scanned dashboard figures: {root.name}")
             return result
 
         self._start_background_task(
@@ -3251,9 +3421,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("No checked projects for dashboard refresh.")
             return
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             result: dict[str, tuple[list[DashboardFigure], list[str], bool]] = {}
-            for project_path in projects:
+            progress(0, len(projects), "Refreshing dashboards")
+            for index, project_path in enumerate(projects, start=1):
                 cancel.throw_if_cancelled()
                 root = Path(project_path)
                 log(f"Dashboard refresh started: {root.name}")
@@ -3273,6 +3444,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 log(f"Dashboard figure scan complete: {root.name} | {len(figures)} figures")
                 for warning in warnings:
                     log(warning)
+                progress(index, len(projects), f"Refreshed dashboards: {root.name}")
             return result
 
         self._start_background_task(
@@ -3360,7 +3532,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sustained_sdpf_ranking_settings_by_project()
         )
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Analysis started.")
             log("Dashboard update will not run. Existing dashboard files are used for reports.")
             prompt_log = self._frequency_prompting_log(log, cancel)
@@ -3381,6 +3553,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 **envelope_kwargs,
                 log=prompt_log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Analysis finished. Reports written: {len(written)}")
             return written
@@ -3412,7 +3585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         envelope_kwargs["resonance_settings_by_project"] = resonance_settings_by_project
         envelope_kwargs["sustained_sdpf_settings_by_project"] = sustained_settings_by_project
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Envelope build started.")
             prompt_log = self._frequency_prompting_log(log, cancel)
             written = actions.build_voltage_envelopes(
@@ -3423,6 +3596,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 build_charts=False,
                 log=prompt_log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Envelope data/check build complete: {len(written)} workbooks.")
             return written
@@ -3448,7 +3622,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Sustained SDPF heatmap rebuild started.")
             actions.rebuild_heatmaps(
                 projects,
@@ -3459,6 +3633,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 event_times=dict(self.session.event_times),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log("Sustained SDPF heatmap rebuild complete.")
 
@@ -3477,7 +3652,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         projects, scopes = selected
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Envelope chart rebuild started.")
             written = actions.rebuild_envelope_charts(
                 projects,
@@ -3486,6 +3661,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 **self._envelope_chart_kwargs(projects),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Envelope chart rebuild complete: {len(written)} workbooks.")
             return written
@@ -3501,7 +3677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def create_event_batches_only(self) -> None:
-        def work(projects, scopes, log, cancel):
+        def work(projects, scopes, log, cancel, progress):
             log("Event plot batch creation started.")
             written = actions.create_plot_batches(
                 projects,
@@ -3512,6 +3688,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Event plot batch creation complete: {len(written)} workbooks.")
             return written
@@ -3519,7 +3696,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_selected_action("Create event batches", "Creating event plot batches", work)
 
     def render_event_plots_only(self) -> None:
-        def work(projects, scopes, log, cancel):
+        def work(projects, scopes, log, cancel, progress):
             log("Event plot rendering started.")
             actions.render_plot_batches(
                 projects,
@@ -3527,6 +3704,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.session.events,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log("Event plot rendering complete.")
 
@@ -3541,7 +3719,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def rebuild_analysis_charts_only(self) -> None:
-        def work(projects, scopes, log, cancel):
+        def work(projects, scopes, log, cancel, progress):
             log("Analysis chart rebuild started.")
             written = actions.rebuild_analysis_charts(
                 projects,
@@ -3549,6 +3727,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 **self._project_chart_axis_kwargs(projects),
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Analysis chart rebuild complete: {len(written)} workbooks.")
             return written
@@ -3576,7 +3755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         heatmap_settings = dict(self.session.sustained_sdpf_heatmap_settings_by_project)
         ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Analysis plot batch creation started.")
             written = actions.create_plot_batches(
                 projects,
@@ -3600,6 +3779,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log(f"Analysis plot batch creation complete: {len(written)} workbooks.")
             return written
@@ -3620,7 +3800,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ranking_settings = self._sustained_sdpf_ranking_settings_by_project()
         limit_overrides = dict(self.session.sustained_sdpf_limit_overrides_by_project)
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Analysis plot rendering started.")
             actions.render_plot_batches(
                 projects,
@@ -3645,6 +3825,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 excel_waveform_exports_enabled=self.session.excel_waveform_exports_enabled,
                 log=log,
                 check_cancel=cancel.throw_if_cancelled,
+                progress=progress,
             )
             log("Analysis plot rendering complete.")
 
@@ -3678,11 +3859,12 @@ class MainWindow(QtWidgets.QMainWindow):
             for path in projects
         }
 
-        def work(log, cancel):
+        def work(log, cancel, progress):
             log("Report rebuild started.")
             log("Report-only mode: no envelopes, batches, plot rendering, or dashboard update will run.")
             log("Using saved dashboard workbooks. Save manual Excel edits before rebuilding reports.")
             cancel.throw_if_cancelled()
+            progress(0, len(projects), "Building reports")
             written = reporting.build_reports_from_existing_plots(
                 projects,
                 scopes,
@@ -3705,6 +3887,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 check_cancel=cancel.throw_if_cancelled,
             )
             cancel.throw_if_cancelled()
+            progress(len(projects), len(projects), "Reports ready")
             log(f"Report rebuild complete: {len(written)} files.")
             return written
 
@@ -3914,9 +4097,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_settings_after_task = False
         cancel_token = CancelToken()
         self._cancel_token = cancel_token
-        worker = BackgroundTask(work, cancel_token, self)
+        worker = BackgroundTask(work, cancel_token, self, with_progress=True)
         self._worker = worker
         worker.message.connect(self._on_worker_message)
+        worker.progress.connect(self._on_worker_progress)
         worker.succeeded.connect(lambda result: self._task_succeeded(title, result, on_success))
         worker.cancelled.connect(lambda: self._task_cancelled(title))
         worker.failed.connect(lambda message, details: self._task_failed(title, message, details))
@@ -3939,6 +4123,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.set_status(message)
         self.log(message)
+
+    def _on_worker_progress(self, current: int, total: int, message: str) -> None:
+        if total <= 0:
+            self.busy_progress.setRange(0, 0)
+            self.set_status(message)
+            return
+        bounded_current = max(0, min(int(current), int(total)))
+        self.busy_progress.setRange(0, int(total))
+        self.busy_progress.setValue(bounded_current)
+        self.set_status(f"{message} ({bounded_current}/{total})")
 
     def _frequency_prompting_log(self, log, cancel):
         def emit(message: str) -> None:
@@ -4086,15 +4280,18 @@ class MainWindow(QtWidgets.QMainWindow):
         for check in self.resonance_checkboxes.values():
             check.setEnabled(not busy)
         self.sustained_sdpf_checkbox.setEnabled(not busy)
+        self.reset_layout_button.setEnabled(not busy)
         rms_available = bool(self._current_project_path() and self.rms_element_checks)
         self.rms_checkbox.setEnabled(not busy and rms_available)
         self.rms_button.setEnabled(not busy and rms_available)
         for check in self.rms_quantity_checks.values():
             check.setEnabled(not busy)
+        if self.rms_real_checkbox is not None:
+            self.rms_real_checkbox.setEnabled(not busy)
         for check in self.rms_element_checks.values():
             check.setEnabled(not busy)
-        for check in self.rms_switching_time_checks.values():
-            check.setEnabled(not busy)
+        if self.rms_switching_time_list is not None:
+            self.rms_switching_time_list.setEnabled(not busy)
         for edit in (
             self.rms_switching_time_start_edit,
             self.rms_switching_time_end_edit,
@@ -4103,6 +4300,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 edit.setEnabled(not busy)
         if not busy:
             self._update_rms_selector_state()
+        if busy:
+            self.busy_progress.setRange(0, 0)
+            self.busy_progress.setValue(0)
+        else:
+            self.busy_progress.reset()
         self.busy_progress.setVisible(busy)
         self.stop_button.setEnabled(busy)
         self.set_status(status)
@@ -4140,4 +4342,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._autosave_timer.isActive():
             self._autosave_timer.stop()
             self._save_autosave_now()
+        self._layout_save_timer.stop()
+        self._save_splitter_layout()
         super().closeEvent(event)

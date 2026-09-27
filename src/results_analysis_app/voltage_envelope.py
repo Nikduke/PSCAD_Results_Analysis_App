@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -22,10 +22,17 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from results_analysis_app import resonance_checks, storage, sustained_sdpf, sustained_sdpf_heatmap
+from results_analysis_app import (
+    envelope_data_cache,
+    resonance_checks,
+    storage,
+    sustained_sdpf,
+    sustained_sdpf_heatmap,
+)
 from results_analysis_app.common import (
     CancelFn,
     LogFn,
+    ProgressFn,
     check_cancel as _cancel,
     log_message as _log,
 )
@@ -67,7 +74,7 @@ from pscad_plotter_app_v3.services.project_conventions import case_run_from_inf_
 
 FrequencyFallbackFn = Callable[[str], None]
 OutFileData = tuple[np.ndarray, dict[int, np.ndarray]]
-SUSTAINED_ENTRY = "__Sustained_SDPF__"
+SUSTAINED_ENTRY = envelope_data_cache.SUSTAINED_ENTRY
 
 FREQUENCY_FALLBACK_MESSAGE_PREFIX = "FREQUENCY_FALLBACK|"
 HIGH_VOLTAGE_LIMIT_FACTOR = DEFAULT_HIGH_VOLTAGE_LIMIT_FACTOR
@@ -83,9 +90,8 @@ STATISTIC_POOL_THRESHOLD = 1000
 MAX_STATISTIC_WORKERS = 4
 _STATISTIC_OUTPUT_SEPARATOR = re.compile(r" +Output+ ")
 _STATISTIC_INTEGER_TOKEN = re.compile(r"[+-]?\d+$")
-# A stale envelope entry is an optimization failure, not a source-data
-# failure.  The entry is kept with the project's other stage fingerprints and
-# contains no processed waveform data.
+# Legacy envelope manifests and per-run pickle caches are removed as part of
+# the next envelope build; the current derived run-data cache is separate.
 LEGACY_ENVELOPE_MANIFEST_FILENAME = ".envelope_manifest.json"
 ENVELOPE_MANIFEST_VERSION = 3
 ENVELOPE_CALCULATION_VERSION = 1
@@ -146,6 +152,41 @@ def _cache_signature(value: Any) -> str:
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def _run_data_cache_key(project_root: Path, voltage_key: str, inf_path: Path) -> str:
+    return f"{voltage_key}\0{_relative_project_path(project_root, inf_path)}"
+
+
+def _run_data_cache_signature(
+    voltage_key: str,
+    bus_prefix: str,
+    bus_um: float,
+    high_voltage_limit_factor: float,
+    time_step: float,
+    time_end: float,
+    fallback_frequency: float,
+    sustained_settings: sustained_sdpf.SustainedSDPFSettings,
+    sustained_limits: sustained_sdpf.SDPFVoltageLimits | None,
+    sustained_frequency: float,
+) -> str:
+    return _cache_signature(
+        {
+            "version": envelope_data_cache.CACHE_VERSION,
+            "envelope_calculation_version": ENVELOPE_CALCULATION_VERSION,
+            "voltage": voltage_key,
+            "bus_prefix": bus_prefix,
+            "bus_um": bus_um,
+            "high_voltage_limit_factor": high_voltage_limit_factor,
+            "time_step": time_step,
+            "time_end": time_end,
+            "fallback_frequency": fallback_frequency,
+            "sustained": sustained_settings,
+            "sustained_limits": sustained_limits,
+            "sustained_frequency": sustained_frequency,
+            "sustained_result_version": sustained_sdpf.RESULT_VERSION,
+        }
+    )
 
 
 def _relative_project_path(project_root: Path, path: Path) -> str:
@@ -661,6 +702,7 @@ class _VoltageBuildResult:
     sustained_results: dict[tuple[str, str], sustained_sdpf.SustainedSDPFResult | None] = field(default_factory=dict)
     sustained_observations: dict[tuple[str, str], list[sustained_sdpf.SustainedSDPFResult]] = field(default_factory=dict)
     sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    cache_updates: dict[Path, envelope_data_cache.RunData] = field(default_factory=dict)
 
 
 @dataclass
@@ -706,13 +748,17 @@ def build_voltage_envelopes(
     voltage_configs: dict[str, Any] | None = None,
     sustained_sdpf_limits_by_voltage: dict[str, sustained_sdpf.SDPFVoltageLimits] | None = None,
     nonconv_cases: Iterable[Any] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     started = time.perf_counter()
     project_root = Path(project_root)
+    if progress is not None:
+        progress(0, 100, f"Preparing envelopes: {project_root.name}")
     _remove_legacy_envelope_cache(project_root)
     case_root = project_root / "Case_folder"
     if not case_root.is_dir():
         raise FileNotFoundError(f"Case_folder not found: {case_root}")
+    incremental_cache_enabled = storage.project_incremental_run_data_enabled(project_root)
 
     total_workers = _configured_worker_count(envelope_workers)
     _log(log, f"Reading statistic and convergence data: {project_root.name}")
@@ -832,6 +878,12 @@ def build_voltage_envelopes(
 
     selected_scopes = list(scopes)
     inf_inventory = _inf_inventory(case_root, exclusion_matcher)
+    if not incremental_cache_enabled:
+        cache_inf_inventory: list[Path] = []
+    elif any(not rule.bus for rule in exclusion_matcher.rules):
+        cache_inf_inventory = _inf_inventory(case_root)
+    else:
+        cache_inf_inventory = inf_inventory
     scope_inf_paths = {
         scope.folder: _selected_inf_paths(inf_inventory, scope)
         for scope in selected_scopes
@@ -858,6 +910,8 @@ def build_voltage_envelopes(
         source_inventory,
     )
     inf_descriptor_cache = _read_inf_descriptor_cache(all_inf_paths, total_workers, check_cancel, log)
+    if progress is not None:
+        progress(5, 100, f"Envelope inputs ready: {project_root.name}")
     sustained_source_files_by_scope = {}
     if sustained_settings_obj.enabled:
         static_source_files = _sustained_source_manifest(
@@ -956,6 +1010,8 @@ def build_voltage_envelopes(
             cached_outputs = _envelope_manifest_matches(project_root, calculation_signature)
             if cached_outputs is not None:
                 _log(log, f"Skipping unchanged envelope build: {project_root.name}")
+                if progress is not None:
+                    progress(100, 100, f"Envelope cache ready: {project_root.name}")
                 return cached_outputs
         else:
             refreshed_outputs = _refresh_cached_presentation(
@@ -976,7 +1032,63 @@ def build_voltage_envelopes(
                 presentation_signature,
             )
             if refreshed_outputs is not None:
+                if progress is not None:
+                    progress(100, 100, f"Envelope charts refreshed: {project_root.name}")
                 return refreshed_outputs
+
+    cached_run_data_by_voltage: dict[
+        str,
+        dict[Path, envelope_data_cache.RunData],
+    ] = {}
+    run_data_cache_signatures: dict[str, str] = {}
+    source_signatures = {
+        path: _cache_signature(manifest)
+        for path, manifest in run_source_manifests.items()
+    }
+    cache_hits = 0
+    cache_candidates = 0
+    if incremental_cache_enabled and all_inf_paths and voltage_keys:
+        with envelope_data_cache.RunDataCache(project_root) as run_cache:
+            for voltage_key in voltage_keys:
+                config = voltage_configs.get(voltage_key)
+                if config is None:
+                    continue
+                run_signature = _run_data_cache_signature(
+                    voltage_key,
+                    config.bus_prefix,
+                    config.um,
+                    limit_factor,
+                    time_step,
+                    time_end,
+                    fallback_frequency,
+                    sustained_worker_settings,
+                    sustained_limits_by_voltage.get(voltage_key),
+                    project_frequency or fallback_frequency,
+                )
+                run_data_cache_signatures[voltage_key] = run_signature
+                voltage_cache: dict[Path, envelope_data_cache.RunData] = {}
+                for inf_path in all_inf_paths:
+                    source_signature = source_signatures.get(inf_path)
+                    if source_signature is None:
+                        continue
+                    cache_candidates += 1
+                    cached = run_cache.get(
+                        _run_data_cache_key(project_root, voltage_key, inf_path),
+                        run_signature,
+                        source_signature,
+                    )
+                    if cached is not None:
+                        voltage_cache[inf_path] = cached
+                        cache_hits += 1
+                cached_run_data_by_voltage[voltage_key] = voltage_cache
+        _log(
+            log,
+            f"Incremental run-data cache: {cache_hits}/{cache_candidates} valid runs reused",
+        )
+    elif incremental_cache_enabled:
+        _log(log, "Incremental run-data cache: enabled; no eligible runs")
+    else:
+        _log(log, "Incremental run-data cache: disabled for this project")
 
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
@@ -992,7 +1104,25 @@ def build_voltage_envelopes(
         f"shared run-read pool={total_workers}; voltage reads concurrent",
     )
 
+    voltage_count = max(1, len(voltage_keys))
+
     def build_voltage(voltage_key: str) -> _VoltageBuildResult:
+        voltage_index = voltage_keys.index(voltage_key)
+
+        def voltage_progress(current: int, total: int, message: str) -> None:
+            if progress is None:
+                return
+            fraction = 1.0 if total <= 0 else max(0.0, min(1.0, current / total))
+            local_percent = fraction * 100.0
+            overall_percent = 5 + int(
+                ((voltage_index + local_percent / 100.0) / voltage_count) * 85
+            )
+            progress(
+                min(90, overall_percent),
+                100,
+                f"{message} | {project_root.name}",
+            )
+
         return _build_voltage_workbooks(
             project_root,
             selected_scopes,
@@ -1021,8 +1151,15 @@ def build_voltage_envelopes(
             sustained_limits_by_voltage.get(voltage_key),
             project_frequency or fallback_frequency,
             sustained_source_files_by_scope,
+            cached_run_data=(
+                cached_run_data_by_voltage.get(voltage_key, {})
+                if incremental_cache_enabled
+                else None
+            ),
+            progress=voltage_progress,
         )
 
+    cache_updates_by_voltage: dict[str, dict[Path, envelope_data_cache.RunData]] = {}
     with ProcessPoolExecutor(max_workers=total_workers) as executor:
         if len(voltage_keys) > 1:
             with ThreadPoolExecutor(max_workers=min(len(voltage_keys), 3)) as voltage_executor:
@@ -1034,13 +1171,52 @@ def build_voltage_envelopes(
         else:
             voltage_results = [build_voltage(voltage_key) for voltage_key in voltage_keys]
 
-        for result in voltage_results:
+        for voltage_key, result in zip(voltage_keys, voltage_results):
             chart_inputs.extend(result.chart_inputs)
             data_outputs.extend(result.data_outputs)
             resonance_results.extend(result.resonance_results)
             sustained_results.update(result.sustained_results)
             sustained_observations.update(result.sustained_observations)
             sustained_signature_inputs.update(result.sustained_signature_inputs)
+            if result.cache_updates:
+                cache_updates_by_voltage[voltage_key] = result.cache_updates
+
+    if progress is not None:
+        progress(90, 100, f"Envelope calculations complete: {project_root.name}")
+
+    cache_path = storage.project_envelope_data_cache_path(project_root)
+    if incremental_cache_enabled and (
+        cache_updates_by_voltage or cache_inf_inventory or cache_path.is_file()
+    ):
+        cache_started = time.perf_counter()
+        cache_rows_written = 0
+        with envelope_data_cache.RunDataCache(project_root) as run_cache:
+            for voltage_key, updates in cache_updates_by_voltage.items():
+                run_signature = run_data_cache_signatures.get(voltage_key)
+                if run_signature is None:
+                    continue
+                for inf_path, run_data in updates.items():
+                    source_signature = source_signatures.get(inf_path)
+                    if source_signature is None:
+                        continue
+                    run_cache.put(
+                        _run_data_cache_key(project_root, voltage_key, inf_path),
+                        run_signature,
+                        source_signature,
+                        run_data,
+                    )
+                    cache_rows_written += 1
+            valid_cache_keys = {
+                _run_data_cache_key(project_root, str(voltage), inf_path)
+                for voltage in set(voltage_configs) | set(voltage_keys)
+                for inf_path in cache_inf_inventory
+            }
+            run_cache.prune(valid_cache_keys)
+        _log(
+            log,
+            f"Envelope run-data cache write finished: {cache_rows_written} rows | "
+            f"{_elapsed(cache_started)}",
+        )
 
     if sustained_settings_obj.enabled:
         for scope in selected_scopes:
@@ -1058,6 +1234,7 @@ def build_voltage_envelopes(
                 voltage: sustained_signature_inputs.get((scope.folder, voltage), {})
                 for voltage in scope_results
             }
+            result_started = time.perf_counter()
             result_path = sustained_sdpf.save_results(
                 project_root,
                 scope.folder,
@@ -1069,7 +1246,12 @@ def build_voltage_envelopes(
             )
             outputs.append(result_path)
             result_outputs.append(result_path)
-            _log(log, f"Sustained SDPF result saved: {result_path}")
+            _log(
+                log,
+                f"Sustained SDPF result saved: {result_path} | "
+                f"persist={_elapsed(result_started)}",
+            )
+            summary_started = time.perf_counter()
             summary_path = sustained_sdpf.write_summary_workbook(
                 project_root,
                 scope.folder,
@@ -1080,7 +1262,11 @@ def build_voltage_envelopes(
             )
             data_outputs.append(summary_path)
             sustained_summary_outputs.append(summary_path)
-            _log(log, f"Sustained SDPF ranked summary saved: {summary_path}")
+            _log(
+                log,
+                f"Sustained SDPF ranked summary saved: {summary_path} | "
+                f"write={_elapsed(summary_started)}",
+            )
     else:
         for scope in selected_scopes:
             stale_result = sustained_sdpf.result_path(project_root, scope.folder)
@@ -1097,6 +1283,7 @@ def build_voltage_envelopes(
 
     resonance_workbooks: list[Path] = []
     if resonance_settings_obj.enabled:
+        resonance_started = time.perf_counter()
         for workbook_path in resonance_checks.write_workbooks(
             project_root,
             selected_scopes,
@@ -1106,6 +1293,7 @@ def build_voltage_envelopes(
         ):
             resonance_workbooks.append(workbook_path)
             _log(log, f"Resonance checks workbook finished: {workbook_path}")
+        _log(log, f"Resonance workbook phase finished: {_elapsed(resonance_started)}")
 
     if build_charts:
         chart_inputs.sort(key=lambda item: (voltage_keys.index(item[0]) if item[0] in voltage_keys else 999, str(item[1])))
@@ -1194,6 +1382,8 @@ def build_voltage_envelopes(
         presentation_outputs=[combined_path for _v, _e, combined_path in chart_inputs],
     )
     _log(log, f"Envelope build total: {project_root.name} | {_elapsed(started)}")
+    if progress is not None:
+        progress(100, 100, f"Envelopes ready: {project_root.name}")
     return outputs
 
 
@@ -1277,6 +1467,8 @@ def _build_voltage_workbooks(
     sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
     sustained_frequency: float | None = None,
     sustained_source_files_by_scope: dict[str, list[dict[str, Any]]] | None = None,
+    cached_run_data: Mapping[Path, envelope_data_cache.RunData] | None = None,
+    progress: ProgressFn | None = None,
 ) -> _VoltageBuildResult:
     started = time.perf_counter()
     _cancel(check_cancel)
@@ -1291,31 +1483,87 @@ def _build_voltage_workbooks(
     bus_prefix, bus_um = config.bus_prefix, config.um
     nominal_voltage = _nominal_voltage_from_key(voltage_key, bus_um)
 
-    _log(log, f"Envelope source read started: {voltage_key} kV | {len(all_inf_paths)} unique runs")
-    read_started = time.perf_counter()
-    run_data = _read_voltage_runs(
-        all_inf_paths,
-        voltage_key,
-        bus_prefix,
-        bus_um,
-        exclusion_matcher,
-        worker_count,
-        log,
-        check_cancel,
-        high_voltage_include_overrides=high_voltage_include_overrides,
-        high_voltage_limit_factor=high_voltage_limit_factor,
-        time_step=time_step,
-        time_end=time_end,
-        fallback_frequency=fallback_frequency,
-        frequency_fallback=frequency_fallback,
-        inf_descriptor_cache=inf_descriptor_cache,
-        executor=run_executor,
-        process_pool=isinstance(run_executor, ProcessPoolExecutor),
-        sustained_settings=sustained_settings,
-        sustained_limits=sustained_limits,
-        sustained_frequency=sustained_frequency,
+    cache_enabled = cached_run_data is not None
+    missing_inf_paths = (
+        [path for path in all_inf_paths if path not in cached_run_data]
+        if cache_enabled
+        else all_inf_paths
     )
+    _log(
+        log,
+        f"Envelope source read started: {voltage_key} kV | "
+        f"{len(missing_inf_paths)} of {len(all_inf_paths)} unique runs",
+    )
+    if progress is not None:
+        progress(0, 100, f"Reading envelope runs: {voltage_key} kV")
+    read_started = time.perf_counter()
+
+    def read_progress(current: int, total: int, message: str) -> None:
+        if progress is None:
+            return
+        fraction = 1.0 if total <= 0 else max(0.0, min(1.0, current / total))
+        progress(5 + int(round(fraction * 45)), 100, message)
+
+    if cache_enabled:
+        fresh_run_data = _read_voltage_runs(
+            missing_inf_paths,
+            voltage_key,
+            bus_prefix,
+            bus_um,
+            ExclusionMatcher(),
+            worker_count,
+            log,
+            check_cancel,
+            high_voltage_include_overrides=None,
+            high_voltage_limit_factor=high_voltage_limit_factor,
+            time_step=time_step,
+            time_end=time_end,
+            fallback_frequency=fallback_frequency,
+            frequency_fallback=frequency_fallback,
+            inf_descriptor_cache=inf_descriptor_cache,
+            executor=run_executor,
+            process_pool=isinstance(run_executor, ProcessPoolExecutor),
+            sustained_settings=sustained_settings,
+            sustained_limits=sustained_limits,
+            sustained_frequency=sustained_frequency,
+            retain_high_voltage_buses=True,
+            progress=read_progress,
+        )
+        raw_run_data = {**cached_run_data, **fresh_run_data}
+        run_data = _filter_cached_run_data(
+            raw_run_data,
+            voltage_key,
+            exclusion_matcher,
+            high_voltage_include_overrides,
+        )
+    else:
+        fresh_run_data = _read_voltage_runs(
+            all_inf_paths,
+            voltage_key,
+            bus_prefix,
+            bus_um,
+            exclusion_matcher,
+            worker_count,
+            log,
+            check_cancel,
+            high_voltage_include_overrides=high_voltage_include_overrides,
+            high_voltage_limit_factor=high_voltage_limit_factor,
+            time_step=time_step,
+            time_end=time_end,
+            fallback_frequency=fallback_frequency,
+            frequency_fallback=frequency_fallback,
+            inf_descriptor_cache=inf_descriptor_cache,
+            executor=run_executor,
+            process_pool=isinstance(run_executor, ProcessPoolExecutor),
+            sustained_settings=sustained_settings,
+            sustained_limits=sustained_limits,
+            sustained_frequency=sustained_frequency,
+            progress=read_progress,
+        )
+        run_data = fresh_run_data
     _log(log, f"Envelope source read finished: {voltage_key} kV | {_elapsed(read_started)}")
+    if progress is not None:
+        progress(50, 100, f"Merging envelope data: {voltage_key} kV")
 
     chart_inputs: list[tuple[str, Path, Path]] = []
     data_outputs: list[Path] = []
@@ -1324,12 +1572,19 @@ def _build_voltage_workbooks(
     sustained_observations: dict[tuple[str, str], list[sustained_sdpf.SustainedSDPFResult]] = {}
     sustained_signature_inputs: dict[tuple[str, str], dict[str, Any]] = {}
     resonance_settings = resonance_settings or resonance_checks.ResonanceSettings()
-    for scope in selected_scopes:
+    scope_count = max(1, len(selected_scopes))
+    for scope_index, scope in enumerate(selected_scopes):
         inf_paths = scope_inf_paths[scope.folder]
         if not inf_paths:
             continue
 
         _cancel(check_cancel)
+        if progress is not None:
+            progress(
+                50 + int((scope_index / scope_count) * 45),
+                100,
+                f"Merging envelope data: {scope.folder} | {voltage_key} kV",
+            )
         scope_started = time.perf_counter()
         _log(log, f"Envelope merge started: {scope.folder} | {voltage_key} kV | {len(inf_paths)} runs")
         entries, high_voltage, sustained_rows = _entries_for_inf_paths(inf_paths, run_data)
@@ -1426,6 +1681,8 @@ def _build_voltage_workbooks(
         )
 
     _log(log, f"Envelope voltage finished: {voltage_key} kV | {_elapsed(started)}")
+    if progress is not None:
+        progress(100, 100, f"Envelope voltage ready: {voltage_key} kV")
     return _VoltageBuildResult(
         chart_inputs=chart_inputs,
         resonance_results=resonance_results,
@@ -1433,6 +1690,7 @@ def _build_voltage_workbooks(
         sustained_results=sustained_results,
         sustained_observations=sustained_observations,
         sustained_signature_inputs=sustained_signature_inputs,
+        cache_updates=fresh_run_data if cache_enabled else {},
     )
 
 
@@ -1706,9 +1964,14 @@ def _read_voltage_runs(
     sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
     sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
     sustained_frequency: float | None = None,
-) -> dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]]:
+    retain_high_voltage_buses: bool = False,
+    progress: ProgressFn | None = None,
+) -> dict[Path, envelope_data_cache.RunData]:
     limit = high_voltage_limit_factor * bus_um * math.sqrt(2)
-    run_data: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]] = {}
+    run_data: dict[Path, envelope_data_cache.RunData] = {}
+
+    if progress is not None:
+        progress(0, len(inf_paths), f"Reading envelope source files: {voltage_key} kV")
 
     workers = _worker_count(len(inf_paths), worker_count)
     completed = 0
@@ -1747,6 +2010,7 @@ def _read_voltage_runs(
                     sustained_settings,
                     sustained_limits,
                     sustained_frequency,
+                    retain_high_voltage_buses,
                 )
             else:
                 future = executor.submit(
@@ -1766,9 +2030,16 @@ def _read_voltage_runs(
                     sustained_settings=sustained_settings,
                     sustained_limits=sustained_limits,
                     sustained_frequency=sustained_frequency,
+                    retain_high_voltage_buses=retain_high_voltage_buses,
                 )
             futures[future] = inf_path
         completed = len(run_data)
+        if progress is not None:
+            progress(
+                completed,
+                len(inf_paths),
+                f"Reading envelope source files: {voltage_key} kV",
+            )
         if completed and not futures:
             _log(log, f"Envelope source files read: {bus_prefix} | {completed}/{len(inf_paths)}")
         for future in as_completed(futures):
@@ -1792,6 +2063,15 @@ def _read_voltage_runs(
             completed += 1
             if completed == 1 or completed == len(inf_paths) or completed % 10 == 0:
                 _log(log, f"Envelope source files read: {bus_prefix} | {completed}/{len(inf_paths)}")
+            if progress is not None and (
+                completed == len(inf_paths)
+                or completed % max(1, len(inf_paths) // 100) == 0
+            ):
+                progress(
+                    completed,
+                    len(inf_paths),
+                    f"Reading envelope source files: {voltage_key} kV",
+                )
     except Exception:
         executor.shutdown(wait=True, cancel_futures=True)
         raise
@@ -1816,7 +2096,12 @@ def _read_run_entries_process(
     sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
     sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
     sustained_frequency: float | None = None,
-) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]], list[str]]:
+    retain_high_voltage_buses: bool = False,
+) -> tuple[
+    list[tuple[str, pd.DataFrame | list[dict[str, Any]]]],
+    list[dict[str, Any]],
+    list[str],
+]:
     fallback_contexts: list[str] = []
     entries, exclusions = _read_run_entries(
         inf_path,
@@ -1837,13 +2122,14 @@ def _read_run_entries_process(
         sustained_settings=sustained_settings,
         sustained_limits=sustained_limits,
         sustained_frequency=sustained_frequency,
+        retain_high_voltage_buses=retain_high_voltage_buses,
     )
     return entries, exclusions, fallback_contexts
 
 
 def _entries_for_inf_paths(
     inf_paths: list[Path],
-    run_data: dict[Path, tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]],
+    run_data: Mapping[Path, envelope_data_cache.RunData],
 ) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[tuple[str, pd.DataFrame]] = []
     high_voltage: list[dict[str, Any]] = []
@@ -1857,6 +2143,70 @@ def _entries_for_inf_paths(
                 entries.append((measurement, value))
         high_voltage.extend(run_exclusions)
     return entries, high_voltage, sustained
+
+
+def _filter_cached_run_data(
+    run_data: Mapping[
+        Path,
+        envelope_data_cache.RunData,
+    ],
+    voltage_key: str,
+    exclusion_matcher: ExclusionMatcher,
+    high_voltage_include_overrides: set[tuple[str, str, int, str]],
+) -> dict[Path, envelope_data_cache.RunData]:
+    """Apply current project exclusions to source-independent cached results."""
+    filtered: dict[Path, envelope_data_cache.RunData] = {}
+    for inf_path, (entries, detected_high_voltage) in run_data.items():
+        case_name, run = case_run_from_inf_path(inf_path)
+        high_voltage: list[dict[str, Any]] = []
+        for record in detected_high_voltage:
+            bus = str(record.get("MM_name", ""))
+            if exclusion_matcher.excludes(voltage_key, case_name, run, bus):
+                continue
+            key = _high_voltage_key(voltage_key, case_name, run, bus)
+            if key is not None and key in high_voltage_include_overrides:
+                continue
+            high_voltage.append(dict(record))
+        high_voltage_buses = {
+            str(record.get("MM_name", "")).casefold()
+            for record in high_voltage
+        }
+
+        filtered_entries: list[tuple[str, pd.DataFrame | list[dict[str, Any]]]] = []
+        for measurement, value in entries:
+            if measurement == SUSTAINED_ENTRY:
+                if not isinstance(value, list):
+                    continue
+                sustained_rows: list[dict[str, Any]] = []
+                for row in value:
+                    if not isinstance(row, dict):
+                        continue
+                    result = row.get("result")
+                    result_mapping = result if isinstance(result, dict) else row
+                    bus = str(result_mapping.get("mm_name", ""))
+                    row_case = str(result_mapping.get("case", case_name))
+                    try:
+                        row_run = int(result_mapping.get("run", run))
+                    except (TypeError, ValueError):
+                        row_run = run
+                    if exclusion_matcher.excludes(voltage_key, row_case, row_run, bus):
+                        continue
+                    if bus.casefold() in high_voltage_buses:
+                        continue
+                    sustained_rows.append(row)
+                if sustained_rows:
+                    filtered_entries.append((measurement, sustained_rows))
+                continue
+            if not isinstance(value, pd.DataFrame) or value.empty:
+                continue
+            bus = str(value["MM_name"].iloc[0]) if "MM_name" in value.columns else ""
+            if exclusion_matcher.excludes(voltage_key, case_name, run, bus):
+                continue
+            if bus.casefold() in high_voltage_buses:
+                continue
+            filtered_entries.append((measurement, value))
+        filtered[inf_path] = (filtered_entries, high_voltage)
+    return filtered
 
 
 def _read_run_entries(
@@ -1875,7 +2225,8 @@ def _read_run_entries(
     sustained_settings: sustained_sdpf.SustainedSDPFSettings | None = None,
     sustained_limits: sustained_sdpf.SDPFVoltageLimits | None = None,
     sustained_frequency: float | None = None,
-) -> tuple[list[tuple[str, pd.DataFrame]], list[dict[str, Any]]]:
+    retain_high_voltage_buses: bool = False,
+) -> envelope_data_cache.RunData:
     _cancel(check_cancel)
     case_name, run = case_run_from_inf_path(inf_path)
     if inf_descriptor_cache is None or inf_path not in inf_descriptor_cache:
@@ -1929,7 +2280,7 @@ def _read_run_entries(
     sustained_rows: list[dict[str, Any]] = []
     for measurement, bus, waveforms in candidates:
         _cancel(check_cancel)
-        if bus in high_voltage_buses:
+        if not retain_high_voltage_buses and bus in high_voltage_buses:
             continue
         envelope_df = _apply_bus_waveforms(
             waveforms,

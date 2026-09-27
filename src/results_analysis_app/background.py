@@ -28,18 +28,35 @@ class CancelToken:
 
 class BackgroundTask(QtCore.QThread):
     message = QtCore.Signal(str)
+    progress = QtCore.Signal(int, int, str)
     succeeded = QtCore.Signal(object)
     cancelled = QtCore.Signal()
     failed = QtCore.Signal(str, str)
 
-    def __init__(self, work, cancel_token: CancelToken, parent: QtCore.QObject | None = None) -> None:
+    def __init__(
+        self,
+        work,
+        cancel_token: CancelToken,
+        parent: QtCore.QObject | None = None,
+        *,
+        with_progress: bool = False,
+    ) -> None:
         super().__init__(parent)
         self._work = work
         self.cancel_token = cancel_token
+        self._with_progress = with_progress
 
     def run(self) -> None:
         try:
-            self.succeeded.emit(self._work(self.message.emit, self.cancel_token))
+            if self._with_progress:
+                result = self._work(
+                    self.message.emit,
+                    self.cancel_token,
+                    self.progress.emit,
+                )
+            else:
+                result = self._work(self.message.emit, self.cancel_token)
+            self.succeeded.emit(result)
         except OperationCancelled:
             self.cancelled.emit()
         except Exception as exc:

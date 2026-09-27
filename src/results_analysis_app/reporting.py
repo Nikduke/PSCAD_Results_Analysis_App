@@ -28,7 +28,7 @@ from results_analysis_app.common import (
 from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import ScopeEntry
-from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
+from results_analysis_app.project_config import DEFAULT_EVENT_TIMES, load_project_frequency
 from pscad_plotter_app_v3.services.project_conventions import KNOWN_FAULT_LABELS
 
 
@@ -48,7 +48,7 @@ WORD_2012_NAMESPACE = "http://schemas.microsoft.com/office/word/2012/wordml"
 WORD_2016_CID_NAMESPACE = "http://schemas.microsoft.com/office/word/2016/wordml/cid"
 REPORT_MANIFEST_VERSION = 2
 SUSTAINED_REPORT_LAYOUT_VERSION = 3
-RMS_REPORT_LAYOUT_VERSION = 2
+RMS_REPORT_LAYOUT_VERSION = 3
 LEGACY_REPORT_MANIFEST_FILENAME = ".report_manifest.json"
 
 @dataclass(frozen=True)
@@ -1663,9 +1663,24 @@ def _add_rms_report_content(
     if not grouped:
         return 0
     _add_report_heading(doc, "RMS", level=2)
+    methods = {selection.real_rms for selection in (selections_by_key or {}).values()}
+    if methods == {True}:
+        method_sentence = (
+            "The governing Case/Run/MM rows come from the MM results catalog; "
+            "their plotted and reported RMS values are recomputed from "
+            "instantaneous LGp/LLp waveforms using the creator's Real RMS method."
+        )
+    elif methods == {False} or not methods:
+        method_sentence = "RMS values use the reported LGr/LLr catalog traces."
+    else:
+        method_sentence = (
+            "The governing Case/Run/MM rows come from the MM results catalog. "
+            "Real RMS is used where the selected instantaneous waveforms are "
+            "available; unavailable rows retain their catalog values."
+        )
     doc.add_paragraph(
         "Selected RMS voltage traces show the governing maximum and minimum values "
-        "for the configured MM elements.",
+        f"for the configured MM elements. {method_sentence}",
         style="Body Text",
     )
     count = 0
@@ -2170,28 +2185,15 @@ def build_reports_from_existing_plots(
                             log,
                             check_cancel,
                         )
-                    if catalog_context.run_index:
-                        provided_selections = rms_analysis.select_rms_rows_from_catalog(
-                            catalog_context.catalog,
-                            parsed_rms,
-                            selected_voltages,
-                        )
-                    else:
-                        # A report-only rebuild may be pointed at a project
-                        # that no longer has its raw .inf inventory.  Keep
-                        # existing plot/report metadata usable in that case;
-                        # batch creation and connected runs always have the
-                        # authoritative run index and use the strict path.
-                        provided_selections = rms_analysis.select_rms_rows(
-                            catalog_context.catalog.mm_results,
-                            selected_elements=parsed_rms["elements"],
-                            selected_quantities=parsed_rms["quantities"],
-                            selected_voltages=selected_voltages,
-                            switching_time_mode=parsed_rms["switching_time_mode"],
-                            selected_switching_times=parsed_rms["switching_times"],
-                            switching_time_start_s=parsed_rms["switching_time_start_s"],
-                            switching_time_end_s=parsed_rms["switching_time_end_s"],
-                        )
+                    provided_selections = rms_analysis.select_rms_rows_from_catalog(
+                        catalog_context.catalog,
+                        parsed_rms,
+                        selected_voltages,
+                        run_index=catalog_context.run_index,
+                        frequency_hz=load_project_frequency(root),
+                        check_cancel=check_cancel,
+                        log=log,
+                    )
                 rms_selections_by_key = {
                     (
                         selection.voltage_key,

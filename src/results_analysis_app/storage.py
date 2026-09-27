@@ -21,6 +21,8 @@ AUTOSAVE_PATH = STATE_DIR / "last_session.json"
 PROJECT_SCAN_CACHE_PATH = STATE_DIR / "project_scan_cache.json"
 PROJECT_ANALYSIS_CACHE_FILENAME = "analysis_cache.json"
 PROJECT_ANALYSIS_CACHE_VERSION = 1
+PROJECT_ENVELOPE_DATA_CACHE_FILENAME = "envelope_data.sqlite3"
+PROJECT_DATA_CACHE_SETTING = "incremental_run_data_enabled"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -48,6 +50,11 @@ def project_analysis_cache_path(project_root: str | Path) -> Path:
     return Path(project_root) / ".state" / PROJECT_ANALYSIS_CACHE_FILENAME
 
 
+def project_envelope_data_cache_path(project_root: str | Path) -> Path:
+    """Return the project-local persistent derived run-data cache path."""
+    return Path(project_root) / ".state" / PROJECT_ENVELOPE_DATA_CACHE_FILENAME
+
+
 def load_project_analysis_cache(project_root: str | Path) -> dict[str, Any]:
     """Load stage fingerprints without treating them as source data."""
     path = project_analysis_cache_path(project_root)
@@ -65,6 +72,28 @@ def save_project_analysis_cache(project_root: str | Path, payload: dict[str, Any
     value = dict(payload)
     value["version"] = PROJECT_ANALYSIS_CACHE_VERSION
     write_json(project_analysis_cache_path(project_root), value, indent=None)
+
+
+def project_incremental_run_data_enabled(project_root: str | Path) -> bool:
+    """Return the project setting for the optional incremental run-data cache."""
+    cache = load_project_analysis_cache(project_root)
+    settings = cache.get("settings")
+    if not isinstance(settings, dict):
+        return True
+    return bool(settings.get(PROJECT_DATA_CACHE_SETTING, True))
+
+
+def set_project_incremental_run_data_enabled(
+    project_root: str | Path,
+    enabled: bool,
+) -> None:
+    """Persist the incremental run-data setting without changing cache artifacts."""
+    cache = load_project_analysis_cache(project_root)
+    settings = cache.get("settings")
+    normalized_settings = dict(settings) if isinstance(settings, dict) else {}
+    normalized_settings[PROJECT_DATA_CACHE_SETTING] = bool(enabled)
+    cache["settings"] = normalized_settings
+    save_project_analysis_cache(project_root, cache)
 
 
 def load_autosave() -> AppSession:

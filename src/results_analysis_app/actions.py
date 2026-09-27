@@ -11,7 +11,7 @@ from results_analysis_app import rms_analysis
 from results_analysis_app import sustained_sdpf
 from results_analysis_app import voltage_envelope
 from results_analysis_app.envelope_chart import create_combined_envelope_plot, create_resonance_check_charts
-from results_analysis_app.common import LogFn, log_message as _log
+from results_analysis_app.common import LogFn, ProgressFn, log_message as _log
 from results_analysis_app.exclusions import ExclusionRule
 from results_analysis_app.excel import EXCEL_AUTOMATION_ERRORS, excel_app
 from results_analysis_app.models import (
@@ -19,7 +19,7 @@ from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_WIDTH,
     ScopeEntry,
 )
-from results_analysis_app.project_config import ProjectTiming
+from results_analysis_app.project_config import ProjectTiming, load_project_frequency
 from results_analysis_app.reporting import build_reports_from_existing_plots
 
 
@@ -118,16 +118,32 @@ def build_voltage_envelopes(
     nonconv_cases_by_project: dict[str, list[Any]] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Build scope-aware voltage envelope workbooks for selected projects."""
+    roots = list(project_roots)
     selected_scopes = list(scopes)
     selected_voltages = list(voltages)
     outputs: list[Path] = []
-    for project_root in project_roots:
+    progress_total = max(1, len(roots)) * 100
+    if progress is not None:
+        progress(0, progress_total, "Building voltage envelopes")
+    for index, project_root in enumerate(roots, start=1):
         root = Path(project_root).resolve()
         ensure_output_tree(root, selected_scopes)
         _log(log, f"Building voltage envelopes: {root.name}")
         project_key = str(root)
+
+        def project_progress(current: int, total: int, message: str) -> None:
+            if progress is None:
+                return
+            fraction = 1.0 if total <= 0 else max(0.0, min(1.0, current / total))
+            progress(
+                (index - 1) * 100 + int(round(fraction * 100)),
+                progress_total,
+                message,
+            )
+
         root_resonance_settings = (resonance_settings_by_project or {}).get(
             project_key,
             resonance_settings,
@@ -184,8 +200,11 @@ def build_voltage_envelopes(
                 sustained_sdpf_limits_by_voltage=(sustained_sdpf_limits_by_project or {}).get(project_key),
                 nonconv_cases=(nonconv_cases_by_project or {}).get(project_key),
                 build_charts=build_charts,
+                progress=project_progress,
             )
         )
+        if progress is not None:
+            progress(index * 100, progress_total, f"Built envelopes: {root.name}")
     return outputs
 
 
@@ -204,6 +223,7 @@ def rebuild_envelope_charts(
     envelope_chart_height: float | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Recreate combined envelope plot workbooks from existing envelope workbooks."""
     selected_scopes = list(scopes)
@@ -212,9 +232,14 @@ def rebuild_envelope_charts(
         "width": float(envelope_chart_width or DEFAULT_ENVELOPE_CHART_WIDTH),
         "height": float(envelope_chart_height or DEFAULT_ENVELOPE_CHART_HEIGHT),
     }
+    roots = list(project_roots)
     outputs: list[Path] = []
+    total = len(roots) * len(selected_scopes) * len(selected_voltages)
+    completed = 0
+    if progress is not None:
+        progress(0, total, "Rebuilding envelope charts")
     with excel_app() as excel:
-        for project_root in project_roots:
+        for project_root in roots:
             root = Path(project_root).resolve()
             chart_x_max = _project_value(envelope_chart_x_max_by_project, root)
             chart_x_major = _project_value(envelope_chart_x_major_by_project, root)
@@ -227,6 +252,13 @@ def rebuild_envelope_charts(
                     input_path = root / "Voltage_envelope" / scope.folder / f"MM_{voltage}.xlsx"
                     if not input_path.exists():
                         _log(log, f"Envelope workbook missing, skipped: {input_path.name}")
+                        completed += 1
+                        if progress is not None:
+                            progress(
+                                completed,
+                                total,
+                                f"Checked envelope chart: {root.name} / {scope.folder} / {voltage} kV",
+                            )
                         continue
                     output_path = input_path.with_name(f"{input_path.stem}_with_combined_plot.xlsx")
                     _log(log, f"Rebuilding envelope chart: {scope.folder} / {input_path.name}")
@@ -247,6 +279,13 @@ def rebuild_envelope_charts(
                             chart_size=chart_size,
                         )
                     )
+                    completed += 1
+                    if progress is not None:
+                        progress(
+                            completed,
+                            total,
+                            f"Rebuilt envelope chart: {root.name} / {scope.folder} / {voltage} kV",
+                        )
     return outputs
 
 
@@ -257,13 +296,19 @@ def rebuild_analysis_charts(
     envelope_chart_x_major_by_project: dict[str, float | None] | None = None,
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Recreate chart sheets inside existing resonance check workbooks."""
     selected_scopes = list(scopes)
+    roots = list(project_roots)
     outputs: list[Path] = []
+    total = len(roots) * len(selected_scopes)
+    completed = 0
+    if progress is not None:
+        progress(0, total, "Rebuilding analysis charts")
     try:
         with excel_app() as excel:
-            for project_root in project_roots:
+            for project_root in roots:
                 root = Path(project_root).resolve()
                 chart_x_max = _project_value(envelope_chart_x_max_by_project, root)
                 chart_x_major = _project_value(envelope_chart_x_major_by_project, root)
@@ -274,6 +319,13 @@ def rebuild_analysis_charts(
                     workbook_path = root / "Voltage_envelope" / scope.folder / resonance_checks.WORKBOOK_NAME
                     if not workbook_path.exists():
                         _log(log, f"Analysis workbook missing, skipped: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
+                        completed += 1
+                        if progress is not None:
+                            progress(
+                                completed,
+                                total,
+                                f"Checked analysis chart: {root.name} / {scope.folder}",
+                            )
                         continue
                     if create_resonance_check_charts(
                         workbook_path,
@@ -285,6 +337,13 @@ def rebuild_analysis_charts(
                         _log(log, f"Rebuilt analysis charts: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
                     else:
                         _log(log, f"No analysis chart sheets found: {scope.folder} / {resonance_checks.WORKBOOK_NAME}")
+                    completed += 1
+                    if progress is not None:
+                        progress(
+                            completed,
+                            total,
+                            f"Rebuilt analysis chart: {root.name} / {scope.folder}",
+                        )
     except EXCEL_AUTOMATION_ERRORS as exc:
         _log(log, f"Excel chart styling unavailable; analysis chart rebuild skipped: {exc}")
     return outputs
@@ -314,13 +373,17 @@ def create_plot_batches(
     rms_selections_by_project: Mapping[
         str, Iterable[rms_analysis.RMSSelection]
     ] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Create scope/event plot batch workbooks from existing envelope workbooks."""
+    roots = list(project_roots)
     selected_scopes = list(scopes)
     selected_voltages = list(voltages)
     selected_events = list(events)
     outputs: list[Path] = []
-    for project_root in project_roots:
+    if progress is not None:
+        progress(0, len(roots), "Creating plot batches")
+    for index, project_root in enumerate(roots, start=1):
         root = Path(project_root).resolve()
         root_resonance_settings = (resonance_settings_by_project or {}).get(
             str(root),
@@ -355,6 +418,8 @@ def create_plot_batches(
                 rms_selections=(rms_selections_by_project or {}).get(str(root)),
             )
         )
+        if progress is not None:
+            progress(index, len(roots), f"Created plot batches: {root.name}")
     return outputs
 
 
@@ -380,8 +445,10 @@ def render_plot_batches(
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     rms_catalog_context_by_project: Mapping[str, Any] | None = None,
+    progress: ProgressFn | None = None,
 ) -> None:
     """Render existing scope/event plot batches into generated plot folders."""
+    roots = list(project_roots)
     selected_scopes = list(scopes)
     base_events = list(events)
     analysis_events = {
@@ -394,7 +461,9 @@ def render_plot_batches(
     }
     base_events = [event for event in base_events if event not in analysis_events]
     rms_by_project = rms_settings_by_project or {}
-    for project_root in project_roots:
+    if progress is not None:
+        progress(0, len(roots), "Rendering plot batches")
+    for index, project_root in enumerate(roots, start=1):
         root = Path(project_root).resolve()
         root_resonance_settings = (resonance_settings_by_project or {}).get(
             str(root),
@@ -432,6 +501,8 @@ def render_plot_batches(
             rms_settings=rms_by_project.get(str(root)),
             rms_catalog_context=(rms_catalog_context_by_project or {}).get(str(root)),
         )
+        if progress is not None:
+            progress(index, len(roots), f"Rendered plot batches: {root.name}")
 
 
 def rebuild_heatmaps(
@@ -443,10 +514,14 @@ def rebuild_heatmaps(
     log: LogFn | None = None,
     check_cancel: Callable[[], None] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    progress: ProgressFn | None = None,
 ) -> None:
     """Regenerate Sustained SDPF heatmaps without rendering other plots."""
+    roots = list(project_roots)
     selected_scopes = list(scopes)
-    for project_root in project_roots:
+    if progress is not None:
+        progress(0, len(roots), "Rebuilding Sustained SDPF heatmaps")
+    for index, project_root in enumerate(roots, start=1):
         root = Path(project_root).resolve()
         root_sustained_settings = (sustained_sdpf_settings_by_project or {}).get(
             str(root),
@@ -462,6 +537,8 @@ def rebuild_heatmaps(
             sustained_sdpf_heatmap_settings=(sustained_sdpf_heatmap_settings_by_project or {}).get(str(root)),
             event_times=event_times,
         )
+        if progress is not None:
+            progress(index, len(roots), f"Rebuilt heatmaps: {root.name}")
 
 
 def run_analysis_pipeline(
@@ -508,14 +585,33 @@ def run_analysis_pipeline(
     rms_catalog_context_by_project: Mapping[str, Any] | None = None,
     resonance_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
     sustained_sdpf_settings_by_project: Mapping[str, Mapping[str, object]] | None = None,
+    progress: ProgressFn | None = None,
 ) -> list[Path]:
     """Run the connected analysis path end to end for selected projects/scopes."""
+    roots = list(project_roots)
     selected_scopes = list(scopes)
     selected_voltages = [str(voltage) for voltage in voltages]
     selected_events = [str(event) for event in events]
     reports: list[Path] = []
 
-    for project_root in project_roots:
+    # Each pipeline stage owns a 100-point slice.  This keeps the progress
+    # range stable while envelope construction reports source-read/merge work.
+    progress_total = len(roots) * 500
+    progress_completed = 0
+    if progress is not None:
+        progress(0, progress_total, "Preparing analysis")
+
+    def stage_progress(current: int, total: int, message: str) -> None:
+        if progress is None:
+            return
+        fraction = 1.0 if total <= 0 else max(0.0, min(1.0, current / total))
+        progress(
+            progress_completed + int(round(fraction * 100)),
+            progress_total,
+            message,
+        )
+
+    for project_root in roots:
         root = Path(project_root).resolve()
         project_key = str(root)
         root_resonance_settings = (resonance_settings_by_project or {}).get(
@@ -564,8 +660,16 @@ def run_analysis_pipeline(
             nonconv_cases_by_project=nonconv_cases_by_project,
             log=log,
             check_cancel=check_cancel,
+            progress=stage_progress,
         )
+        progress_completed += 100
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Envelopes ready: {root.name}")
 
+        data_started = time.perf_counter()
+        _log(log, "Preparing analysis data for plot batches.")
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Preparing analysis data: {root.name}")
         rms_catalog_context = (rms_catalog_context_by_project or {}).get(project_key)
         rms_selections: list[rms_analysis.RMSSelection] | None = None
         parsed_rms_settings = rms_analysis.normalize_rms_settings(
@@ -576,15 +680,24 @@ def run_analysis_pipeline(
                 rms_catalog_context is None
                 or not rms_catalog_context.mm_results_are_current()
             ):
+                rms_started = time.perf_counter()
                 rms_catalog_context = analysis_engine.load_plotter_catalog(
                     root,
                     log,
                     check_cancel,
                 )
+                _log(log, f"RMS catalog preparation finished: {time.perf_counter() - rms_started:.1f}s")
             rms_selections = rms_analysis.select_rms_rows_from_catalog(
                 rms_catalog_context.catalog,
                 parsed_rms_settings,
                 selected_voltages,
+                run_index=rms_catalog_context.run_index,
+                frequency_hz=(
+                    (project_timing_by_project or {}).get(project_key, {}).get("frequency")
+                    or load_project_frequency(root)
+                ),
+                check_cancel=check_cancel,
+                log=log,
             )
 
         sustained_payloads_by_scope: dict[str, Mapping[str, Any]] = {}
@@ -595,6 +708,7 @@ def run_analysis_pipeline(
             root_sustained_settings
         )
         if parsed_sustained_settings.enabled:
+            sustained_started = time.perf_counter()
             sustained_payloads_by_scope = {
                 scope.folder: sustained_sdpf.load_results(root, scope.folder)
                 for scope in selected_scopes
@@ -607,6 +721,18 @@ def run_analysis_pipeline(
                 )
                 for scope in selected_scopes
             }
+            _log(
+                log,
+                f"Sustained result loading/validation finished: {time.perf_counter() - sustained_started:.1f}s",
+            )
+        _log(log, f"Analysis data preparation finished: {time.perf_counter() - data_started:.1f}s")
+        progress_completed += 100
+        if progress is not None:
+            progress(
+                progress_completed,
+                progress_total,
+                f"Analysis data ready: {root.name}",
+            )
 
         _log(log, "Creating plot batch workbooks.")
         create_plot_batches(
@@ -635,7 +761,11 @@ def run_analysis_pipeline(
             ),
             log=log,
             check_cancel=check_cancel,
+            progress=stage_progress,
         )
+        progress_completed += 100
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Plot batches ready: {root.name}")
 
         _log(log, "Rendering plots from batch workbooks.")
         render_plot_batches(
@@ -660,9 +790,15 @@ def run_analysis_pipeline(
             ),
             log=log,
             check_cancel=check_cancel,
+            progress=stage_progress,
         )
+        progress_completed += 100
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Plots rendered: {root.name}")
 
         _log(log, "Building reports from generated plots and selected dashboard figures.")
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Building reports: {root.name}")
         reports.extend(
             build_reports_from_existing_plots(
                 [root],
@@ -693,5 +829,8 @@ def run_analysis_pipeline(
             )
         )
         _log(log, f"Analysis complete: {root.name}")
+        progress_completed += 100
+        if progress is not None:
+            progress(progress_completed, progress_total, f"Reports ready: {root.name}")
 
     return reports

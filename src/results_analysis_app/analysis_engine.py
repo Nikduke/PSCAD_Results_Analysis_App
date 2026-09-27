@@ -30,13 +30,16 @@ from results_analysis_app.common import (
 from results_analysis_app.envelope_rows import nearest_rows, row_value
 from results_analysis_app.models import ScopeEntry
 from pscad_plotter_app_v3.models import DEFAULT_TOV_WINDOW_S
-from results_analysis_app.project_config import DEFAULT_EVENT_TIMES
+from results_analysis_app.project_config import DEFAULT_EVENT_TIMES, load_project_frequency
 
 
 LEGACY_PLOT_MANIFEST_FILENAME = ".plot_manifest.json"
 # Kept only as the name of the legacy per-folder file that is removed when a
 # folder is next rendered. New stage metadata lives in the project cache.
-PLOT_MANIFEST_VERSION = 3
+# Increment when batch inputs or renderer behavior change.  Real RMS changes
+# the waveform source and derived values even though the visible trace names
+# remain LGr/LLr.
+PLOT_MANIFEST_VERSION = 4
 _DIRECTORY_REPLACE_ATTEMPTS = 3
 _DIRECTORY_REPLACE_DELAY_S = 0.05
 
@@ -479,6 +482,10 @@ def create_plot_batches(
                     catalog_context.catalog,
                     parsed_rms,
                     selected_voltages,
+                    run_index=catalog_context.run_index,
+                    frequency_hz=load_project_frequency(project_root),
+                    check_cancel=check_cancel,
+                    log=log,
                 )
             else:
                 selections = list(rms_selections)

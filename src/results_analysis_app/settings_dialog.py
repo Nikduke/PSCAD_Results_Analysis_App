@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from results_analysis_app.models import (
     DEFAULT_ENVELOPE_CHART_X_MAJOR,
@@ -20,8 +20,82 @@ from results_analysis_app.project_config import (
     load_project_timing,
     load_voltage_configs,
 )
-from results_analysis_app import sustained_sdpf, sustained_sdpf_heatmap
+from results_analysis_app import storage, sustained_sdpf, sustained_sdpf_heatmap
 from results_analysis_app.styles import make_muted_label, make_section_label
+
+
+def validate_settings_table_inputs(
+    y_limit_table: QtWidgets.QTableWidget,
+    um_table: QtWidgets.QTableWidget,
+) -> list[str]:
+    """Return actionable errors for the editable numeric settings tables.
+
+    Empty chart-limit cells are intentional (they mean auto), and an empty Um
+    value is intentional only when the source is marked ``Missing``.  All
+    other entered values must be finite numbers so the settings editor cannot
+    silently turn a typo into an omitted setting.
+    """
+
+    errors: list[str] = []
+
+    def parse_number(text: str) -> float | None:
+        value = text.strip()
+        if not value:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return math.nan
+        return number if math.isfinite(number) else math.nan
+
+    for row in range(y_limit_table.rowCount()):
+        voltage_item = y_limit_table.item(row, 0)
+        voltage_text = voltage_item.text().strip() if voltage_item is not None else ""
+        if not voltage_text and all(
+            not (y_limit_table.item(row, column) and y_limit_table.item(row, column).text().strip())
+            for column in range(1, 4)
+        ):
+            continue
+        voltage = parse_number(voltage_text)
+        if voltage is None or not math.isfinite(voltage) or voltage <= 0:
+            errors.append(f"Envelope Chart row {row + 1}: kV must be a positive number.")
+            continue
+        values: dict[str, float] = {}
+        for column, label in ((1, "Y min"), (2, "Y max"), (3, "Y major")):
+            item = y_limit_table.item(row, column)
+            number = parse_number(item.text() if item is not None else "")
+            if number is None:
+                continue
+            if not math.isfinite(number):
+                errors.append(f"Envelope Chart row {row + 1}: {label} must be a finite number.")
+                continue
+            if label == "Y major" and number <= 0:
+                errors.append(f"Envelope Chart row {row + 1}: Y major must be positive.")
+                continue
+            values[label] = number
+        if "Y min" in values and "Y max" in values and values["Y min"] >= values["Y max"]:
+            errors.append(f"Envelope Chart row {row + 1}: Y min must be less than Y max.")
+
+    for row in range(um_table.rowCount()):
+        voltage_item = um_table.item(row, 0)
+        um_item = um_table.item(row, 1)
+        source_item = um_table.item(row, 2)
+        voltage_text = voltage_item.text().strip() if voltage_item is not None else ""
+        um_text = um_item.text().strip() if um_item is not None else ""
+        source_text = source_item.text().strip() if source_item is not None else ""
+        if not voltage_text and not um_text:
+            continue
+        voltage = parse_number(voltage_text)
+        if voltage is None or not math.isfinite(voltage) or voltage <= 0:
+            errors.append(f"Voltage Um row {row + 1}: kV must be a positive number.")
+            continue
+        if not um_text and source_text.casefold() == "missing":
+            continue
+        um = parse_number(um_text)
+        if um is None or not math.isfinite(um) or um <= 0:
+            errors.append(f"Voltage Um row {row + 1}: Um must be a positive number.")
+
+    return errors
 
 
 def edit_settings(window, initial_tab: str | None = None) -> None:
@@ -50,6 +124,22 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         else project_timing.final_duration if project_timing is not None else None
     )
 
+    scope_context = make_muted_label(
+        (
+            f"Active project: {Path(project_path).name}. "
+            "[All] applies to every project; [Project] applies only here; "
+            "[Derived] is read from project files."
+        )
+        if project_path
+        else "No active project. [Project] controls are disabled; [All] applies to every project.",
+        dialog,
+    )
+    scope_context.setWordWrap(True)
+    scope_context.setToolTip(
+        "Settings marked [All] are shared. Settings marked [Project] are stored per project."
+    )
+    layout.addWidget(scope_context)
+
     tabs = QtWidgets.QTabWidget(dialog)
     build_tab = QtWidgets.QWidget(tabs)
     build_form = QtWidgets.QFormLayout(build_tab)
@@ -70,7 +160,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     workers_row.addWidget(workers_auto_check)
     workers_row.addWidget(workers_spin)
     workers_row.addStretch()
-    build_form.addRow("Envelope workers", workers_row)
+    build_form.addRow("Envelope workers [All]", workers_row)
 
     rebuild_cache_requested = False
     rebuild_cache_button = QtWidgets.QPushButton("Rebuild project cache", build_tab)
@@ -82,7 +172,20 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         dialog.accept()
 
     rebuild_cache_button.clicked.connect(request_cache_rebuild)
-    build_form.addRow("Project scans", rebuild_cache_button)
+    build_form.addRow("Project scans [All]", rebuild_cache_button)
+
+    run_data_cache_check = QtWidgets.QCheckBox("Cache analyzed run data", build_tab)
+    run_data_cache_check.setChecked(
+        storage.project_incremental_run_data_enabled(project_path)
+        if project_path
+        else True
+    )
+    run_data_cache_check.setEnabled(project_path is not None)
+    run_data_cache_check.setToolTip(
+        "Reuse unchanged derived envelope data for this project when scopes, bus exclusions, "
+        "or selected voltages change."
+    )
+    build_form.addRow("Incremental cache [Project]", run_data_cache_check)
 
     excel_exports_check = QtWidgets.QCheckBox("Create automatic Excel waveform exports", build_tab)
     excel_exports_check.setChecked(
@@ -97,7 +200,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     excel_exports_check.setToolTip(
         "Include one waveform Excel file with each automatically generated plot."
     )
-    build_form.addRow("Waveform exports", excel_exports_check)
+    build_form.addRow("Waveform exports [All]", excel_exports_check)
 
     time_step_spin = QtWidgets.QDoubleSpinBox(build_tab)
     time_step_spin.setDecimals(4)
@@ -105,7 +208,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     time_step_spin.setSingleStep(0.001)
     time_step_spin.setSuffix(" s")
     time_step_spin.setValue(float(self.session.envelope_time_step))
-    build_form.addRow("Envelope time step", time_step_spin)
+    build_form.addRow("Envelope time step [All]", time_step_spin)
 
     time_end_spin = QtWidgets.QDoubleSpinBox(build_tab)
     time_end_spin.setDecimals(3)
@@ -123,7 +226,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     time_end_layout.addWidget(time_end_spin)
     time_end_layout.addWidget(time_end_auto_check)
     time_end_layout.addStretch()
-    build_form.addRow("Envelope time end", time_end_widget)
+    build_form.addRow("Envelope time end [All]", time_end_widget)
 
     def update_time_end_controls() -> None:
         time_end_spin.setEnabled(not time_end_auto_check.isChecked())
@@ -140,34 +243,34 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     fallback_frequency_spin.setSuffix(" Hz")
     fallback_frequency_spin.setValue(float(project_frequency or self.session.envelope_fallback_frequency))
     fallback_frequency_spin.setEnabled(project_frequency is None)
-    build_form.addRow("Fallback frequency", fallback_frequency_spin)
+    build_form.addRow("Fallback frequency [All]", fallback_frequency_spin)
     frequency_source = (
         f"Input_Data!B16 for selected project. Settings fallback remains {self.session.envelope_fallback_frequency:g} Hz."
         if project_frequency is not None
         else "Settings fallback; used when Input_Data!B16 is unavailable."
     )
-    build_form.addRow("Frequency source", make_muted_label(frequency_source, build_tab))
+    build_form.addRow("Frequency source [Derived]", make_muted_label(frequency_source, build_tab))
 
     high_voltage_factor_spin = QtWidgets.QDoubleSpinBox(build_tab)
     high_voltage_factor_spin.setDecimals(2)
     high_voltage_factor_spin.setRange(0.01, 100.0)
     high_voltage_factor_spin.setSingleStep(0.5)
     high_voltage_factor_spin.setValue(float(self.session.high_voltage_limit_factor))
-    build_form.addRow("High voltage factor", high_voltage_factor_spin)
+    build_form.addRow("High voltage factor [All]", high_voltage_factor_spin)
 
     nonconv_iip_spin = QtWidgets.QDoubleSpinBox(build_tab)
     nonconv_iip_spin.setDecimals(1)
     nonconv_iip_spin.setRange(0.1, 100000.0)
     nonconv_iip_spin.setSingleStep(10.0)
     nonconv_iip_spin.setValue(float(self.session.nonconv_cb_iip_limit))
-    build_form.addRow("NonConv CB_IIp limit", nonconv_iip_spin)
+    build_form.addRow("NonConv CB_IIp limit [All]", nonconv_iip_spin)
 
     nonconv_iir_spin = QtWidgets.QDoubleSpinBox(build_tab)
     nonconv_iir_spin.setDecimals(1)
     nonconv_iir_spin.setRange(0.1, 100000.0)
     nonconv_iir_spin.setSingleStep(10.0)
     nonconv_iir_spin.setValue(float(self.session.nonconv_cb_iir_limit))
-    build_form.addRow("NonConv CB_IIr limit", nonconv_iir_spin)
+    build_form.addRow("NonConv CB_IIr limit [All]", nonconv_iir_spin)
     tabs.addTab(build_tab, "Envelope Build")
 
     chart_tab = QtWidgets.QWidget(tabs)
@@ -191,7 +294,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     chart_x_max_layout.setContentsMargins(0, 0, 0, 0)
     chart_x_max_layout.addWidget(chart_x_max_spin)
     chart_x_max_layout.addWidget(chart_x_max_auto)
-    chart_form.addRow("Chart x max", chart_x_max_widget)
+    chart_form.addRow("Chart x max [Project]", chart_x_max_widget)
 
     x_major_override = self.session.envelope_chart_x_major_overrides_by_project.get(project_path or "")
     chart_x_major_spin = QtWidgets.QDoubleSpinBox(chart_tab)
@@ -213,7 +316,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     chart_x_major_layout.setContentsMargins(0, 0, 0, 0)
     chart_x_major_layout.addWidget(chart_x_major_spin)
     chart_x_major_layout.addWidget(chart_x_major_auto)
-    chart_form.addRow("Chart x major", chart_x_major_widget)
+    chart_form.addRow("Chart x major [Project]", chart_x_major_widget)
 
     def update_chart_x_controls() -> None:
         enabled = project_path is not None
@@ -238,29 +341,29 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
 
     chart_top_left_edit = QtWidgets.QLineEdit(chart_tab)
     chart_top_left_edit.setText(self.session.envelope_chart_top_left_cell)
-    chart_form.addRow("Chart top-left cell", chart_top_left_edit)
+    chart_form.addRow("Chart top-left cell [All]", chart_top_left_edit)
 
     chart_width_spin = QtWidgets.QDoubleSpinBox(chart_tab)
     chart_width_spin.setDecimals(2)
     chart_width_spin.setRange(10.0, 5000.0)
     chart_width_spin.setValue(float(self.session.envelope_chart_width))
-    chart_form.addRow("Chart width", chart_width_spin)
+    chart_form.addRow("Chart width [All]", chart_width_spin)
 
     chart_height_spin = QtWidgets.QDoubleSpinBox(chart_tab)
     chart_height_spin.setDecimals(2)
     chart_height_spin.setRange(10.0, 5000.0)
     chart_height_spin.setValue(float(self.session.envelope_chart_height))
-    chart_form.addRow("Chart height", chart_height_spin)
+    chart_form.addRow("Chart height [All]", chart_height_spin)
 
     show_sa_label_check = QtWidgets.QCheckBox("Show SA label", chart_tab)
     show_sa_label_check.setChecked(bool(self.session.envelope_chart_show_sa_label))
-    chart_form.addRow("Annotations", show_sa_label_check)
+    chart_form.addRow("Annotations [All]", show_sa_label_check)
     move_labels_check = QtWidgets.QCheckBox("Move labels to avoid overlap", chart_tab)
     move_labels_check.setChecked(bool(self.session.envelope_chart_move_labels))
     move_labels_check.setToolTip(
         "Move envelope labels when they overlap traces, plot edges, or other labels."
     )
-    chart_form.addRow("Label placement", move_labels_check)
+    chart_form.addRow("Label placement [All]", move_labels_check)
     chart_layout.addLayout(chart_form)
 
     y_limit_table = QtWidgets.QTableWidget(0, 4, chart_tab)
@@ -295,7 +398,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     um_layout = QtWidgets.QVBoxLayout(um_tab)
     um_layout.addWidget(
         make_muted_label(
-            f"Project: {Path(project_path).name}" if project_path else "Select a project to edit Um values.",
+            f"[Project] {Path(project_path).name}" if project_path else "[Project] Select a project to edit Um values.",
             um_tab,
         )
     )
@@ -352,7 +455,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         spin.setSuffix(" s")
         spin.setValue(float(self.session.event_times.get(event, 0.0)))
         event_spins[event] = spin
-        events_form.addRow(event, spin)
+        events_form.addRow(f"{event} [All]", spin)
     tabs.addTab(events_tab, "Events")
 
     resonance_tab = QtWidgets.QWidget(tabs)
@@ -365,18 +468,18 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     resonance_top_n_spin = QtWidgets.QSpinBox(resonance_tab)
     resonance_top_n_spin.setRange(1, 20)
     resonance_top_n_spin.setValue(int(self.session.resonance_top_n))
-    resonance_form.addRow("Top N per voltage/type/check", resonance_top_n_spin)
+    resonance_form.addRow("Top N per voltage/type/check [All]", resonance_top_n_spin)
 
     resonance_limit_spin = QtWidgets.QDoubleSpinBox(resonance_tab)
     resonance_limit_spin.setDecimals(4)
     resonance_limit_spin.setRange(0.001, 100.0)
     resonance_limit_spin.setSingleStep(0.1)
     resonance_limit_spin.setValue(float(self.session.resonance_limit_multiplier))
-    resonance_form.addRow("Voltage limit multiplier", resonance_limit_spin)
+    resonance_form.addRow("Voltage limit multiplier [All]", resonance_limit_spin)
 
     resonance_auto_release_check = QtWidgets.QCheckBox("Auto-detect release/recovery time", resonance_tab)
     resonance_auto_release_check.setChecked(bool(self.session.resonance_auto_release))
-    resonance_form.addRow("Release mode", resonance_auto_release_check)
+    resonance_form.addRow("Release mode [All]", resonance_auto_release_check)
 
     resonance_manual_start_spin = QtWidgets.QDoubleSpinBox(resonance_tab)
     resonance_manual_start_spin.setDecimals(4)
@@ -386,7 +489,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     resonance_manual_start_spin.setValue(float(self.session.resonance_manual_analysis_start))
     resonance_manual_start_spin.setEnabled(not resonance_auto_release_check.isChecked())
     resonance_auto_release_check.toggled.connect(lambda checked: resonance_manual_start_spin.setEnabled(not checked))
-    resonance_form.addRow("Manual analysis start time", resonance_manual_start_spin)
+    resonance_form.addRow("Manual analysis start time [All]", resonance_manual_start_spin)
     resonance_layout.addLayout(resonance_form)
 
     sustained_tab = QtWidgets.QWidget(tabs)
@@ -404,13 +507,13 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
         "Minimum physical duration for the peak envelope to remain at or above the selected limit. "
         "A qualifying peak is still required in each relevant complete power-frequency cycle."
     )
-    sustained_form.addRow("Minimum sustained duration", sustained_duration_spin)
+    sustained_form.addRow("Minimum sustained duration [All]", sustained_duration_spin)
     sustained_group_layout.addLayout(sustained_form)
 
     ranking_settings = sustained_sdpf.SustainedSDPFRankingSettings.from_mapping(
         self.session.sustained_sdpf_ranking_settings_by_project.get(project_path or "")
     )
-    ranking_group = QtWidgets.QGroupBox("Representative ranking", sustained_group)
+    ranking_group = QtWidgets.QGroupBox("Representative ranking [Project]", sustained_group)
     ranking_layout = QtWidgets.QVBoxLayout(ranking_group)
     ranking_layout.addWidget(
         make_muted_label(
@@ -658,6 +761,7 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     # The controls use the current scanner cache; no result files are read here.
     refresh_heatmap_set_combo()
     load_heatmap_set(0)
+    sustained_group.setTitle("Sustained SDPF Stress [Project]")
     sustained_limit_table = QtWidgets.QTableWidget(0, 7, sustained_group)
     sustained_limit_table.setHorizontalHeaderLabels(
         [
@@ -804,8 +908,28 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     sustained_tab_layout.addStretch(1)
     tabs.addTab(sustained_tab, "Sustained SDPF")
 
-    advanced_group = QtWidgets.QGroupBox("Algorithm constants", resonance_tab)
+    advanced_toggle = QtWidgets.QToolButton(resonance_tab)
+    advanced_toggle.setText("Advanced algorithm constants")
+    advanced_toggle.setCheckable(True)
+    advanced_toggle.setChecked(False)
+    advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    advanced_toggle.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+    advanced_toggle.setToolTip(
+        "Expert-only resonance thresholds. Leave collapsed unless you need to tune the algorithm."
+    )
+    resonance_layout.addWidget(advanced_toggle)
+
+    advanced_group = QtWidgets.QGroupBox("Algorithm constants [All]", resonance_tab)
+    advanced_group.setVisible(False)
     advanced_form = QtWidgets.QFormLayout(advanced_group)
+
+    def set_advanced_visible(visible: bool) -> None:
+        advanced_group.setVisible(visible)
+        advanced_toggle.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if visible else QtCore.Qt.ArrowType.RightArrow
+        )
+
+    advanced_toggle.toggled.connect(set_advanced_visible)
 
     def fraction_spin(value: float) -> QtWidgets.QDoubleSpinBox:
         spin = QtWidgets.QDoubleSpinBox(advanced_group)
@@ -882,12 +1006,34 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
                 break
     layout.addWidget(tabs)
 
+    validation_label = QtWidgets.QLabel(dialog)
+    validation_label.setWordWrap(True)
+    validation_label.setStyleSheet("color: #b3261e;")
+    validation_label.hide()
+    layout.addWidget(validation_label)
+
     buttons = QtWidgets.QDialogButtonBox(
         QtWidgets.QDialogButtonBox.StandardButton.Ok
         | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
         dialog,
     )
-    buttons.accepted.connect(dialog.accept)
+    def validate_and_accept() -> None:
+        errors = validate_settings_table_inputs(y_limit_table, um_table)
+        if errors:
+            validation_label.setText("Fix the following settings before saving:\n" + "\n".join(
+                f"• {error}" for error in errors[:6]
+            ))
+            validation_label.show()
+            if errors[0].startswith("Envelope Chart"):
+                tabs.setCurrentWidget(chart_tab)
+                y_limit_table.setFocus()
+            else:
+                tabs.setCurrentWidget(um_tab)
+                um_table.setFocus()
+            return
+        dialog.accept()
+
+    buttons.accepted.connect(validate_and_accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
 
@@ -922,6 +1068,11 @@ def edit_settings(window, initial_tab: str | None = None) -> None:
     self.session.envelope_time_step = float(time_step_spin.value())
     self.session.envelope_time_end_auto = time_end_auto_check.isChecked()
     self.session.excel_waveform_exports_enabled = excel_exports_check.isChecked()
+    if project_path:
+        storage.set_project_incremental_run_data_enabled(
+            project_path,
+            run_data_cache_check.isChecked(),
+        )
     if not self.session.envelope_time_end_auto:
         self.session.envelope_time_end = float(time_end_spin.value())
     if project_frequency is None:

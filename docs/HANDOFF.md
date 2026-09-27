@@ -16,6 +16,7 @@ order before making a change:
 3. `README.md` - setup, commands, user workflow, and output locations.
 4. `docs/CURRENT_CONTEXT.md` - detailed current-state notes, risks, and recent validation.
 5. `docs/ANALYSIS_METHODS.md` - the calculation and data-handling contract.
+6. `docs/PERFORMANCE_AUDIT.md` - measured runtime stages and the speed-up benchmark plan.
 6. `pyproject.toml`, `environment.yml`, then the relevant source and tests.
 
 Always inspect `git status` before editing. The worktree may contain
@@ -98,7 +99,7 @@ or recatalog saved dashboard figures.
 | Scanning | `scanner.py`, `project_scan_runner.py`, `project_scan_cache.py`, `project_config.py` | Project discovery, metadata cache, timing/frequency/voltage inputs, fault map, proposals |
 | Exclusions | `exclusions.py` | Manual, NonConv, High Voltage normalization and matching |
 | Envelopes | `voltage_envelope.py`, `envelope_chart.py`, `envelope_label_placement.py`, `envelope_rows.py` | Raw reads, exclusions, envelopes, Excel workbooks/charts, two-pass post-render label placement, and shared nearest-time selection |
-| Checks | `resonance_checks.py`, `sustained_sdpf.py`, `rms_analysis.py` | Existing envelope checks, project-defined Sustained SDPF persistence, and RMS selection from the project's MM catalog |
+| Checks | `resonance_checks.py`, `sustained_sdpf.py`, `rms_analysis.py`, `real_rms.py` | Existing envelope checks, project-defined Sustained SDPF persistence, and project-specific legacy/creator-style RMS selection |
 | Heatmaps | `sustained_sdpf_heatmap.py` | Persisted Run x MM aggregation and heatmap rendering |
 | Plot bridge | `analysis_engine.py`, `src/pscad_plotter_app_v3/` | Batch creation, MM plotting, process execution, and waveform Excel export |
 | Plotter conventions | `pscad_plotter_app_v3/services/project_conventions.py` | Case/run filename parsing, statistic-file selection, fault-label normalization, and statistic-row parsing |
@@ -122,18 +123,19 @@ every selected project.
 | --- | --- | --- |
 | Session/autosave | app-level UI selections plus project-keyed settings and overrides | raw waveform arrays |
 | `.state/project_scan_cache.json` | compact discovery metadata, input timing/voltage/MM data, proposals, and dashboard catalogs | full `.out` inventory and waveform data |
-| project `.state/analysis_cache.json` | one compact stage-signature/output-metadata cache | engineering result payloads and waveform arrays |
+| project `.state/analysis_cache.json` | one compact stage-signature/output-metadata cache plus the project cache setting | engineering result payloads and waveform arrays |
+| project `.state/envelope_data.sqlite3` | optional compact derived per-run envelope arrays keyed by source and calculation settings | raw PSCAD waveform samples and stale source runs |
 | `Sustained_SDpf.json` | compact Sustained observations, selection references, heatmap flags, and source fingerprint | raw cycle samples, plot settings, RMS diagnostics |
 | generated folders | authoritative current workbooks, PNG/Excel outputs, and DOCX reports | duplicate cache manifests in every output folder |
 
 Current source versions are: project scan cache **8**, project analysis cache
-**1**, voltage-envelope manifest **3**, RMS result selection **3**, Sustained
-result JSON **19**, Sustained summary workbook **4**, plot-batch manifest **3**,
-report manifest **2**, RMS report layout **2**, and Sustained report layout **3**.
-The embedded plotter's SQLite/MM caches are **3/3**.
-Obsolete or incomplete artifacts are rebuilt; they are not treated as valid
-empty results. The app deliberately does not persist a processed-waveform
-cache.
+**1**, voltage-envelope manifest **3**, RMS result selection **5**, Sustained
+result JSON **19**, Sustained summary workbook **4**, plot-batch manifest **4**,
+report manifest **2**, RMS report layout **3**, and Sustained report layout **3**.
+The embedded plotter's SQLite/MM caches are **3/3**. The envelope run-data
+cache is version **1**. Obsolete or incomplete artifacts are rebuilt; they are
+not treated as valid empty results. The envelope cache stores derived
+per-run arrays only; raw PSCAD waveform samples are never persisted.
 
 ## Function ownership rules
 
@@ -204,32 +206,38 @@ covered by plotting tests.
    Voltage levels are selected through the `Voltages` popup: `All voltages`
    is the tri-state master checkbox and the entries below it are the individual
    levels. RMS is the first Analysis control; its popup is project-specific and
-   lists LG/LL quantities plus alphabetized MM elements. It is enabled only
+   lists LG/LL quantities, the default-on Real RMS toggle, and alphabetized MM
+   elements. It is enabled only
    when the highlighted project is checked and its project MM-results catalog
    contains elements.
 4. **Build envelopes/checks.** `voltage_envelope.build_voltage_envelopes`
    loads `Statistic*.out` tables through the NumPy fast path (with the legacy
    pandas fallback), using one process below 1,000 files and a separate pool
    capped at four workers for larger sets. It applies Manual and NonConv rules,
-   reads voltage-specific raw `.out` data,
+   reads voltage-specific raw `.out` data for cache misses,
    performs the authoritative high-voltage check, creates per-run chronological
-   envelope data, merges the selected runs, and writes the base workbook. A
-   processed envelope data exists only during the current build, and the
-   single project `.state/analysis_cache.json` can skip the complete stage
-   when its artifacts are current. Selected voltage levels submit reads
+   envelope data, merges the selected runs, and writes the base workbook. The
+   project-local `envelope_data.sqlite3` cache can reuse unchanged derived run
+   data when enabled, while the single project `.state/analysis_cache.json`
+   still skips the complete stage when its artifacts are current. Cache misses
+   submit reads for selected voltage levels
    concurrently through one shared bounded process pool, so the worker cap is
    not multiplied by voltage count. Presentation-only changes can reuse
-   validated calculation artifacts without rereading raw waveforms. Stress/Late/No-settle consume
-   the envelope data. Sustained SDPF consumes the raw phase/pair arrays already
-   loaded by the envelope workers; it must not create a second raw-read pass.
-   The project analysis cache is versioned and stores only signatures and
-   output metadata. Its envelope signature includes the current Sustained
-   SDPF result and summary-workbook format versions; the result version is
-   also included in plot/report signatures, so stale algorithm outputs are rebuilt while no
-   processed waveform arrays are retained between builds. A shared validator
-    checks the saved result version, settings, source fingerprint, and
-    per-voltage signature before batches, heatmaps, or reports reuse the
-    result. Source paths in that compact manifest are project-relative POSIX
+   validated calculation artifacts without rereading raw waveforms. Stress/Late/No-settle
+   consume envelope data from the cache or the current build. Sustained SDPF consumes
+   cached result rows when valid; otherwise it uses the raw phase/pair arrays
+   loaded by the envelope workers and must not create a second raw-read pass.
+   The project analysis cache is versioned and stores stage signatures, output
+   metadata, and the project cache setting. Its envelope signature includes the
+   current Sustained SDPF result and summary-workbook format versions; the
+   result version is also included in plot/report signatures, so stale algorithm
+   outputs are rebuilt. The run-data cache is source/signature validated, writes
+   one transaction per
+   build, and can be bypassed from the project Settings checkbox. Scope, bus,
+   and High Voltage include filters are reapplied after cache loading. A shared
+   validator checks the saved result version, settings, source fingerprint, and
+   per-voltage signature before batches, heatmaps, or reports reuse the result.
+   Source paths in that compact manifest are project-relative POSIX
     paths, including on Windows, so the build and later validation hash the
     same metadata. An invalid cache is logged with its reason and cannot
     create an empty Sustained batch that looks like a clean result. Sustained plot
@@ -257,8 +265,11 @@ covered by plotting tests.
    current; otherwise it loads the rows once per connected run. It restricts
    new batches to Case/Run/MM/voltage combinations backed by the `.inf` run
    index, and reuses the resulting catalog for selection, batches, rendering,
-   and report text. It writes separate `RMS/LG` and `RMS/LL`
-   outputs; it does not add a second raw waveform read. `Rebuild heatmaps` uses the
+   and report text. The default Real RMS path keeps the governing Case/Run/MM
+   identity selected from the catalog, then recomputes only those selected
+   rows from instantaneous `LGp`/`LLp` with the creator's method; clearing the
+   toggle uses the catalog `LGr`/`LLr` values.
+   It writes separate `RMS/LG` and `RMS/LL` outputs. `Rebuild heatmaps` uses the
    saved Sustained SDPF JSON only; it does not reread waveforms. If validation
    reports a stale or mismatched Sustained cache, rerun `Build envelope
    data/checks`; the report log identifies the exact reason instead of
@@ -322,19 +333,26 @@ covered by plotting tests.
   subset of the available MM elements. Analysis and RMS selections are restored
   independently when the active project changes.
 - The switching-time selector follows `Input_Data!B5`: `Sequential` and
-  `None` show sorted discrete switching-time checkboxes, all checked by
-  default; other switch types show inclusive `Start time [s]` and `End time
-  [s]` fields, defaulted to the available range. A row is included when any
+  `None` show a sorted discrete switching-time list with normal click and
+  Ctrl+click extended selection, all selected by default; other switch types
+  show inclusive `Start time [s]` and `End time [s]` fields, defaulted to the
+  available range. A row is included when any
   available `Tswitch_a/b/c` value is inside the active selection. The switch
   type is read during the project scan and the time values come from the
   already loaded MM catalog, so the RMS popup does not reopen either source.
-- RMS consumes the project's parsed/cached `Results/MM results.csv` catalog, whose
-  bus names are already part of the scan/catalog; Case/Run/MM rows are checked
-  against the `.inf` run index before new batches are created. It does not
-  reread raw waveform `.out` files or create a binary waveform cache. For every
-  selected voltage and quantity, one maximum (`LGr`/`LLr`) and one minimum
-  (`LGrm`/`LLrm`, above 0.05 pu) are selected across the chosen elements. LG pu
-  values use `voltage / sqrt(3)`; LL pu values use `voltage`.
+- RMS keeps the project's parsed/cached `Results/MM results.csv` catalog for
+  element and switching-time selection, and checks Case/Run/MM rows against the
+  `.inf` run index before new batches are created. The project-specific **Real
+  RMS** checkbox is on by default. The catalog's reported RMS columns first
+  select the governing rows. When the toggle is on, only those selected rows'
+  instantaneous `LGp`/`LLp` channels are recomputed with the creator's
+  one-cycle, half-cycle-update RVC method; the app does not rerank every raw
+  candidate. When off, the reported `LGr`/`LLr`/`LGrm`/`LLrm` catalog values are
+  used exactly as before. Neither mode creates a binary waveform cache. For every selected voltage and
+  quantity, one maximum and one valid minimum (above 0.05 pu) are selected
+  across the chosen elements. LG pu values use `voltage / sqrt(3)`; LL pu
+  values use `voltage`. A report-only rebuild without raw inventory falls back
+  to catalog values so existing plots remain usable.
   Report-only rebuilds with no remaining `.inf` inventory retain CSV metadata
   needed to describe already-generated plots.
 - The first RMS catalog load for a project runs in the background so changing
@@ -495,6 +513,7 @@ among the analysis sections when it is enabled.
 ```text
 .state/
   analysis_cache.json       # compact envelope/plot/report stage metadata
+  envelope_data.sqlite3     # optional compact derived per-run envelope cache
 Voltage_envelope/
   <scope>/
     MM_<voltage>.xlsx
@@ -521,6 +540,13 @@ representative-ranking checkboxes, envelope duration mode, chart axes, exclusion
 mode must survive closing and reopening Settings; changing a ranking checkbox
 does not invalidate the engineering result cache, and changing a heatmap layout
 does not require another project scan.
+
+The **Cache analyzed run data** checkbox is also project-specific, defaults on
+when absent, and is persisted in the project's `.state/analysis_cache.json`.
+When enabled, the envelope build reuses source/signature-valid derived rows
+from `.state/envelope_data.sqlite3`; when disabled, it bypasses both reads and
+writes without deleting retained cache rows. Cache writes are committed once per
+build rather than once per run.
 
 Dashboard figure metadata is cached by canonical project path. The UI shows
 the union of the cached catalogs by default, with the short `All checked`
@@ -576,7 +602,9 @@ Sustained SDPF duration needs the corresponding data/check build.
   benchmark and an explicit design reason. Warm project validation uses one
   `os.scandir`/`DirEntry.stat()` walk for the targeted case files, and envelope
   source manifests reuse an indexed directory listing plus binary-searched
-  output prefixes; these changes add no persistent files or dependencies.
+  output prefixes; these indexing changes add no other persistent files or
+  dependencies. The optional derived run-data cache is documented separately
+  above.
 - Plot process workers do not receive Qt objects or the parent renderer. They
   rebuild process-local renderer/exporter state from the simple run index;
   each renderer loads only requested waveform columns, reuses standardized
@@ -614,7 +642,7 @@ $env:TEMP = "$PWD\.tmp"
 ```
 
 The latest recorded local source-level validation for this snapshot passed
-**286 tests**. Run the command and report its actual result rather than relying
+**297 tests**. Run the command and report its actual result rather than relying
 on the number. Also run the dependency import smoke check when packaging/setup
 is touched, and `Create_executable.bat` only when the executable itself is
 being validated.
