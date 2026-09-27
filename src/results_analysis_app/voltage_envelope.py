@@ -94,7 +94,8 @@ _STATISTIC_INTEGER_TOKEN = re.compile(r"[+-]?\d+$")
 # the next envelope build; the current derived run-data cache is separate.
 LEGACY_ENVELOPE_MANIFEST_FILENAME = ".envelope_manifest.json"
 ENVELOPE_MANIFEST_VERSION = 3
-ENVELOPE_CALCULATION_VERSION = 1
+# Bump with run-data precision changes so prior envelope outputs rebuild once.
+ENVELOPE_CALCULATION_VERSION = 2
 ENVELOPE_PRESENTATION_VERSION = 1
 
 ENVELOPE_HEADERS = [

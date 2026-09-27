@@ -16,7 +16,7 @@ import pandas as pd
 from results_analysis_app import storage
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 SUSTAINED_ENTRY = "__Sustained_SDPF__"
 RunData: TypeAlias = tuple[
     list[tuple[str, pd.DataFrame | list[dict[str, Any]]]],
@@ -67,8 +67,8 @@ def _encode_run_data(run_data: RunData) -> bytes:
             continue
         time_name = f"time_{index}"
         values_name = f"values_{index}"
-        arrays[time_name] = value.index.to_numpy(dtype=np.float32)
-        arrays[values_name] = value[value_columns].to_numpy(dtype=np.float32)
+        arrays[time_name] = value.index.to_numpy(dtype=np.float64)
+        arrays[values_name] = value[value_columns].to_numpy(dtype=np.float64)
         entry_metadata.append(
             {
                 "measurement": str(measurement),

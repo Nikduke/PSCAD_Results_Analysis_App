@@ -879,8 +879,17 @@ def test_serialized_result_cache_roundtrip_and_invalidation() -> None:
         resonance_checks.analyze_records,
         ([record], changed_settings, {}),
     )
+    resonance_cache.call(
+        resonance_checks.analyze_records,
+        ([record], resonance_settings, {"SFO": 0.01}),
+    )
+    changed_scope = replace(record, scope_folder="Single case")
+    resonance_cache.call(
+        resonance_checks.analyze_records,
+        ([changed_scope], resonance_settings, {}),
+    )
     assert resonance_cache.hits == 1
-    assert resonance_cache.misses == 3
+    assert resonance_cache.misses == 5
 
     phase = sustained_sdpf.PhaseStressResult(
         "LGp",
@@ -1028,11 +1037,12 @@ def benchmark_separate_result_cache(
             str(path.relative_to(project_root)) for path in cold_outputs
         )
     }
-    # The existing run-data cache stores waveform arrays as float32.  That is
-    # intentionally allowed to produce tiny cold-vs-warm floating-point
-    # serialization differences; this benchmark isolates the proposed result
-    # cache and therefore compares all later builds with the first warm build.
-    reference_digests_by_selection: dict[tuple[str, ...], dict[str, str]] = {}
+    # Run-data cache arrays preserve float64 precision. This benchmark isolates
+    # the proposed result cache and compares later forced builds with the first
+    # warm build while avoiding a cold-source baseline in each timed iteration.
+    reference_digests_by_selection: dict[tuple[str, ...], dict[str, str]] = {
+        tuple(selected_voltages): _semantic_output_digests(project_root, cold_outputs)
+    }
 
     def invalidate_envelope_output_cache() -> None:
         cache = storage.load_project_analysis_cache(project_root)

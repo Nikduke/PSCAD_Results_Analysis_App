@@ -95,8 +95,7 @@ def test_run_data_cache_round_trips_and_rejects_stale_source(tmp_path) -> None:
     assert stale is None
 
 
-def test_run_data_cache_keeps_compact_float32_precision_contract() -> None:
-    from results_analysis_app import voltage_envelope
+def test_run_data_cache_preserves_float64_time_and_value_precision() -> None:
     from results_analysis_app.envelope_data_cache import _decode_run_data, _encode_run_data
 
     frame = pd.DataFrame(
@@ -106,29 +105,115 @@ def test_run_data_cache_keeps_compact_float32_precision_contract() -> None:
             "MM_name": ["MM_66_A", "MM_66_A"],
             "Case": ["C1-1", "C1-1"],
         },
-        index=np.array([0.0, 0.002]),
+        index=np.array([0.000000123456789, 0.0020000123456789], dtype=np.float64),
     )
     frame.index.name = "Time (s)"
     run_data = ([("LGp", frame)], [])
 
     payload = _encode_run_data(run_data)
     with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
-        assert archive["values_0"].dtype == np.dtype(np.float32)
+        assert archive["time_0"].dtype == np.dtype(np.float64)
+        assert archive["values_0"].dtype == np.dtype(np.float64)
 
     restored_entries, _high_voltage = _decode_run_data(payload)
     restored = restored_entries[0][1]
     assert isinstance(restored, pd.DataFrame)
-    np.testing.assert_allclose(
-        restored[["Max_A", "Max_B"]].to_numpy(),
-        frame[["Max_A", "Max_B"]].to_numpy(),
-        rtol=0.0,
-        atol=1e-4,
+    pd.testing.assert_frame_equal(restored, frame)
+
+
+def test_run_data_cache_preserves_resonance_vlim_boundary() -> None:
+    from results_analysis_app.envelope_data_cache import _decode_run_data, _encode_run_data
+    from results_analysis_app.resonance_checks import (
+        POST_EVENT_STRESS,
+        ResonanceSettings,
+        analyze_records,
+        records_from_entries,
     )
-    pd.testing.assert_frame_equal(
-        voltage_envelope._reduce_merge([frame]),
-        voltage_envelope._reduce_merge([restored]),
-        check_dtype=False,
+
+    frame = pd.DataFrame(
+        {
+            "Max_A": np.full(11, 100.000001, dtype=np.float64),
+            "MM_name": ["MM_66_A"] * 11,
+            "Case": ["C1-1"] * 11,
+        },
+        index=np.arange(0.0, 0.11, 0.01, dtype=np.float64),
     )
+    frame.index.name = "Time (s)"
+    run_data = ([("LGp", frame)], [])
+
+    restored_entries, _high_voltage = _decode_run_data(_encode_run_data(run_data))
+    restored_frame = restored_entries[0][1]
+    assert isinstance(restored_frame, pd.DataFrame)
+    settings = ResonanceSettings(
+        enabled_checks=(POST_EVENT_STRESS,),
+        auto_release=False,
+        manual_analysis_start=0.04,
+        limit_multiplier=1.0,
+        rolling_min_samples=1,
+        rolling_p95_window=0.01,
+    )
+    event_times = {"SFO": 0.0, "TOV": 0.0}
+
+    source_results = analyze_records(
+        records_from_entries("Full", "66", "LGp", 100.0, [("LGp", frame)]),
+        settings,
+        event_times,
+    )
+    cached_results = analyze_records(
+        records_from_entries("Full", "66", "LGp", 100.0, [("LGp", restored_frame)]),
+        settings,
+        event_times,
+    )
+
+    assert len(source_results) == 1
+    assert len(cached_results) == 1
+    source_result = source_results[0]
+    cached_result = cached_results[0]
+    assert source_result.metrics == cached_result.metrics
+    assert source_result.rank_key == cached_result.rank_key
+    assert source_result.main_metric == cached_result.main_metric
+    np.testing.assert_array_equal(source_result.time, cached_result.time)
+    np.testing.assert_array_equal(source_result.envelope, cached_result.envelope)
+    np.testing.assert_array_equal(source_result.smooth, cached_result.smooth)
+
+
+def test_run_data_cache_version_invalidates_prior_representation(tmp_path, monkeypatch) -> None:
+    from results_analysis_app import envelope_data_cache, voltage_envelope
+    from results_analysis_app.envelope_data_cache import RunDataCache
+    from results_analysis_app.sustained_sdpf import SustainedSDPFSettings
+
+    signature_arguments = (
+        "66",
+        "MM_66",
+        72.5,
+        5.0,
+        0.0001,
+        0.5,
+        60.0,
+        SustainedSDPFSettings(),
+        None,
+        60.0,
+    )
+    current_version = envelope_data_cache.CACHE_VERSION
+    assert current_version == 2
+    current_signature = voltage_envelope._run_data_cache_signature(*signature_arguments)
+
+    monkeypatch.setattr(envelope_data_cache, "CACHE_VERSION", current_version - 1)
+    previous_signature = voltage_envelope._run_data_cache_signature(*signature_arguments)
+    assert previous_signature != current_signature
+
+    cache_key = "66\0Case_folder/C1/C1_r00001.inf"
+    with RunDataCache(tmp_path) as cache:
+        cache.put(cache_key, previous_signature, "source", _run_data())
+        monkeypatch.setattr(envelope_data_cache, "CACHE_VERSION", current_version)
+
+        assert cache.get(cache_key, current_signature, "source") is None
+        # Even a direct lookup using the old signature rejects its old-format payload.
+        assert cache.get(cache_key, previous_signature, "source") is None
+
+        cache.put(cache_key, current_signature, "source", _run_data())
+        assert cache.get(cache_key, current_signature, "source") is not None
+        assert cache.get(cache_key, previous_signature, "source") is None
 
 
 def test_run_data_cache_prunes_removed_source_runs(tmp_path) -> None:
@@ -267,7 +352,7 @@ def test_settings_checkbox_persists_project_cache_choice(monkeypatch, tmp_path) 
 
 
 def test_envelope_build_uses_project_cache_and_can_bypass_it(tmp_path, monkeypatch) -> None:
-    from results_analysis_app import storage, voltage_envelope
+    from results_analysis_app import envelope_data_cache, storage, voltage_envelope
     from results_analysis_app.models import ScopeEntry
     from results_analysis_app.project_config import ProjectTiming, VoltageConfig
 
@@ -332,18 +417,49 @@ def test_envelope_build_uses_project_cache_and_can_bypass_it(tmp_path, monkeypat
         "build_charts": False,
     }
 
+    current_cache_version = envelope_data_cache.CACHE_VERSION
+    current_calculation_version = voltage_envelope.ENVELOPE_CALCULATION_VERSION
+    assert current_cache_version == 2
+    assert current_calculation_version == 2
+    monkeypatch.setattr(envelope_data_cache, "CACHE_VERSION", current_cache_version - 1)
+    monkeypatch.setattr(
+        voltage_envelope,
+        "ENVELOPE_CALCULATION_VERSION",
+        current_calculation_version - 1,
+    )
     voltage_envelope.build_voltage_envelopes(project, [ScopeEntry.full()], ["66"], **common)
     assert observed_cache_arguments[0] == {}
     assert storage.project_envelope_data_cache_path(project).is_file()
 
+    # Updating both versions forces the old stage manifest and run-data row to miss.
+    monkeypatch.setattr(envelope_data_cache, "CACHE_VERSION", current_cache_version)
+    monkeypatch.setattr(
+        voltage_envelope,
+        "ENVELOPE_CALCULATION_VERSION",
+        current_calculation_version,
+    )
+    voltage_envelope.build_voltage_envelopes(project, [ScopeEntry.full()], ["66"], **common)
+    assert observed_cache_arguments[1] == {}
+
+    skip_messages: list[str] = []
+    voltage_envelope.build_voltage_envelopes(
+        project,
+        [ScopeEntry.full()],
+        ["66"],
+        log=skip_messages.append,
+        **common,
+    )
+    assert len(observed_cache_arguments) == 2
+    assert any("Skipping unchanged envelope build" in message for message in skip_messages)
+
     include_scope = ScopeEntry(name="Only C1", mode="include", tokens=["C1"])
     voltage_envelope.build_voltage_envelopes(project, [include_scope], ["66"], **common)
-    assert inf_path in observed_cache_arguments[1]
+    assert inf_path in observed_cache_arguments[2]
 
     storage.set_project_incremental_run_data_enabled(project, False)
     exclude_scope = ScopeEntry(name="No C2", mode="exclude", tokens=["C2"])
     voltage_envelope.build_voltage_envelopes(project, [exclude_scope], ["66"], **common)
-    assert observed_cache_arguments[2] is None
+    assert observed_cache_arguments[3] is None
 
 
 def test_warm_envelope_build_is_faster_and_keeps_outputs_equivalent(tmp_path, monkeypatch) -> None:

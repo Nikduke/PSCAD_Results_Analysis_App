@@ -548,6 +548,16 @@ from `.state/envelope_data.sqlite3`; when disabled, it bypasses both reads and
 writes without deleting retained cache rows. Cache writes are committed once per
 build rather than once per run.
 
+**Cache precision correction (working tree):** cache format version 2 stores time
+and `Max_*` arrays as float64. The version is part of the run-data calculation
+signature, invalidating older float32 rows. Envelope calculation version 2 also
+invalidates the old complete-stage manifest, forcing one correctness rebuild; later
+unchanged runs can skip normally. A production cold/warm check on the available
+150-run example reused 450/450 entries and matched semantic contents in all three
+voltage-envelope workbooks. The measured whole-cache size tradeoff was about +52% on
+the reference data; see
+`APPLICATION_AUDIT_BACKLOG.md` and `docs/PERFORMANCE_AUDIT.md` for evidence and limits.
+
 Dashboard figure metadata is cached by canonical project path. The UI shows
 the union of the cached catalogs by default, with the short `All checked`
 checkbox applying one shared checked-ID list to every checked project. Clearing

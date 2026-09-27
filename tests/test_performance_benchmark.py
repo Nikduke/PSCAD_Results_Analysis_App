@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -12,11 +11,10 @@ import time
 import pytest
 
 
-def _file_digests(project_root: Path, outputs: list[Path]) -> dict[str, str]:
-    return {
-        str(path.relative_to(project_root)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in outputs
-    }
+def _semantic_file_digests(project_root: Path, outputs: list[Path]) -> dict[str, str]:
+    from test_performance_candidates import _semantic_output_digests
+
+    return _semantic_output_digests(project_root, outputs)
 
 
 def _envelope_stage_timings(messages: list[str]) -> dict[str, list[float]]:
@@ -153,6 +151,8 @@ def benchmark_warm_envelope_cache(
     remains reusable. This measures the actual cache-enabled build path,
     including the remaining merge and presentation work.
     """
+    from contextlib import nullcontext
+
     from results_analysis_app import project_config, storage, voltage_envelope
     from results_analysis_app.models import ScopeEntry
 
@@ -179,6 +179,10 @@ def benchmark_warm_envelope_cache(
         raise AssertionError("benchmark project has no requested voltage configurations")
     timing = project_config.load_project_timing(project_root)
     worker_count = workers or None
+    original_excel_app = voltage_envelope.excel_app
+    original_autofit_workbook = voltage_envelope.autofit_workbook
+    voltage_envelope.excel_app = lambda: nullcontext(None)
+    voltage_envelope.autofit_workbook = lambda _excel, _path: None
 
     def build(scope: ScopeEntry, messages: list[str]) -> list[Path]:
         return voltage_envelope.build_voltage_envelopes(
@@ -192,29 +196,33 @@ def benchmark_warm_envelope_cache(
             build_charts=False,
         )
 
-    cold_messages: list[str] = []
-    started = time.perf_counter()
-    cold_outputs = build(ScopeEntry.full(), cold_messages)
-    cold_seconds = time.perf_counter() - started
-    cold_digests = _file_digests(project_root, cold_outputs)
-
-    warm_samples: list[float] = []
-    warm_cache_messages: list[list[str]] = []
-    warm_stage_timings: list[dict[str, list[float]]] = []
-    for index in range(max(1, repetitions)):
-        warm_messages: list[str] = []
-        warm_scope = ScopeEntry(name=f"Full cache reuse {index + 1}", mode="full")
+    try:
+        cold_messages: list[str] = []
         started = time.perf_counter()
-        warm_outputs = build(warm_scope, warm_messages)
-        warm_samples.append(time.perf_counter() - started)
-        assert [path.relative_to(project_root) for path in warm_outputs] == [
-            path.relative_to(project_root) for path in cold_outputs
-        ]
-        assert _file_digests(project_root, warm_outputs) == cold_digests
-        warm_stage_timings.append(_envelope_stage_timings(warm_messages))
-        warm_cache_messages.append(
-            [message for message in warm_messages if "Incremental run-data cache:" in message]
-        )
+        cold_outputs = build(ScopeEntry.full(), cold_messages)
+        cold_seconds = time.perf_counter() - started
+        cold_digests = _semantic_file_digests(project_root, cold_outputs)
+
+        warm_samples: list[float] = []
+        warm_cache_messages: list[list[str]] = []
+        warm_stage_timings: list[dict[str, list[float]]] = []
+        for index in range(max(1, repetitions)):
+            warm_messages: list[str] = []
+            warm_scope = ScopeEntry(name=f"Full cache reuse {index + 1}", mode="full")
+            started = time.perf_counter()
+            warm_outputs = build(warm_scope, warm_messages)
+            warm_samples.append(time.perf_counter() - started)
+            assert [path.relative_to(project_root) for path in warm_outputs] == [
+                path.relative_to(project_root) for path in cold_outputs
+            ]
+            assert _semantic_file_digests(project_root, warm_outputs) == cold_digests
+            warm_stage_timings.append(_envelope_stage_timings(warm_messages))
+            warm_cache_messages.append(
+                [message for message in warm_messages if "Incremental run-data cache:" in message]
+            )
+    finally:
+        voltage_envelope.excel_app = original_excel_app
+        voltage_envelope.autofit_workbook = original_autofit_workbook
 
     warm_median = statistics.median(warm_samples)
     return {
